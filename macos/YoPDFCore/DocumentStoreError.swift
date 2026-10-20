@@ -36,6 +36,11 @@ public enum DocumentStoreError: Error, Equatable, Sendable {
     /// A session whose last save could not be verified. `refresh()` is the
     /// only operation allowed before it is reopened.
     case sessionNeedsRefresh
+    /// `refresh()` was called on a session that has no pending save to verify.
+    /// Re-reading the file there would adopt an external change as the save
+    /// baseline while the in-memory document still holds the old bytes.
+    /// Accepting the change requires an explicit reload of the document.
+    case reloadRequired
     case coordinationFailed(String)
     /// `saveAs` was asked to overwrite, and the destination did not exist when
     /// the user confirmed but does now.
@@ -119,6 +124,8 @@ extension DocumentStoreError: LocalizedError {
             return "“\(url.lastPathComponent)” was saved, but its new state could not be confirmed: \(reason)"
         case .sessionNeedsRefresh:
             return "This document must be re-checked after an incomplete save before it can be used again."
+        case .reloadRequired:
+            return "This document has no unfinished save to check. Reload it to accept changes made by another app."
         case let .coordinationFailed(reason):
             return "Another app is using the file: \(reason)"
         case let .targetAppearedDuringSave(url):

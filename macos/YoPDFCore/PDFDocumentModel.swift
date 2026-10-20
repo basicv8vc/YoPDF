@@ -179,7 +179,10 @@ public final class PDFDocumentModel: ObservableObject {
         case .notReadable, .sessionClosed, .externalModificationDetected,
              .targetExists, .stagingFailed, .replacementFailed,
              .replacementStateUncertain, .committedButUnverified,
-             .sessionNeedsRefresh, .targetAppearedDuringSave, .coordinationFailed:
+             .sessionNeedsRefresh, .reloadRequired, .targetAppearedDuringSave,
+             .coordinationFailed:
+            // None of these can happen while opening a file; they are save- and
+            // session-level outcomes. Kept here so the mapping stays exhaustive.
             return .unreadable
         }
     }

@@ -290,4 +290,36 @@ final class DocumentStoreRecoveryTests: XCTestCase {
         XCTAssertEqual(try session.read(), payload)
         XCTAssertEqual(try session.checkExternalChange(), .unchanged)
     }
+
+    // MARK: - refresh() is not a reload
+
+    func testRefreshOnAnOpenSessionRefusesToRebaselineAnExternalChange() throws {
+        let (url, payload) = try makeFile()
+        let session = try DocumentStore().open(url)
+        defer { session.close() }
+
+        // Another program rewrites the file while it is open. `Data.write`
+        // truncates in place, so the identity survives and only the bytes move.
+        let external = TestPayload.bytes(2048, seed: 0x91)
+        try external.write(to: url)
+
+        // A session with no pending save has nothing to verify, and must not
+        // adopt the other app's bytes as the baseline for the next save.
+        XCTAssertEqual(storeError(from: try session.refresh()), .reloadRequired)
+        XCTAssertEqual(session.state, .open)
+        XCTAssertEqual(
+            session.version.contentHash,
+            TestPayload.sha256(payload),
+            "the baseline must stay at the version the session opened"
+        )
+
+        // And the next save is still checked against that version, so the
+        // external file is reported rather than overwritten.
+        let error = storeError(from: try session.save(TestPayload.bytes(64)))
+        guard case let .externalModificationDetected(change) = error, case .modified = change else {
+            return XCTFail("expected .externalModificationDetected(.modified), got \(String(describing: error))")
+        }
+        XCTAssertEqual(try Data(contentsOf: url), external, "the other app's bytes must survive")
+        XCTAssertEqual(session.state, .open)
+    }
 }

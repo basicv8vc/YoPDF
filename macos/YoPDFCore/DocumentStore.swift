@@ -190,9 +190,15 @@ public final class DocumentSession: @unchecked Sendable {
         return Self.classify(expected: version, current: onDisk)
     }
 
-    /// Re-reads the file's version after a save whose result could not be
-    /// confirmed. Returns the session to `.open` only when what is on disk
-    /// matches something the save was allowed to produce.
+    /// Verifies the result of a save whose outcome could not be confirmed.
+    ///
+    /// Only a session in `needsRefresh` has something to verify. A session in
+    /// `.open` refuses with `reloadRequired` instead of re-reading the file:
+    /// adopting whatever is on disk would install an external change as the
+    /// save baseline while the in-memory document still holds the old bytes, so
+    /// the next save would overwrite the other app's work. Accepting an external
+    /// change is an explicit reload of the document, not a side effect of this
+    /// call.
     ///
     /// A session in `needsRefresh` knows two acceptable outcomes: the bytes it
     /// tried to write, or the original it was asked to preserve. Anything else
@@ -214,9 +220,9 @@ public final class DocumentSession: @unchecked Sendable {
         let pending = stateLock.withLock { pendingSave }
 
         guard state == .needsRefresh else {
-            let updated = try io.version(of: target)
-            adopt(updated)
-            return updated
+            // Nothing to verify: the baseline is already a version this session
+            // opened and nobody has asked to accept a newer one.
+            throw DocumentStoreError.reloadRequired
         }
 
         guard let pending else {

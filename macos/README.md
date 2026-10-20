@@ -23,7 +23,7 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (96)
+./scripts/test.sh                     # unit tests (97)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
@@ -117,13 +117,14 @@ What the save path does and does not promise:
   write block can finish and install the file before the coordinator reports a
   problem, so the block's result wins, and any error that does escape is checked
   against the file's hash before it is called a failure.
-- `refresh()` is not a way around the conflict check. A session in
-  `needsRefresh` remembers what its save was trying to produce, and only accepts
-  the bytes it meant to write or the original it was told to keep. A different
-  file at the same path — for instance one another program created while the
-  outcome was undecided — leaves the session in `needsRefresh` and is reported
-  as an external modification. Deciding which version to keep is the caller's
-  call, not something refresh may assume.
+- `refresh()` is not a way around the conflict check, and not a reload. On a
+  session in `needsRefresh` it only accepts the bytes its save meant to write or
+  the original it was told to keep; a different file at the same path — for
+  instance one another program created while the outcome was undecided — leaves
+  the session in `needsRefresh` and is reported as an external modification. On
+  a session that is simply `.open` it refuses with `reloadRequired` rather than
+  re-reading the file, because adopting a newer version there would leave the
+  in-memory document holding older bytes while the save baseline moved forward.
 - Crash durability is not claimed. `fsync`/`F_FULLFSYNC` is issued for the
   staging file and its directory before the replacement, but "power loss at every
   instant still leaves a consistent result" is not something these tests show.
@@ -164,6 +165,9 @@ Known P1 boundaries:
   `needsRefresh` and refuses further saves until the caller calls `refresh()`,
   and `refresh()` only succeeds when the file matches the expected outcome.
   There is no automatic retry and no background restore.
+- There is no reload yet. Accepting an external change means reopening the
+  document, which also replaces the in-memory PDF; `refresh()` deliberately does
+  not do that, and refuses when there is no pending save to verify.
 - Save As refuses to write over a target that changed, appeared or vanished
   between confirmation and the coordinated commit, and refuses aliases of the
   file the session already has open (same path via symlink, symlinked parent
