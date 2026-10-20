@@ -23,7 +23,7 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (72)
+./scripts/test.sh                     # unit tests (89)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
@@ -72,6 +72,9 @@ macos/
 │   ├── DocumentStoreTests.swift         # sessions, versions, external changes
 │   ├── DocumentStoreSaveTests.swift     # save / Save As contract
 │   ├── DocumentStoreFailureTests.swift  # injected staging/commit failures
+│   ├── DocumentStoreRecoveryTests.swift # partial commits, post-commit failures
+│   ├── DocumentStoreSaveAsSafetyTests.swift # Save As target races and aliases
+│   ├── DocumentStoreLifecycleTests.swift    # close vs. in-flight operations
 │   ├── DocumentStoreScaleTests.swift    # 200 MB streaming and save
 │   ├── DocumentStoreModelIntegrationTests.swift
 │   └── ReaderViewSyncTests.swift
@@ -92,8 +95,27 @@ screen — and its access — untouched.
 an annotation means. A save writes a sibling staging file, flushes it, re-checks
 the file's identity and content hash inside an `NSFileCoordinator` write intent,
 and only then replaces the original. A changed or replaced file is reported as a
-conflict instead of being overwritten, and a failed save leaves the original
-bytes untouched.
+conflict instead of being overwritten.
+
+What the save path does and does not promise:
+
+- A detected conflict, a staging failure, and a commit that failed with the
+  original verifiably still in place each leave the original bytes intact, and
+  each is reported as its own error case rather than a single `saveFailed`.
+- `FileManager.replaceItemAt` can fail *after* it has already started moving
+  files, so a thrown error is never read as "nothing happened". The store
+  re-inspects the target, the staging file and the location the system reports
+  for the original; if the outcome cannot be decided it throws
+  `replacementStateUncertain` listing every surviving copy. It does not delete
+  the only recoverable copy and does not attempt an automatic restore — the
+  caller decides.
+- A replacement that succeeded but whose new version could not be read back is
+  reported as `committedButUnverified`, not as a failure: the bytes *were*
+  written. The session moves to `needsRefresh`, which refuses further saves until
+  `refresh()` re-reads the file and re-establishes a known version.
+- Crash durability is not claimed. `fsync`/`F_FULLFSYNC` is issued for the
+  staging file and its directory before the replacement, but "power loss at every
+  instant still leaves a consistent result" is not something these tests show.
 
 `YoPDFCore` is a framework so tests are pure logic tests: they link the module
 and never launch the app, so no window server or accessibility permission is
@@ -125,8 +147,14 @@ Known P1 boundaries:
   restoration yet, so a session holds a runtime scope only.
 - Symlinks, hard links and undownloaded cloud placeholders are refused by
   `save` rather than written through; `saveAs` is the escape hatch.
-- Crash durability is bounded by what is testable here: failure paths are
-  verified to leave the original bytes intact, but "power loss at every instant"
-  is not claimed.
+- Crash durability is not claimed; the save-path notes above list exactly which
+  failure outcomes are verified and which are not.
+- Recovery after an undecidable save is manual by design: the session moves to
+  `needsRefresh` and refuses further saves until the caller calls `refresh()`.
+  There is no automatic retry and no background restore.
+- Save As refuses to write over a target that changed, appeared or vanished
+  between confirmation and the coordinated commit, and refuses aliases of the
+  file the session already has open (same path via symlink, symlinked parent
+  directory, or hard link). A different file with the same bytes is allowed.
 - The 200 MB test skips itself when the volume has less than 800 MB free, since
   it needs room for the file plus its staging copy.

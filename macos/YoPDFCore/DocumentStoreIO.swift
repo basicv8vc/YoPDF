@@ -13,12 +13,17 @@ public protocol DocumentStoreIO: Sendable {
     func version(of url: URL) throws -> DocumentVersion
     func readContents(of url: URL) throws -> Data
     /// Creates a sibling staging file, writes `contents`, flushes it to disk,
-    /// and returns its URL. If it throws, no staging file is left behind.
-    func createStagingFile(nextTo url: URL, contents: Data) throws -> URL
+    /// and returns it with the hash of what was written. If it throws, no
+    /// staging file is left behind.
+    func createStagingFile(nextTo url: URL, contents: Data) throws -> StagedFile
     /// Runs `body` inside an `NSFileCoordinator` write intent.
     func withCoordinatedWrite(at url: URL, _ body: (URL) throws -> URL) throws -> URL
-    /// Atomically replaces `url` with `stagingURL` and returns the resulting URL.
-    func replaceItem(at url: URL, with stagingURL: URL) throws -> URL
+    /// Atomically replaces `url` with `staged` and returns the resulting URL.
+    ///
+    /// A failure is reported as `.replacementStateUncertain` carrying whatever
+    /// survived, because `replaceItemAt` may have moved the original aside
+    /// before failing. It is never safe to assume the target is unchanged.
+    func replaceItem(at url: URL, with staged: StagedFile, expecting expected: DocumentVersion) throws -> URL
     func moveItem(at url: URL, to destination: URL) throws
     /// Applies POSIX permissions. Used only for files this store creates, so a
     /// new document gets normal document permissions instead of the 0600 the
@@ -193,7 +198,7 @@ public struct SystemDocumentStoreIO: DocumentStoreIO {
 
     // MARK: - Writing
 
-    public func createStagingFile(nextTo url: URL, contents: Data) throws -> URL {
+    public func createStagingFile(nextTo url: URL, contents: Data) throws -> StagedFile {
         let directory = url.deletingLastPathComponent()
         // Same directory means same volume, which is what makes the later
         // rename a single atomic step instead of a copy.
@@ -224,7 +229,11 @@ public struct SystemDocumentStoreIO: DocumentStoreIO {
         try Self.writeAll(contents, to: descriptor, url: stagingURL)
         try Self.flushToDisk(descriptor: descriptor, url: stagingURL)
         removeOnFailure = false
-        return stagingURL
+        // Hashing the in-memory bytes is one pass and no extra allocation; it
+        // lets a failed replacement tell "new content is already installed"
+        // from "the original is still there".
+        let hash = SHA256.hash(data: contents).map { String(format: "%02x", $0) }.joined()
+        return StagedFile(url: stagingURL, contentHash: hash)
     }
 
     private static func writeAll(_ data: Data, to descriptor: Int32, url: URL) throws {
@@ -285,30 +294,89 @@ public struct SystemDocumentStoreIO: DocumentStoreIO {
         return try outcome.get()
     }
 
-    public func replaceItem(at url: URL, with stagingURL: URL) throws -> URL {
+    public func replaceItem(at url: URL, with staged: StagedFile, expecting expected: DocumentVersion) throws -> URL {
         do {
             // Default options keep the original file's metadata (permissions,
             // owner, extended attributes, ACL). Verified on APFS: mode 0600 and
             // a user xattr survive, while `.usingNewMetadataOnly` drops them.
-            let replaced = try FileManager.default.replaceItemAt(url, withItemAt: stagingURL)
+            let replaced = try FileManager.default.replaceItemAt(url, withItemAt: staged.url)
             Self.synchronizeDirectory(containing: url)
             return replaced ?? url
         } catch {
-            let nsError = error as NSError
-            if nsError.domain == NSCocoaErrorDomain {
-                switch nsError.code {
-                case NSFileNoSuchFileError, NSFileReadNoSuchFileError:
-                    throw DocumentStoreError.fileMissing(url)
-                case NSFileWriteNoPermissionError, NSFileReadNoPermissionError:
-                    // The target changed permissions between the check and the
-                    // swap; report it as a permission problem, not a mystery.
-                    throw DocumentStoreError.permissionDenied(url)
-                default:
-                    break
-                }
-            }
-            throw DocumentStoreError.replacementFailed(error.localizedDescription)
+            throw classifyReplacementFailure(error, target: url, staged: staged, expected: expected)
         }
+    }
+
+    /// The documented `NSFileOriginalItemLocationKey`.
+    ///
+    /// The current macOS SDK does not export this symbol to Swift, but the
+    /// runtime uses exactly this string: a real `replaceItemAt` failure prints
+    /// it in `userInfo`. It is read here and never written.
+    private static let originalItemLocationKey = "NSFileOriginalItemLocationKey"
+
+    private func reportedOriginalLocation(
+        in userInfo: [String: Any],
+        target: URL,
+        staging: URL
+    ) -> URL? {
+        if let reported = userInfo[Self.originalItemLocationKey] as? URL,
+           FileManager.default.fileExists(atPath: reported.path) {
+            return reported
+        }
+        // Fallback for the case where the key is absent or bridged
+        // differently: any surviving URL in the error that is neither the
+        // target nor the staging file. Reported only; never restored.
+        for value in userInfo.values {
+            guard let candidate = value as? URL,
+                  candidate != target,
+                  candidate != staging,
+                  FileManager.default.fileExists(atPath: candidate.path) else { continue }
+            return candidate
+        }
+        return nil
+    }
+
+    /// A failed `replaceItemAt` is not evidence that nothing changed.
+    ///
+    /// The API moves the original aside before installing the new item and
+    /// reports where it went. Only one outcome is safe to call "unchanged":
+    /// the target still exists and still matches the version the caller
+    /// expected. Everything else is reported as uncertain, with every
+    /// surviving path, and nothing is deleted.
+    private func classifyReplacementFailure(
+        _ error: Error,
+        target: URL,
+        staged: StagedFile,
+        expected: DocumentVersion
+    ) -> DocumentStoreError {
+        let nsError = error as NSError
+        let survivingLocation = reportedOriginalLocation(
+            in: nsError.userInfo,
+            target: target,
+            staging: staged.url
+        )
+        let stagingSurvived = FileManager.default.fileExists(atPath: staged.url.path)
+
+        if let current = try? version(of: target),
+           current.identity == expected.identity,
+           current.contentHash == expected.contentHash {
+            // The target is verifiably untouched, so the failure can be named
+            // precisely instead of being reported as an unknown state.
+            if nsError.domain == NSCocoaErrorDomain,
+               nsError.code == NSFileWriteNoPermissionError || nsError.code == NSFileReadNoPermissionError {
+                return .permissionDenied(target)
+            }
+            return .replacementFailed(nsError.localizedDescription)
+        }
+
+        return .replacementStateUncertain(
+            ReplacementRecovery(
+                targetURL: target,
+                stagingURL: stagingSurvived ? staged.url : nil,
+                originalLocation: survivingLocation,
+                underlyingDescription: nsError.localizedDescription
+            )
+        )
     }
 
     public func moveItem(at url: URL, to destination: URL) throws {

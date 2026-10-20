@@ -92,6 +92,54 @@ public struct FileStatus: Equatable, Sendable {
     )
 }
 
+/// A staging file that has been written and flushed.
+///
+/// The hash is computed from the bytes while they are still in hand, so a
+/// failed replacement can later answer "is the new content already installed?"
+/// without a second pass over the file.
+public struct StagedFile: Equatable, Sendable {
+    public let url: URL
+    public let contentHash: String
+
+    public init(url: URL, contentHash: String) {
+        self.url = url
+        self.contentHash = contentHash
+    }
+}
+
+/// What is still on disk after a replacement failed part-way.
+///
+/// `replaceItemAt` can move the original aside before installing the new item.
+/// When the operation then fails, the original may not be at the target path
+/// any more, and the system reports where it went. Nothing in this struct is
+/// deleted or restored automatically: it exists so the caller can decide.
+public struct ReplacementRecovery: Equatable, Sendable {
+    /// The path the save was writing to.
+    public let targetURL: URL
+    /// The staging file, if it survived the failure.
+    public let stagingURL: URL?
+    /// `NSFileOriginalItemLocationKey`: where the system says the original now is.
+    public let originalLocation: URL?
+    public let underlyingDescription: String
+
+    public init(
+        targetURL: URL,
+        stagingURL: URL?,
+        originalLocation: URL?,
+        underlyingDescription: String
+    ) {
+        self.targetURL = targetURL
+        self.stagingURL = stagingURL
+        self.originalLocation = originalLocation
+        self.underlyingDescription = underlyingDescription
+    }
+
+    /// Paths that may hold data worth keeping.
+    public var recoverableURLs: [URL] {
+        [stagingURL, originalLocation].compactMap { $0 }
+    }
+}
+
 /// A file layout where writing in place cannot be done without changing
 /// something the user did not ask to change. These are refused rather than
 /// handled optimistically: a wrong guess here destroys data or breaks links.

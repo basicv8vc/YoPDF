@@ -22,9 +22,24 @@ public enum DocumentStoreError: Error, Equatable, Sendable {
     case unsupportedFileSituation(UnsupportedFileSituation, URL)
     /// Writing the staging file failed (no space, quota, I/O error).
     case stagingFailed(String)
-    /// The staging file was written but could not be committed.
+    /// The staging file was written but could not be committed, and the
+    /// original is verifiably still in place. Nothing was lost.
     case replacementFailed(String)
+    /// The replacement failed in a state that could not be classified: the
+    /// target may be missing, and the original may have been moved. Nothing
+    /// was deleted. `recoverableURLs` lists what is still on disk.
+    case replacementStateUncertain(ReplacementRecovery)
+    /// The replacement succeeded, but the new state could not be read back, so
+    /// the session cannot vouch for its own baseline any more. The file *was*
+    /// written; `refresh()` re-reads it.
+    case committedButUnverified(URL, String)
+    /// A session whose last save could not be verified. `refresh()` is the
+    /// only operation allowed before it is reopened.
+    case sessionNeedsRefresh
     case coordinationFailed(String)
+    /// `saveAs` was asked to overwrite, and the destination did not exist when
+    /// the user confirmed but does now.
+    case targetAppearedDuringSave(URL)
 
     /// Maps a POSIX error number to the most specific case available.
     /// `fallback` covers the codes that are specific to the operation that
@@ -93,9 +108,21 @@ extension DocumentStoreError: LocalizedError {
         case let .stagingFailed(reason):
             return "The new contents could not be written: \(reason)"
         case let .replacementFailed(reason):
-            return "The file could not be replaced safely: \(reason)"
+            return "The file could not be replaced safely, and was left unchanged: \(reason)"
+        case let .replacementStateUncertain(recovery):
+            let kept = recovery.recoverableURLs.map(\.lastPathComponent).joined(separator: ", ")
+            let detail = kept.isEmpty
+                ? "No recovery copy was reported."
+                : "Recoverable files were kept: \(kept)."
+            return "Saving stopped in an unclear state. The original may have been moved. \(detail)"
+        case let .committedButUnverified(url, reason):
+            return "“\(url.lastPathComponent)” was saved, but its new state could not be confirmed: \(reason)"
+        case .sessionNeedsRefresh:
+            return "This document must be re-checked after an incomplete save before it can be used again."
         case let .coordinationFailed(reason):
             return "Another app is using the file: \(reason)"
+        case let .targetAppearedDuringSave(url):
+            return "“\(url.lastPathComponent)” was created by another app while saving. It was not overwritten."
         }
     }
 }

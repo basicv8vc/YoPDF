@@ -64,18 +64,33 @@ public final class DocumentStore: Sendable {
 /// idempotent; dropping the last reference releases the scope as well.
 public final class DocumentSession: @unchecked Sendable {
 
-    private let stateLock = NSLock()
-    /// Serialises saves. Two saves of the same session must not interleave:
-    /// the second one's baseline check would be meaningless.
-    private let saveLock = NSLock()
+    /// What the session can still be trusted for.
+    public enum State: Equatable, Sendable {
+        /// The baseline matches what the session last observed on disk.
+        case open
+        /// A save committed, or stopped in an unclear state, and the session
+        /// could not confirm the resulting version. Only `refresh()` and
+        /// `close()` are allowed until it is resolved.
+        case needsRefresh
+        case closed
+    }
 
-    private let lease: SecurityScopeLease
+    /// Guards `currentURL`, `currentVersion`, `state` and `lease`.
+    private let stateLock = NSLock()
+    /// Held for the whole of every file operation and of `close()`.
+    ///
+    /// This is what keeps `close()` from releasing the security scope while a
+    /// read or a save is still using it. Lock order is always
+    /// `operationLock` → `stateLock`; nothing takes them the other way round.
+    private let operationLock = NSLock()
+
+    private var lease: SecurityScopeLease
     private let io: any DocumentStoreIO
     private let access: any SecurityScopeAccessing
 
     private var currentURL: URL
     private var currentVersion: DocumentVersion
-    private var closed = false
+    private var currentState: State = .open
 
     /// Whether the file was writable when it was opened. Diagnostic only;
     /// `save` always re-checks, because permissions can change while a
@@ -99,9 +114,9 @@ public final class DocumentSession: @unchecked Sendable {
     }
 
     deinit {
-        // A session must not be deallocated while a save is running; callers
-        // hold it for the duration of the call. Releasing here only balances
-        // an open that was never explicitly closed.
+        // A session must not be deallocated while an operation is running;
+        // callers hold it for the duration of the call. Releasing here only
+        // balances an open that was never explicitly closed.
         lease.release()
     }
 
@@ -116,20 +131,28 @@ public final class DocumentSession: @unchecked Sendable {
         stateLock.withLock { currentVersion }
     }
 
+    public var state: State {
+        stateLock.withLock { currentState }
+    }
+
     public var isClosed: Bool {
-        stateLock.withLock { closed }
+        stateLock.withLock { currentState == .closed }
     }
 
     // MARK: - Reading
 
     public func read() throws -> Data {
-        try ensureOpen()
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        try ensureUsable()
+
+        let target = url
         do {
-            return try io.readContents(of: url)
+            return try io.readContents(of: target)
         } catch let error as DocumentStoreError {
             throw error
         } catch {
-            throw DocumentStoreError.notReadable(url, error.localizedDescription)
+            throw DocumentStoreError.notReadable(target, error.localizedDescription)
         }
     }
 
@@ -139,11 +162,35 @@ public final class DocumentSession: @unchecked Sendable {
     /// unreadable). A file that is simply gone returns `.missing` rather than
     /// throwing, because that is a normal answer to "has it changed?".
     public func checkExternalChange() throws -> ExternalChange {
-        try ensureOpen()
-        let status = try io.status(of: url)
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        try ensureUsable()
+
+        let target = url
+        let status = try io.status(of: target)
         guard status.exists else { return .missing }
-        let onDisk = try io.version(of: url)
+        let onDisk = try io.version(of: target)
         return Self.classify(expected: version, current: onDisk)
+    }
+
+    /// Re-reads the file's version after a save whose result could not be
+    /// confirmed. Returns the session to `.open` on success.
+    @discardableResult
+    public func refresh() throws -> DocumentVersion {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+
+        // Refreshing a closed session would silently reopen it, and the scope
+        // has already been released.
+        if isClosed { throw DocumentStoreError.sessionClosed }
+
+        let target = url
+        let updated = try io.version(of: target)
+        stateLock.withLock {
+            currentVersion = updated
+            currentState = .open
+        }
+        return updated
     }
 
     // MARK: - Writing
@@ -152,123 +199,210 @@ public final class DocumentSession: @unchecked Sendable {
     ///
     /// The original is never modified until the replacement step, and that
     /// step only runs when the file still matches the version this session
-    /// opened. On any failure the original keeps its exact bytes.
+    /// opened. A detected conflict, a staging failure or a failed commit with
+    /// the original verifiably in place leaves the original bytes untouched.
+    /// A commit that fails in an unclear state is reported as such, keeps every
+    /// surviving copy, and puts the session into `needsRefresh`.
     @discardableResult
     public func save(_ contents: Data) throws -> DocumentVersion {
-        try ensureOpen()
-        saveLock.lock()
-        defer { saveLock.unlock() }
-        try ensureOpen()
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        try ensureUsable()
 
         let target = url
         try Self.validateSaveTarget(try io.status(of: target), url: target)
 
         let expected = version
-        let staging = try io.createStagingFile(nextTo: target, contents: contents)
+        let staged = try io.createStagingFile(nextTo: target, contents: contents)
 
         var committed = false
+        var keepStaging = false
         defer {
             // The staging file is consumed by a successful replacement; on
-            // every other path it is removed so a failure leaves no debris.
-            if !committed {
-                try? io.removeItemIfExists(at: staging)
+            // every other path it is removed, unless it may be the only
+            // surviving copy of something.
+            if !committed && !keepStaging {
+                try? io.removeItemIfExists(at: staged.url)
             }
         }
 
-        let finalURL = try io.withCoordinatedWrite(at: target) { coordinatedURL in
-            // Everything below runs inside the write intent, immediately
-            // before the bytes are swapped. A process that ignores file
-            // coordination can still have written between the check above and
-            // this point, which is exactly why the check is repeated here.
-            let liveStatus = try io.status(of: coordinatedURL)
-            guard liveStatus.exists else {
-                throw DocumentStoreError.fileMissing(coordinatedURL)
-            }
-            try Self.validateSaveTarget(liveStatus, url: coordinatedURL)
+        let finalURL: URL
+        do {
+            finalURL = try io.withCoordinatedWrite(at: target) { coordinatedURL in
+                // Everything below runs inside the write intent, immediately
+                // before the bytes are swapped. A process that ignores file
+                // coordination can still have written between the check above
+                // and this point, which is exactly why the check is repeated.
+                let liveStatus = try io.status(of: coordinatedURL)
+                guard liveStatus.exists else {
+                    throw DocumentStoreError.fileMissing(coordinatedURL)
+                }
+                try Self.validateSaveTarget(liveStatus, url: coordinatedURL)
 
-            let onDisk = try io.version(of: coordinatedURL)
-            let change = Self.classify(expected: expected, current: onDisk)
-            guard case .unchanged = change else {
-                throw DocumentStoreError.externalModificationDetected(change)
+                let onDisk = try io.version(of: coordinatedURL)
+                let change = Self.classify(expected: expected, current: onDisk)
+                guard case .unchanged = change else {
+                    throw DocumentStoreError.externalModificationDetected(change)
+                }
+
+                return try io.replaceItem(at: coordinatedURL, with: staged, expecting: expected)
+            }
+        } catch let error as DocumentStoreError {
+            guard case let .replacementStateUncertain(recovery) = error else { throw error }
+
+            // The replacement may have installed the new bytes and only then
+            // reported an error. That is verified by hash, not assumed.
+            //
+            // If the caller saved identical bytes, the old and the new content
+            // hash the same and this reports "committed" even when nothing
+            // moved. That is harmless: the file holds exactly what was asked
+            // for, and the session adopts whatever version is now on disk.
+            if let current = try? io.version(of: recovery.targetURL),
+               current.contentHash == staged.contentHash {
+                committed = true
+                adoptLocation(recovery.targetURL)
+                stateLock.withLock {
+                    currentVersion = current
+                    currentState = .open
+                }
+                return current
             }
 
-            return try io.replaceItem(at: coordinatedURL, with: staging)
+            // The original is verifiably still in place: a plain failure.
+            if let current = try? io.version(of: recovery.targetURL),
+               current.identity == expected.identity,
+               current.contentHash == expected.contentHash {
+                throw DocumentStoreError.replacementFailed(recovery.underlyingDescription)
+            }
+
+            // Unknown. Keep every surviving copy and stop trusting the
+            // baseline until the caller resolves it.
+            keepStaging = true
+            stateLock.withLock { currentState = .needsRefresh }
+            throw error
         }
 
         committed = true
-        // The replacement changed the inode, so the session has to adopt the
-        // new identity before it can be used for another save.
-        let updated = try io.version(of: finalURL)
-        stateLock.withLock {
-            currentURL = finalURL
-            currentVersion = updated
-        }
-        return updated
+        return try finishCommit(at: finalURL)
     }
 
     /// Writes `contents` to `destination` and returns a **new** session for it.
     ///
     /// The receiver is left untouched: the caller decides when to close the
     /// old session. The original file is never modified by this call.
+    ///
+    /// With `overwrite`, the destination's version is recorded before staging
+    /// and re-checked inside the write intent, so a file changed by another app
+    /// after the user confirmed is refused rather than silently replaced. A
+    /// destination that did not exist at confirmation time but does at commit
+    /// time is also refused.
     public func saveAs(
         _ contents: Data,
         to destination: URL,
         overwrite: Bool = false
     ) throws -> DocumentSession {
-        try ensureOpen()
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        try ensureUsable()
+
         guard destination.isFileURL else { throw DocumentStoreError.notAFileURL }
-        guard destination.standardizedFileURL != url.standardizedFileURL else {
+        if try isSameFile(as: destination) {
             throw DocumentStoreError.unsupportedFileSituation(.sameFileAsCurrent, destination)
         }
 
         // A save panel hands back a security-scoped URL for the new location.
         let newLease = SecurityScopeLease(url: destination, access: access)
         do {
-            let status = try io.status(of: destination)
-            if status.exists {
+            let existing = try io.status(of: destination)
+            var expectedTarget: DocumentVersion?
+            if existing.exists {
                 guard overwrite else { throw DocumentStoreError.targetExists(destination) }
-                // Overwriting an existing file is an explicit user choice, but
-                // the same structural refusals still apply.
-                try Self.validateSaveTarget(status, url: destination)
+                try Self.validateSaveTarget(existing, url: destination)
+                let recorded = try io.version(of: destination)
+                if recorded.identity == version.identity {
+                    throw DocumentStoreError.unsupportedFileSituation(.sameFileAsCurrent, destination)
+                }
+                expectedTarget = recorded
             } else {
                 try Self.validateCreatableDestination(destination)
             }
 
-            let staging = try io.createStagingFile(nextTo: destination, contents: contents)
+            let staged = try io.createStagingFile(nextTo: destination, contents: contents)
             var committed = false
+            var keepStaging = false
             defer {
-                if !committed {
-                    try? io.removeItemIfExists(at: staging)
+                if !committed && !keepStaging {
+                    try? io.removeItemIfExists(at: staged.url)
                 }
             }
 
-            let finalURL = try io.withCoordinatedWrite(at: destination) { coordinatedURL in
-                let liveStatus = try io.status(of: coordinatedURL)
-                if liveStatus.exists {
-                    guard overwrite else { throw DocumentStoreError.targetExists(coordinatedURL) }
-                    try Self.validateSaveTarget(liveStatus, url: coordinatedURL)
-                    return try io.replaceItem(at: coordinatedURL, with: staging)
+            let finalURL: URL
+            do {
+                finalURL = try io.withCoordinatedWrite(at: destination) { coordinatedURL in
+                    let liveStatus = try io.status(of: coordinatedURL)
+
+                    if let expectedTarget {
+                        guard liveStatus.exists else {
+                            // Deleted after the user confirmed: do not recreate
+                            // it behind their back.
+                            throw DocumentStoreError.fileMissing(coordinatedURL)
+                        }
+                        guard overwrite else { throw DocumentStoreError.targetExists(coordinatedURL) }
+                        try Self.validateSaveTarget(liveStatus, url: coordinatedURL)
+
+                        let current = try io.version(of: coordinatedURL)
+                        if current.identity == version.identity {
+                            throw DocumentStoreError.unsupportedFileSituation(.sameFileAsCurrent, coordinatedURL)
+                        }
+                        let change = Self.classify(expected: expectedTarget, current: current)
+                        guard case .unchanged = change else {
+                            throw DocumentStoreError.externalModificationDetected(change)
+                        }
+                        return try io.replaceItem(at: coordinatedURL, with: staged, expecting: expectedTarget)
+                    }
+
+                    guard !liveStatus.exists else {
+                        throw DocumentStoreError.targetAppearedDuringSave(coordinatedURL)
+                    }
+                    do {
+                        try io.moveItem(at: staged.url, to: coordinatedURL)
+                    } catch {
+                        // A rename is a single step, but verify rather than
+                        // assume that a thrown error means nothing landed.
+                        if let created = try? io.version(of: coordinatedURL),
+                           created.contentHash == staged.contentHash {
+                            try? io.setPermissions(0o644, at: coordinatedURL)
+                            return coordinatedURL
+                        }
+                        throw error
+                    }
+                    // The staging file is created 0600 for safety. A brand-new
+                    // document should look like any other document, so it gets
+                    // ordinary permissions; an existing target keeps its own,
+                    // because replaceItemAt preserves the original's metadata.
+                    try? io.setPermissions(0o644, at: coordinatedURL)
+                    return coordinatedURL
                 }
-                // A file that did not exist is created, never "replaced".
-                try io.moveItem(at: staging, to: coordinatedURL)
-                // The staging file is created 0600 for safety. A brand-new
-                // document should look like any other document, so it gets
-                // ordinary permissions; an existing target keeps its own,
-                // because replaceItemAt preserves the original's metadata.
-                try? io.setPermissions(0o644, at: coordinatedURL)
-                return coordinatedURL
+            } catch let error as DocumentStoreError {
+                guard case let .replacementStateUncertain(recovery) = error else { throw error }
+
+                if let current = try? io.version(of: recovery.targetURL),
+                   current.contentHash == staged.contentHash {
+                    committed = true
+                    return try makeSession(at: recovery.targetURL, lease: newLease)
+                }
+                if let expectedTarget,
+                   let current = try? io.version(of: recovery.targetURL),
+                   current.identity == expectedTarget.identity,
+                   current.contentHash == expectedTarget.contentHash {
+                    throw DocumentStoreError.replacementFailed(recovery.underlyingDescription)
+                }
+                keepStaging = true
+                throw error
             }
 
             committed = true
-            let version = try io.version(of: finalURL)
-            return DocumentSession(
-                url: finalURL,
-                version: version,
-                isWritableAtOpen: true,
-                lease: newLease,
-                io: io,
-                access: access
-            )
+            return try makeSession(at: finalURL, lease: newLease)
         } catch {
             newLease.release()
             throw error
@@ -276,15 +410,16 @@ public final class DocumentSession: @unchecked Sendable {
     }
 
     /// Releases the security scope. Safe to call more than once.
+    ///
+    /// Waits for any in-flight operation, so the scope is never released while
+    /// a read or a save is still using it.
     public func close() {
-        // Wait for an in-flight save: releasing access mid-write would turn a
-        // recoverable failure into an unclear one.
-        saveLock.lock()
-        defer { saveLock.unlock() }
+        operationLock.lock()
+        defer { operationLock.unlock() }
 
         let alreadyClosed = stateLock.withLock { () -> Bool in
-            if closed { return true }
-            closed = true
+            if currentState == .closed { return true }
+            currentState = .closed
             return false
         }
         guard !alreadyClosed else { return }
@@ -293,8 +428,18 @@ public final class DocumentSession: @unchecked Sendable {
 
     // MARK: - Decisions
 
-    private func ensureOpen() throws {
-        if isClosed { throw DocumentStoreError.sessionClosed }
+    /// Called with `operationLock` held, so the state cannot change underneath
+    /// it; it still goes through `stateLock` so every read of the state follows
+    /// the same lock order.
+    private func ensureUsable() throws {
+        switch state {
+        case .open:
+            return
+        case .needsRefresh:
+            throw DocumentStoreError.sessionNeedsRefresh
+        case .closed:
+            throw DocumentStoreError.sessionClosed
+        }
     }
 
     /// Identity first: a new inode means the file was replaced, whatever the
@@ -308,6 +453,72 @@ public final class DocumentSession: @unchecked Sendable {
             return .modified(current)
         }
         return .unchanged
+    }
+
+    /// Records the new location after a replacement and moves the security
+    /// scope with it. `replaceItemAt` normally returns the same path, but the
+    /// lease must follow the file if it does not.
+    private func adoptLocation(_ newURL: URL) {
+        let previous = stateLock.withLock { () -> SecurityScopeLease? in
+            guard newURL != currentURL else { return nil }
+            currentURL = newURL
+            return lease
+        }
+        guard let previous else { return }
+        // Acquire the new scope before releasing the old one, so the session is
+        // never left without access to the file it is now pointing at.
+        let replacement = SecurityScopeLease(url: newURL, access: access)
+        stateLock.withLock { lease = replacement }
+        previous.release()
+    }
+
+    /// Reads back the version after a successful replacement. A failure here is
+    /// not a failed save: the file was written. It is reported separately and
+    /// leaves the session in `needsRefresh`.
+    private func finishCommit(at finalURL: URL) throws -> DocumentVersion {
+        adoptLocation(finalURL)
+        do {
+            let updated = try io.version(of: finalURL)
+            stateLock.withLock {
+                currentVersion = updated
+                currentState = .open
+            }
+            return updated
+        } catch {
+            stateLock.withLock { currentState = .needsRefresh }
+            let reason = (error as? DocumentStoreError)?.localizedDescription ?? error.localizedDescription
+            throw DocumentStoreError.committedButUnverified(finalURL, reason)
+        }
+    }
+
+    private func makeSession(at url: URL, lease: SecurityScopeLease) throws -> DocumentSession {
+        do {
+            let version = try io.version(of: url)
+            return DocumentSession(
+                url: url,
+                version: version,
+                isWritableAtOpen: true,
+                lease: lease,
+                io: io,
+                access: access
+            )
+        } catch {
+            let reason = (error as? DocumentStoreError)?.localizedDescription ?? error.localizedDescription
+            throw DocumentStoreError.committedButUnverified(url, reason)
+        }
+    }
+
+    /// True when `destination` reaches the same file as the session, through
+    /// any path: a symlink, a symlinked parent directory, `..`, or a hard link.
+    private func isSameFile(as destination: URL) throws -> Bool {
+        let resolvedDestination = destination.resolvingSymlinksInPath().standardizedFileURL
+        let resolvedCurrent = url.resolvingSymlinksInPath().standardizedFileURL
+        if resolvedDestination == resolvedCurrent { return true }
+
+        if let existing = try? io.version(of: destination) {
+            return existing.identity == version.identity
+        }
+        return false
     }
 
     private static func validateSaveTarget(_ status: FileStatus, url: URL) throws {

@@ -177,7 +177,9 @@ public final class PDFDocumentModel: ObservableObject {
         case let .unsupportedFileSituation(situation, _):
             return .unsupportedFileSituation(situation)
         case .notReadable, .sessionClosed, .externalModificationDetected,
-             .targetExists, .stagingFailed, .replacementFailed, .coordinationFailed:
+             .targetExists, .stagingFailed, .replacementFailed,
+             .replacementStateUncertain, .committedButUnverified,
+             .sessionNeedsRefresh, .targetAppearedDuringSave, .coordinationFailed:
             return .unreadable
         }
     }
