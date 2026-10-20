@@ -12,8 +12,10 @@ public final class PDFDocumentModel: ObservableObject {
         case notAFileURL
         case unsupportedType(String)
         case fileMissing
+        case permissionDenied
         case unreadable
         case emptyDocument
+        case unsupportedFileSituation(UnsupportedFileSituation)
     }
 
     public static let minimumZoomScale: CGFloat = 0.25
@@ -37,14 +39,21 @@ public final class PDFDocumentModel: ObservableObject {
     @Published public private(set) var loadGeneration: Int = 0
 
     /// PDFKit memory-maps the file, so a security-scoped URL must stay open for
-    /// as long as the document is displayed. The lease is replaced only after a
-    /// candidate document has been fully loaded, so a failed open leaves the
-    /// previous document and its access intact.
-    private let access: any SecurityScopeAccessing
-    private var activeLease: SecurityScopeLease?
+    /// as long as the document is displayed. The session is the single owner of
+    /// that access; the model never starts or stops a scope itself, which is
+    /// what keeps the two layers from releasing each other's grants.
+    ///
+    /// A candidate session is replaced only after its document has been fully
+    /// loaded, so a failed open leaves the previous document and its access
+    /// intact.
+    private let store: DocumentStore
+
+    /// The open file session, or nil when nothing is loaded. Exposed so later
+    /// phases can save through the same session that owns the access.
+    public private(set) var documentSession: DocumentSession?
 
     public init(access: any SecurityScopeAccessing = SystemSecurityScopeAccess()) {
-        self.access = access
+        self.store = DocumentStore(access: access)
     }
 
     public var isLoaded: Bool { document != nil }
@@ -74,42 +83,47 @@ public final class PDFDocumentModel: ObservableObject {
             return false
         }
 
-        // Phase 1: acquire before touching the file. A security-scoped URL must
-        // be opened before any access, including an existence check: in a
-        // sandboxed build `fileExists` on an unopened URL can fail even when the
-        // file is there.
-        let candidate = SecurityScopeLease(url: url, access: access)
-
-        // Phase 2: validate while the candidate access is still active.
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            candidate.release()
-            lastError = .fileMissing
+        // Phase 1: acquire access and record the initial version. The store
+        // acquires the scope before touching the file: a security-scoped URL
+        // must be opened before any access, including an existence check,
+        // because in a sandboxed build `fileExists` on an unopened URL can
+        // fail even when the file is there.
+        let candidate: DocumentSession
+        do {
+            candidate = try store.open(url)
+        } catch let error as DocumentStoreError {
+            lastError = Self.loadError(from: error)
+            return false
+        } catch {
+            lastError = .unreadable
             return false
         }
+
+        // Phase 2: validate while the candidate access is still active.
         guard let opened = PDFDocument(url: url) else {
-            candidate.release()
+            candidate.close()
             lastError = .unreadable
             return false
         }
         guard opened.pageCount > 0 else {
-            candidate.release()
+            candidate.close()
             lastError = .emptyDocument
             return false
         }
 
         // Phase 3: commit. Swap first, then release the previous scope, so the
         // model is never left without access to the document it displays.
-        let previous = activeLease
-        activeLease = candidate
-        previous?.release()
+        let previous = documentSession
+        documentSession = candidate
+        previous?.close()
 
         apply(document: opened, fileURL: url)
         return true
     }
 
     public func close() {
-        activeLease?.release()
-        activeLease = nil
+        documentSession?.close()
+        documentSession = nil
         document = nil
         fileURL = nil
         title = ""
@@ -148,6 +162,29 @@ public final class PDFDocumentModel: ObservableObject {
             return name
         }
         return "Untitled"
+    }
+
+    /// Keeps the reader's user-facing failures narrow while the store reports
+    /// the file-level situation precisely.
+    private static func loadError(from error: DocumentStoreError) -> LoadError {
+        switch error {
+        case .notAFileURL:
+            return .notAFileURL
+        case .fileMissing:
+            return .fileMissing
+        case .permissionDenied, .readOnly:
+            return .permissionDenied
+        case let .unsupportedFileSituation(situation, _):
+            return .unsupportedFileSituation(situation)
+        case .notReadable, .sessionClosed, .externalModificationDetected,
+             .targetExists, .stagingFailed, .replacementFailed,
+             .replacementStateUncertain, .committedButUnverified,
+             .sessionNeedsRefresh, .reloadRequired, .targetAppearedDuringSave,
+             .coordinationFailed:
+            // None of these can happen while opening a file; they are save- and
+            // session-level outcomes. Kept here so the mapping stays exhaustive.
+            return .unreadable
+        }
     }
 
     // MARK: - Navigation
@@ -221,10 +258,25 @@ extension PDFDocumentModel.LoadError: LocalizedError {
             return "YoPDF can only open PDF files, but this file has \(suffix)."
         case .fileMissing:
             return "The file could not be found. It may have been moved or deleted."
+        case .permissionDenied:
+            return "YoPDF does not have permission to open this file."
         case .unreadable:
             return "This file is not a readable PDF. It may be damaged or password protected."
         case .emptyDocument:
             return "This PDF contains no pages."
+        case let .unsupportedFileSituation(situation):
+            switch situation {
+            case .symbolicLink:
+                return "This PDF is a symbolic link. Open the file it points to instead."
+            case let .hardLink(count):
+                return "This PDF is linked to \(count) other files and cannot be opened safely."
+            case .notARegularFile:
+                return "That location is not a regular file."
+            case .cloudPlaceholderNotDownloaded:
+                return "This PDF has not been downloaded from the cloud yet."
+            case .sameFileAsCurrent:
+                return "That is the file that is already open."
+            }
         }
     }
 }

@@ -1,8 +1,13 @@
 # YoPDF for macOS
 
-Native PDF reader built with **SwiftUI + AppKit + PDFKit**. This is the P0
-skeleton: it opens local PDFs, renders them, and navigates/zooms. There is no
-network code, no account system, and no agent integration.
+Native PDF reader built with **SwiftUI + AppKit + PDFKit**. It opens local PDFs
+directly from disk and renders them; there is no managed library, no network
+code, no account system, and no agent integration.
+
+P1 adds a file-first `DocumentStore` in `YoPDFCore`: file identity and version
+tracking, external-change detection, and safe in-place saving. There is no Save
+command in the UI yet — the save path is exercised through the Core API and its
+tests, and no document is presented as "edited" before annotations exist.
 
 ## Requirements
 
@@ -18,7 +23,7 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (31)
+./scripts/test.sh                     # unit tests (97)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
@@ -44,6 +49,10 @@ macos/
 ├── project.yml                 # single source of truth for the Xcode project
 ├── Config/Info.plist           # bundle metadata, PDF document type
 ├── YoPDFCore/                  # reader logic, no UI — unit-testable module
+│   ├── DocumentStore.swift     # file sessions: open/read/check/save/saveAs/close
+│   ├── DocumentStoreIO.swift   # filesystem seam + POSIX implementation
+│   ├── DocumentStoreError.swift
+│   ├── DocumentVersion.swift   # identity, version, external-change types
 │   ├── PDFDocumentModel.swift
 │   ├── ReaderViewSync.swift    # pure page/zoom decisions used by the bridge
 │   └── SecurityScopeAccess.swift
@@ -59,6 +68,15 @@ macos/
 │   ├── SecurityScopeSpy.swift
 │   ├── PDFDocumentModelTests.swift
 │   ├── DocumentSecurityScopeTests.swift
+│   ├── DocumentStoreTestSupport.swift   # temp dirs, payloads, fault injection
+│   ├── DocumentStoreTests.swift         # sessions, versions, external changes
+│   ├── DocumentStoreSaveTests.swift     # save / Save As contract
+│   ├── DocumentStoreFailureTests.swift  # injected staging/commit failures
+│   ├── DocumentStoreRecoveryTests.swift # partial commits, post-commit failures
+│   ├── DocumentStoreSaveAsSafetyTests.swift # Save As target races and aliases
+│   ├── DocumentStoreLifecycleTests.swift    # close vs. in-flight operations
+│   ├── DocumentStoreScaleTests.swift    # 200 MB streaming and save
+│   ├── DocumentStoreModelIntegrationTests.swift
 │   └── ReaderViewSyncTests.swift
 └── scripts/{generate,build,test}.sh
 ```
@@ -66,6 +84,50 @@ macos/
 Each `WindowGroup` window owns its own `PDFDocumentModel`. Menu commands read the
 focused window's model through `FocusedValues`, so zoom/page actions and the open
 panel apply to the active window only.
+
+`PDFDocumentModel` does not acquire security scopes itself. It holds a
+`DocumentSession`, which is the single owner of the scope for the file it opened;
+closing the session (or releasing the last reference) releases the grant exactly
+once. A failed open releases only the candidate session, leaving the document on
+screen — and its access — untouched.
+
+`DocumentStore` is byte-level: it never parses PDF pages and never decides what
+an annotation means. A save writes a sibling staging file, flushes it, re-checks
+the file's identity and content hash inside an `NSFileCoordinator` write intent,
+and only then replaces the original. A changed or replaced file is reported as a
+conflict instead of being overwritten.
+
+What the save path does and does not promise:
+
+- A detected conflict, a staging failure, and a commit that failed with the
+  original verifiably still in place each leave the original bytes intact, and
+  each is reported as its own error case rather than a single `saveFailed`.
+- `FileManager.replaceItemAt` can fail *after* it has already started moving
+  files, so a thrown error is never read as "nothing happened". The store
+  re-inspects the target, the staging file and the location the system reports
+  for the original; if the outcome cannot be decided it throws
+  `replacementStateUncertain` listing every surviving copy. It does not delete
+  the only recoverable copy and does not attempt an automatic restore — the
+  caller decides.
+- A replacement that succeeded but whose new version could not be read back is
+  reported as `committedButUnverified`, not as a failure: the bytes *were*
+  written. The session moves to `needsRefresh`, which refuses further saves until
+  `refresh()` re-reads the file and re-establishes a known version.
+- An error from the coordinator does not by itself mean "not committed". The
+  write block can finish and install the file before the coordinator reports a
+  problem, so the block's result wins, and any error that does escape is checked
+  against the file's hash before it is called a failure.
+- `refresh()` is not a way around the conflict check, and not a reload. On a
+  session in `needsRefresh` it only accepts the bytes its save meant to write or
+  the original it was told to keep; a different file at the same path — for
+  instance one another program created while the outcome was undecided — leaves
+  the session in `needsRefresh` and is reported as an external modification. On
+  a session that is simply `.open` it refuses with `reloadRequired` rather than
+  re-reading the file, because adopting a newer version there would leave the
+  in-memory document holding older bytes while the save baseline moved forward.
+- Crash durability is not claimed. `fsync`/`F_FULLFSYNC` is issued for the
+  staging file and its directory before the replacement, but "power loss at every
+  instant still leaves a consistent result" is not something these tests show.
 
 `YoPDFCore` is a framework so tests are pure logic tests: they link the module
 and never launch the app, so no window server or accessibility permission is
@@ -87,5 +149,28 @@ separate task; see `internal/` notes (not published).
 
 ## Scope
 
-P0 intentionally excludes: annotations, search, recent documents, tabs, agent
-integration, accounts, sync, PDF editing.
+P0 excluded annotations, search, recent documents, tabs, agent integration,
+accounts, sync and PDF editing. P1 adds only file access and safe persistence:
+no annotations, no undo, no autosave, no document library, no Save UI.
+
+Known P1 boundaries:
+
+- Security-scoped bookmarks are not created. Nothing needs to survive a window
+  restoration yet, so a session holds a runtime scope only.
+- Symlinks, hard links and undownloaded cloud placeholders are refused by
+  `save` rather than written through; `saveAs` is the escape hatch.
+- Crash durability is not claimed; the save-path notes above list exactly which
+  failure outcomes are verified and which are not.
+- Recovery after an undecidable save is manual by design: the session moves to
+  `needsRefresh` and refuses further saves until the caller calls `refresh()`,
+  and `refresh()` only succeeds when the file matches the expected outcome.
+  There is no automatic retry and no background restore.
+- There is no reload yet. Accepting an external change means reopening the
+  document, which also replaces the in-memory PDF; `refresh()` deliberately does
+  not do that, and refuses when there is no pending save to verify.
+- Save As refuses to write over a target that changed, appeared or vanished
+  between confirmation and the coordinated commit, and refuses aliases of the
+  file the session already has open (same path via symlink, symlinked parent
+  directory, or hard link). A different file with the same bytes is allowed.
+- The 200 MB test skips itself when the volume has less than 800 MB free, since
+  it needs room for the file plus its staging copy.
