@@ -11,6 +11,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+if [[ ! -d YoPDF.xcodeproj || project.yml -nt YoPDF.xcodeproj/project.pbxproj ]]; then
+  echo "project.yml changed or project missing; regenerating..."
+  ./scripts/generate.sh
+fi
+
 CONFIGURATION="${CONFIGURATION:-Debug}"
 DESTINATION="${DESTINATION:-platform=macOS,arch=arm64}"
 DERIVED_DATA="${DERIVED_DATA:-build/DerivedData}"

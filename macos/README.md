@@ -18,9 +18,13 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (15)
+./scripts/test.sh                     # unit tests (30)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
+
+`build.sh` and `test.sh` regenerate the Xcode project automatically when
+`project.yml` is newer than the generated project, so a fresh clone only needs
+XcodeGen installed.
 
 Build products stay under `macos/build/` (git-ignored) so builds are
 reproducible and easy to inspect.
@@ -40,18 +44,28 @@ macos/
 ├── project.yml                 # single source of truth for the Xcode project
 ├── Config/Info.plist           # bundle metadata, PDF document type
 ├── YoPDFCore/                  # reader logic, no UI — unit-testable module
-│   └── PDFDocumentModel.swift
+│   ├── PDFDocumentModel.swift
+│   ├── ReaderViewSync.swift    # pure page/zoom decisions used by the bridge
+│   └── SecurityScopeAccess.swift
 ├── YoPDF/
-│   ├── App/YoPDFApp.swift      # @main, single WindowGroup
+│   ├── App/YoPDFApp.swift      # @main, one model per window
 │   ├── App/PDFReaderCommands.swift
+│   ├── App/ReaderFocusedValues.swift
 │   └── Reader/
 │       ├── PDFViewerRepresentable.swift # PDFView ↔ SwiftUI bridge
 │       └── PDFReaderView.swift          # toolbar, empty state, drag & drop
 ├── YoPDFTests/
 │   ├── PDFFixtureFactory.swift # generates real PDFs at runtime
-│   └── PDFDocumentModelTests.swift
+│   ├── SecurityScopeSpy.swift
+│   ├── PDFDocumentModelTests.swift
+│   ├── DocumentSecurityScopeTests.swift
+│   └── ReaderViewSyncTests.swift
 └── scripts/{generate,build,test}.sh
 ```
+
+Each `WindowGroup` window owns its own `PDFDocumentModel`. Menu commands read the
+focused window's model through `FocusedValues`, so zoom/page actions and the open
+panel apply to the active window only.
 
 `YoPDFCore` is a framework so tests are pure logic tests: they link the module
 and never launch the app, so no window server or accessibility permission is

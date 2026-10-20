@@ -1,6 +1,7 @@
 import AppKit
 import PDFKit
 import SwiftUI
+import YoPDFCore
 
 /// Bridges PDFView into SwiftUI.
 ///
@@ -38,12 +39,14 @@ struct PDFViewerRepresentable: NSViewRepresentable {
 
         view.autoScales = autoScales
 
-        if !autoScales, view.scaleFactor.isFinite, abs(view.scaleFactor - zoomScale) > 0.001 {
+        if !autoScales,
+           ReaderViewSync.shouldApplyZoom(current: view.scaleFactor, target: zoomScale) {
             view.scaleFactor = zoomScale
         }
 
-        guard let document, document.pageCount > 0 else { return }
-        let clamped = min(max(currentPageIndex, 0), document.pageCount - 1)
+        guard let document,
+              let clamped = ReaderViewSync.clampedPageIndex(currentPageIndex, pageCount: document.pageCount)
+        else { return }
         if let target = document.page(at: clamped), view.currentPage !== target {
             view.go(to: target)
         }

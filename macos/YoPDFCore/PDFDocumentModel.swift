@@ -37,11 +37,15 @@ public final class PDFDocumentModel: ObservableObject {
     @Published public private(set) var loadGeneration: Int = 0
 
     /// PDFKit memory-maps the file, so a security-scoped URL must stay open for
-    /// as long as the document is displayed. Non-sandboxed builds return false
-    /// here and need no bookkeeping.
-    private var securityScopedURL: URL?
+    /// as long as the document is displayed. The lease is replaced only after a
+    /// candidate document has been fully loaded, so a failed open leaves the
+    /// previous document and its access intact.
+    private let access: any SecurityScopeAccessing
+    private var activeLease: SecurityScopeLease?
 
-    public init() {}
+    public init(access: any SecurityScopeAccessing = SystemSecurityScopeAccess()) {
+        self.access = access
+    }
 
     public var isLoaded: Bool { document != nil }
 
@@ -50,8 +54,15 @@ public final class PDFDocumentModel: ObservableObject {
 
     // MARK: - Opening
 
-    /// Opens a local PDF. Returns `false` and records `lastError` on failure;
-    /// a failed open never replaces the document that is already loaded.
+    /// Opens a local PDF with a two-phase switch:
+    ///
+    /// 1. acquire access for the candidate URL,
+    /// 2. validate and load the document while that access is held,
+    /// 3. only on success replace the current document and release the previous
+    ///    access.
+    ///
+    /// A failed open therefore leaves the loaded document *and* its security
+    /// scope untouched. Returns `false` and records `lastError` on failure.
     @discardableResult
     public func open(url: URL) -> Bool {
         guard url.isFileURL else {
@@ -67,24 +78,34 @@ public final class PDFDocumentModel: ObservableObject {
             return false
         }
 
-        beginSecurityScope(for: url)
+        // Phase 1: acquire. The lease releases itself if this open does not commit.
+        let candidate = SecurityScopeLease(url: url, access: access)
+
+        // Phase 2: validate while the candidate access is still active.
         guard let opened = PDFDocument(url: url) else {
-            endSecurityScope()
+            candidate.release()
             lastError = .unreadable
             return false
         }
         guard opened.pageCount > 0 else {
-            endSecurityScope()
+            candidate.release()
             lastError = .emptyDocument
             return false
         }
+
+        // Phase 3: commit. Swap first, then release the previous scope, so the
+        // model is never left without access to the document it displays.
+        let previous = activeLease
+        activeLease = candidate
+        previous?.release()
 
         apply(document: opened, fileURL: url)
         return true
     }
 
     public func close() {
-        endSecurityScope()
+        activeLease?.release()
+        activeLease = nil
         document = nil
         fileURL = nil
         title = ""
@@ -112,18 +133,6 @@ public final class PDFDocumentModel: ObservableObject {
         lastError = nil
         title = Self.resolvedTitle(for: document, fileURL: fileURL)
         loadGeneration &+= 1
-    }
-
-    private func beginSecurityScope(for url: URL) {
-        endSecurityScope()
-        if url.startAccessingSecurityScopedResource() {
-            securityScopedURL = url
-        }
-    }
-
-    private func endSecurityScope() {
-        securityScopedURL?.stopAccessingSecurityScopedResource()
-        securityScopedURL = nil
     }
 
     private static func resolvedTitle(for document: PDFDocument, fileURL: URL?) -> String {

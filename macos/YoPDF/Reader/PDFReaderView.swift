@@ -25,9 +25,8 @@ struct PDFReaderView: View {
             guard case let .success(urls) = result, let url = urls.first else { return }
             model.open(url: url)
         }
-        .onReceive(NotificationCenter.default.publisher(for: .yopdfRequestOpenDocument)) { _ in
-            isImporterPresented = true
-        }
+        .focusedSceneValue(\.documentModel, model)
+        .focusedSceneValue(\.openDocument, { isImporterPresented = true })
         .alert(
             "Couldn’t open this document",
             isPresented: Binding(
