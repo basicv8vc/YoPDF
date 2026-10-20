@@ -1,0 +1,114 @@
+name: YoPDF
+
+options:
+  bundleIdPrefix: dev.yopdf.provisional
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+    DEVELOPMENT_TEAM: ""
+    CLANG_ENABLE_MODULES: YES
+
+targets:
+  # Reader logic lives in its own module so it can be tested without launching
+  # the app. Host-app tests depend on XCTest injection into a GUI process, which
+  # is fragile in headless and CI environments; logic tests are not.
+  YoPDFCore:
+    type: framework
+    platform: macOS
+    sources:
+      - path: YoPDFCore
+    settings:
+      base:
+        PRODUCT_NAME: YoPDFCore
+        PRODUCT_BUNDLE_IDENTIFIER: dev.yopdf.provisional.core
+        DEFINES_MODULE: YES
+        GENERATE_INFOPLIST_FILE: YES
+        SKIP_INSTALL: YES
+        BUILD_LIBRARY_FOR_DISTRIBUTION: NO
+        ENABLE_HARDENED_RUNTIME: NO
+
+  YoPDF:
+    type: application
+    platform: macOS
+    sources:
+      - path: YoPDF
+    dependencies:
+      - target: YoPDFCore
+        embed: true
+    settings:
+      base:
+        PRODUCT_NAME: YoPDF
+        PRODUCT_BUNDLE_IDENTIFIER: dev.yopdf.provisional
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        ENABLE_HARDENED_RUNTIME: NO
+        SWIFT_EMIT_LOC_STRINGS: YES
+        COMBINE_HIDPI_IMAGES: YES
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/../Frameworks"
+      configs:
+        # Debug gets its own bundle identifier so a Debug and a Release build can
+        # coexist on the same machine without LaunchServices getting confused
+        # about which copy to activate.
+        Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: dev.yopdf.provisional.debug
+        Release:
+          PRODUCT_BUNDLE_IDENTIFIER: dev.yopdf.provisional
+          # Ad-hoc signing otherwise injects com.apple.security.get-task-allow,
+          # which lets a debugger attach. Fine locally, wrong for any build that
+          # is handed to someone else. Release builds carry no entitlements
+          # until a real Developer ID + notarization setup exists.
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+    info:
+      path: Config/Info.plist
+      properties:
+        CFBundleDisplayName: YoPDF
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        LSApplicationCategoryType: public.app-category.productivity
+        LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
+        NSHighResolutionCapable: true
+        NSHumanReadableCopyright: "YoPDF contributors. Apache-2.0. Provisional bundle identifier."
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: PDF Document
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes:
+              - com.adobe.pdf
+
+  YoPDFTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: YoPDFTests
+    dependencies:
+      - target: YoPDFCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.yopdf.provisional.tests
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  YoPDF:
+    build:
+      targets:
+        YoPDFCore: all
+        YoPDF: all
+        YoPDFTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      gatherCoverageData: true
+      targets:
+        - YoPDFTests
