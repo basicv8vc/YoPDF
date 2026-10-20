@@ -12,7 +12,7 @@ Annotations, search, and AI-assisted reading are not implemented yet.
 | Area | State |
 | --- | --- |
 | macOS app (SwiftUI + AppKit + PDFKit) | Reader skeleton, builds and runs |
-| Unit tests | 30 logic tests |
+| Unit tests | 31 logic tests |
 | Annotations | Not started |
 | Windows (WinUI 3 + PDFium) | Feasibility work, not in this repository yet |
 | AI / agent integration | Not started |

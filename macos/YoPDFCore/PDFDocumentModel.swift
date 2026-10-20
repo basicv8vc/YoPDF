@@ -73,15 +73,19 @@ public final class PDFDocumentModel: ObservableObject {
             lastError = .unsupportedType(url.pathExtension)
             return false
         }
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            lastError = .fileMissing
-            return false
-        }
 
-        // Phase 1: acquire. The lease releases itself if this open does not commit.
+        // Phase 1: acquire before touching the file. A security-scoped URL must
+        // be opened before any access, including an existence check: in a
+        // sandboxed build `fileExists` on an unopened URL can fail even when the
+        // file is there.
         let candidate = SecurityScopeLease(url: url, access: access)
 
         // Phase 2: validate while the candidate access is still active.
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            candidate.release()
+            lastError = .fileMissing
+            return false
+        }
         guard let opened = PDFDocument(url: url) else {
             candidate.release()
             lastError = .unreadable

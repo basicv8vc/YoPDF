@@ -93,7 +93,7 @@ final class DocumentSecurityScopeTests: XCTestCase {
         XCTAssertFalse(spy.stops.contains(good), "the displayed document keeps its access")
     }
 
-    func testFailedOpenWithMissingFileDoesNotAcquireAnything() throws {
+    func testMissingFileStartsAndReleasesCandidateScope() throws {
         let spy = SecurityScopeSpy()
         let model = PDFDocumentModel(access: spy)
 
@@ -101,7 +101,28 @@ final class DocumentSecurityScopeTests: XCTestCase {
             .appendingPathComponent("missing-\(UUID().uuidString).pdf")
         XCTAssertFalse(model.open(url: missing))
 
-        XCTAssertEqual(spy.events, [], "validation happens before any scope is taken")
+        XCTAssertEqual(spy.starts, [missing], "access must be opened before the existence check")
+        XCTAssertEqual(spy.stops, [missing], "the candidate scope must be released on failure")
+        XCTAssertEqual(model.lastError, .fileMissing)
+    }
+
+    func testMissingFileWhileDocumentIsOpenKeepsOldDocumentAndScope() throws {
+        let good = try makeFixture(named: "scope-before-missing")
+        let missing = FileManager.default.temporaryDirectory
+            .appendingPathComponent("missing-\(UUID().uuidString).pdf")
+        let spy = SecurityScopeSpy()
+        let model = PDFDocumentModel(access: spy)
+
+        XCTAssertTrue(model.open(url: good))
+        XCTAssertFalse(model.open(url: missing))
+
+        XCTAssertTrue(model.isLoaded)
+        XCTAssertEqual(model.fileURL, good)
+        XCTAssertEqual(model.title, "scope-before-missing")
+
+        XCTAssertEqual(spy.starts, [good, missing])
+        XCTAssertEqual(spy.stops, [missing], "only the failed candidate is released")
+        XCTAssertFalse(spy.stops.contains(good), "the displayed document keeps its access")
     }
 
     // MARK: - Close and deallocation

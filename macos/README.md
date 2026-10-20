@@ -18,7 +18,7 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (30)
+./scripts/test.sh                     # unit tests (31)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
