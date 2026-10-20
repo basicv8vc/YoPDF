@@ -23,7 +23,7 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (89)
+./scripts/test.sh                     # unit tests (96)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
@@ -113,6 +113,17 @@ What the save path does and does not promise:
   reported as `committedButUnverified`, not as a failure: the bytes *were*
   written. The session moves to `needsRefresh`, which refuses further saves until
   `refresh()` re-reads the file and re-establishes a known version.
+- An error from the coordinator does not by itself mean "not committed". The
+  write block can finish and install the file before the coordinator reports a
+  problem, so the block's result wins, and any error that does escape is checked
+  against the file's hash before it is called a failure.
+- `refresh()` is not a way around the conflict check. A session in
+  `needsRefresh` remembers what its save was trying to produce, and only accepts
+  the bytes it meant to write or the original it was told to keep. A different
+  file at the same path — for instance one another program created while the
+  outcome was undecided — leaves the session in `needsRefresh` and is reported
+  as an external modification. Deciding which version to keep is the caller's
+  call, not something refresh may assume.
 - Crash durability is not claimed. `fsync`/`F_FULLFSYNC` is issued for the
   staging file and its directory before the replacement, but "power loss at every
   instant still leaves a consistent result" is not something these tests show.
@@ -150,7 +161,8 @@ Known P1 boundaries:
 - Crash durability is not claimed; the save-path notes above list exactly which
   failure outcomes are verified and which are not.
 - Recovery after an undecidable save is manual by design: the session moves to
-  `needsRefresh` and refuses further saves until the caller calls `refresh()`.
+  `needsRefresh` and refuses further saves until the caller calls `refresh()`,
+  and `refresh()` only succeeds when the file matches the expected outcome.
   There is no automatic retry and no background restore.
 - Save As refuses to write over a target that changed, appeared or vanished
   between confirmation and the coordinated commit, and refuses aliases of the

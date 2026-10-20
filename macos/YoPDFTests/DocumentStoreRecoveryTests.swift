@@ -157,4 +157,137 @@ final class DocumentStoreRecoveryTests: XCTestCase {
         try session.save(TestPayload.bytes(256))
         XCTAssertEqual(try Data(contentsOf: url), TestPayload.bytes(256))
     }
+
+    // MARK: - A coordinator error must not hide a write that already happened
+
+    func testCoordinatedWritePrefersAccessorSuccessOverACoordinationError() {
+        let committed = URL(fileURLWithPath: "/tmp/yopdf-committed.pdf")
+        let result = SystemDocumentStoreIO.resolve(
+            outcome: .success(committed),
+            coordinationError: NSError(domain: NSCocoaErrorDomain, code: NSFileWriteUnknownError)
+        )
+
+        guard case let .success(resolved) = result else {
+            return XCTFail("a completed write block must win over a coordination error")
+        }
+        XCTAssertEqual(resolved, committed)
+    }
+
+    func testCoordinatedWriteKeepsTheAccessorErrorWhenBothFail() {
+        let failure = DocumentStoreError.externalModificationDetected(.missing)
+        let result = SystemDocumentStoreIO.resolve(
+            outcome: .failure(failure),
+            coordinationError: NSError(domain: NSCocoaErrorDomain, code: NSFileWriteUnknownError)
+        )
+
+        XCTAssertThrowsError(try result.get()) { error in
+            XCTAssertEqual(
+                error as? DocumentStoreError,
+                failure,
+                "the specific outcome must not be replaced by a generic coordination failure"
+            )
+        }
+    }
+
+    func testCoordinatedWriteReportsCoordinationFailureOnlyWhenTheBlockNeverRan() {
+        let coordinationError = NSError(
+            domain: NSCocoaErrorDomain,
+            code: NSFileWriteUnknownError,
+            userInfo: [NSLocalizedDescriptionKey: "another process holds the file"]
+        )
+
+        let withError = SystemDocumentStoreIO.resolve(
+            outcome: nil,
+            coordinationError: coordinationError
+        )
+        XCTAssertThrowsError(try withError.get()) { error in
+            guard case .coordinationFailed = (error as? DocumentStoreError) else {
+                return XCTFail("expected .coordinationFailed, got \(error)")
+            }
+        }
+
+        let withoutAnything = SystemDocumentStoreIO.resolve(outcome: nil, coordinationError: nil)
+        XCTAssertThrowsError(try withoutAnything.get()) { error in
+            guard case .coordinationFailed = (error as? DocumentStoreError) else {
+                return XCTFail("expected .coordinationFailed, got \(error)")
+            }
+        }
+    }
+
+    func testCoordinatorErrorAfterTheWriteBlockRanIsNotReportedAsUncommitted() throws {
+        let (url, payload) = try makeFile()
+        let io = ScriptedDocumentStoreIO()
+        let session = try DocumentStore(io: io).open(url)
+        defer { session.close() }
+        io.coordinationFailsAfterWrite = true
+        let updated = TestPayload.bytes(700, seed: 0x71)
+
+        // No error: the bytes are on disk, so the save committed even though
+        // the coordinator complained afterwards.
+        let version = try session.save(updated)
+
+        XCTAssertEqual(try Data(contentsOf: url), updated)
+        XCTAssertNotEqual(try Data(contentsOf: url), payload)
+        XCTAssertEqual(version.contentHash, TestPayload.sha256(updated))
+        XCTAssertEqual(session.state, .open)
+        XCTAssertEqual(session.version.contentHash, TestPayload.sha256(updated))
+        XCTAssertEqual(try session.checkExternalChange(), .unchanged)
+        XCTAssertEqual(directory.stagingLeftovers(), [])
+    }
+
+    // MARK: - refresh() must not adopt a stranger
+
+    func testRefreshAfterPartialCommitRefusesAStrangerFileAtThePath() throws {
+        let (url, payload) = try makeFile()
+        let io = ScriptedDocumentStoreIO()
+        let session = try DocumentStore(io: io).open(url)
+        defer { session.close() }
+        io.partialCommit = .originalMovedTo(directory.url.appendingPathComponent("moved-original.pdf"))
+
+        XCTAssertNotNil(storeError(from: try session.save(TestPayload.bytes(320, seed: 0x81))))
+        XCTAssertEqual(session.state, .needsRefresh)
+
+        // While the outcome is undecided, another program puts its own file at
+        // the same path.
+        let stranger = TestPayload.bytes(999, seed: 0x82)
+        try stranger.write(to: url)
+
+        let error = storeError(from: try session.refresh())
+
+        guard case let .externalModificationDetected(change) = error, case .replaced = change else {
+            return XCTFail("expected .externalModificationDetected(.replaced), got \(String(describing: error))")
+        }
+        XCTAssertEqual(session.state, .needsRefresh, "refresh must not turn an unknown file into a baseline")
+        XCTAssertEqual(
+            session.version.contentHash,
+            TestPayload.sha256(payload),
+            "the recorded baseline must not move"
+        )
+
+        // And the session stays unwritable, so the stranger survives.
+        XCTAssertEqual(storeError(from: try session.save(TestPayload.bytes(64))), .sessionNeedsRefresh)
+        XCTAssertEqual(try Data(contentsOf: url), stranger)
+    }
+
+    func testRefreshAcceptsTheOriginalWhenItIsPutBack() throws {
+        let (url, payload) = try makeFile()
+        let io = ScriptedDocumentStoreIO()
+        let session = try DocumentStore(io: io).open(url)
+        defer { session.close() }
+        let backup = directory.url.appendingPathComponent("moved-original.pdf")
+        io.partialCommit = .originalMovedTo(backup)
+
+        XCTAssertNotNil(storeError(from: try session.save(TestPayload.bytes(320, seed: 0x83))))
+        XCTAssertEqual(session.state, .needsRefresh)
+
+        // The original comes back at its own path: same inode, same bytes.
+        try FileManager.default.moveItem(at: backup, to: url)
+
+        let restored = try session.refresh()
+
+        XCTAssertEqual(restored.contentHash, TestPayload.sha256(payload))
+        XCTAssertEqual(session.state, .open)
+        XCTAssertEqual(try session.read(), payload)
+        XCTAssertEqual(try session.checkExternalChange(), .unchanged)
+    }
 }

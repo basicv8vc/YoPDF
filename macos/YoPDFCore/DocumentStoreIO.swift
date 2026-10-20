@@ -285,13 +285,35 @@ public struct SystemDocumentStoreIO: DocumentStoreIO {
             outcome = Result { try body(coordinatedURL) }
         }
 
+        return try Self.resolve(outcome: outcome, coordinationError: coordinationError).get()
+    }
+
+    /// Decides what a coordinated write actually did.
+    ///
+    /// A coordination error does **not** mean the write did not happen: the
+    /// accessor can run to completion and install the new file before the
+    /// coordinator reports a problem. The accessor's result therefore wins,
+    /// because reporting "not committed" for a committed write is the
+    /// dangerous direction to be wrong in. The coordination error is only used
+    /// when the accessor never ran at all.
+    ///
+    /// Internal rather than private so this decision can be tested directly:
+    /// the real coordinator cannot be made to misbehave on demand.
+    static func resolve(
+        outcome: Result<URL, Error>?,
+        coordinationError: NSError?
+    ) -> Result<URL, Error> {
+        if let outcome {
+            return outcome
+        }
         if let coordinationError {
-            throw DocumentStoreError.coordinationFailed(coordinationError.localizedDescription)
+            return .failure(
+                DocumentStoreError.coordinationFailed(coordinationError.localizedDescription)
+            )
         }
-        guard let outcome else {
-            throw DocumentStoreError.coordinationFailed("The file coordinator did not run the write block.")
-        }
-        return try outcome.get()
+        return .failure(
+            DocumentStoreError.coordinationFailed("The file coordinator did not run the write block.")
+        )
     }
 
     public func replaceItem(at url: URL, with staged: StagedFile, expecting expected: DocumentVersion) throws -> URL {

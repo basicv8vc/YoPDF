@@ -80,6 +80,7 @@ final class ScriptedDocumentStoreIO: DocumentStoreIO, @unchecked Sendable {
     private var replacements = 0
     private var commits = 0
     private var versionFailureAfterCommit = false
+    private var coordinationFailureAfterWrite = false
     private var partial: PartialCommit?
     private var hook: (@Sendable () -> Void)?
 
@@ -105,6 +106,15 @@ final class ScriptedDocumentStoreIO: DocumentStoreIO, @unchecked Sendable {
     var failVersionAfterCommit: Bool {
         get { lock.withLock { versionFailureAfterCommit } }
         set { lock.withLock { versionFailureAfterCommit = newValue } }
+    }
+
+    /// Lets the write block run to completion — installing the new file — and
+    /// only then reports a coordination error. This is the ordering a real
+    /// `NSFileCoordinator` can produce, and the one that used to be reported as
+    /// "nothing was committed".
+    var coordinationFailsAfterWrite: Bool {
+        get { lock.withLock { coordinationFailureAfterWrite } }
+        set { lock.withLock { coordinationFailureAfterWrite = newValue } }
     }
 
     var replacementCount: Int {
@@ -138,7 +148,15 @@ final class ScriptedDocumentStoreIO: DocumentStoreIO, @unchecked Sendable {
             throw DocumentStoreError.coordinationFailed("injected coordination failure")
         }
         beforeCoordinatedWrite?()
-        return try base.withCoordinatedWrite(at: url, body)
+        let result = try base.withCoordinatedWrite(at: url, body)
+        // The write block succeeded and the new file is in place; the error
+        // arrives afterwards, as it can from the real coordinator.
+        if coordinationFailsAfterWrite {
+            throw DocumentStoreError.coordinationFailed(
+                "injected coordination failure after the write block ran"
+            )
+        }
+        return result
     }
 
     func replaceItem(at url: URL, with staged: StagedFile, expecting expected: DocumentVersion) throws -> URL {

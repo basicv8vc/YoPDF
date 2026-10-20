@@ -84,6 +84,22 @@ public final class DocumentSession: @unchecked Sendable {
     /// `operationLock` → `stateLock`; nothing takes them the other way round.
     private let operationLock = NSLock()
 
+    /// What a save was trying to produce, recorded only while the session is in
+    /// `needsRefresh`.
+    ///
+    /// Without it, `refresh()` could only answer "is there a file here?", and
+    /// would happily adopt a file some other program created at the same path.
+    /// Both reasons for entering `needsRefresh` (an undecidable commit and a
+    /// commit whose version could not be read back) resolve the same way: the
+    /// disk must hold either the content the save intended or the original the
+    /// save was told to expect.
+    struct PendingSave: Equatable, Sendable {
+        /// The version the file had before the save.
+        let original: DocumentVersion
+        /// Hash of the bytes the save tried to write.
+        let intendedHash: String
+    }
+
     private var lease: SecurityScopeLease
     private let io: any DocumentStoreIO
     private let access: any SecurityScopeAccessing
@@ -91,6 +107,7 @@ public final class DocumentSession: @unchecked Sendable {
     private var currentURL: URL
     private var currentVersion: DocumentVersion
     private var currentState: State = .open
+    private var pendingSave: PendingSave?
 
     /// Whether the file was writable when it was opened. Diagnostic only;
     /// `save` always re-checks, because permissions can change while a
@@ -174,7 +191,16 @@ public final class DocumentSession: @unchecked Sendable {
     }
 
     /// Re-reads the file's version after a save whose result could not be
-    /// confirmed. Returns the session to `.open` on success.
+    /// confirmed. Returns the session to `.open` only when what is on disk
+    /// matches something the save was allowed to produce.
+    ///
+    /// A session in `needsRefresh` knows two acceptable outcomes: the bytes it
+    /// tried to write, or the original it was asked to preserve. Anything else
+    /// at that path was written by somebody else, and adopting it would be a
+    /// silent way around the external-change check — so the session stays in
+    /// `needsRefresh` and the conflict is reported. Resolving that conflict is
+    /// a deliberate caller decision (keep mine / keep theirs), not something
+    /// this method may decide.
     @discardableResult
     public func refresh() throws -> DocumentVersion {
         operationLock.lock()
@@ -185,12 +211,47 @@ public final class DocumentSession: @unchecked Sendable {
         if isClosed { throw DocumentStoreError.sessionClosed }
 
         let target = url
-        let updated = try io.version(of: target)
-        stateLock.withLock {
-            currentVersion = updated
-            currentState = .open
+        let pending = stateLock.withLock { pendingSave }
+
+        guard state == .needsRefresh else {
+            let updated = try io.version(of: target)
+            adopt(updated)
+            return updated
         }
-        return updated
+
+        guard let pending else {
+            // No expectation was recorded, so there is nothing to verify
+            // against and no honest way to call the baseline known.
+            throw DocumentStoreError.sessionNeedsRefresh
+        }
+
+        // A missing or unreadable target throws here; the session stays in
+        // `needsRefresh` because the outcome is still undecided.
+        let current = try io.version(of: target)
+
+        if current.contentHash == pending.intendedHash {
+            // The save did land after all.
+            adopt(current)
+            return current
+        }
+        if current.identity == pending.original.identity,
+           current.contentHash == pending.original.contentHash {
+            // The save did not land; the original is still there.
+            adopt(current)
+            return current
+        }
+
+        throw DocumentStoreError.externalModificationDetected(
+            Self.classify(expected: pending.original, current: current)
+        )
+    }
+
+    private func adopt(_ version: DocumentVersion) {
+        stateLock.withLock {
+            currentVersion = version
+            currentState = .open
+            pendingSave = nil
+        }
     }
 
     // MARK: - Writing
@@ -203,6 +264,11 @@ public final class DocumentSession: @unchecked Sendable {
     /// the original verifiably in place leaves the original bytes untouched.
     /// A commit that fails in an unclear state is reported as such, keeps every
     /// surviving copy, and puts the session into `needsRefresh`.
+    ///
+    /// Any error coming out of the coordinated write is checked against the
+    /// disk before it is treated as "not committed": the coordinator can report
+    /// a problem after the accessor already installed the file, and reporting
+    /// that as a plain failure would be wrong in the one direction that matters.
     @discardableResult
     public func save(_ contents: Data) throws -> DocumentVersion {
         operationLock.lock()
@@ -247,25 +313,28 @@ public final class DocumentSession: @unchecked Sendable {
 
                 return try io.replaceItem(at: coordinatedURL, with: staged, expecting: expected)
             }
-        } catch let error as DocumentStoreError {
-            guard case let .replacementStateUncertain(recovery) = error else { throw error }
-
-            // The replacement may have installed the new bytes and only then
-            // reported an error. That is verified by hash, not assumed.
+        } catch {
+            // Any failure out of the coordinated write may still have committed
+            // the new bytes: the coordinator can report an error after the
+            // accessor finished, and `replaceItemAt` can fail after it moved
+            // files. Check the disk before deciding, so a write that happened
+            // is never reported as "nothing changed".
             //
             // If the caller saved identical bytes, the old and the new content
             // hash the same and this reports "committed" even when nothing
             // moved. That is harmless: the file holds exactly what was asked
             // for, and the session adopts whatever version is now on disk.
-            if let current = try? io.version(of: recovery.targetURL),
+            if let current = try? io.version(of: target),
                current.contentHash == staged.contentHash {
                 committed = true
-                adoptLocation(recovery.targetURL)
-                stateLock.withLock {
-                    currentVersion = current
-                    currentState = .open
-                }
+                adoptLocation(target)
+                adopt(current)
                 return current
+            }
+
+            guard let storeError = error as? DocumentStoreError,
+                  case let .replacementStateUncertain(recovery) = storeError else {
+                throw error
             }
 
             // The original is verifiably still in place: a plain failure.
@@ -275,15 +344,23 @@ public final class DocumentSession: @unchecked Sendable {
                 throw DocumentStoreError.replacementFailed(recovery.underlyingDescription)
             }
 
-            // Unknown. Keep every surviving copy and stop trusting the
-            // baseline until the caller resolves it.
+            // Unknown. Keep every surviving copy, record what this save was
+            // supposed to produce, and stop trusting the baseline until the
+            // caller resolves it.
             keepStaging = true
-            stateLock.withLock { currentState = .needsRefresh }
+            stateLock.withLock {
+                currentState = .needsRefresh
+                pendingSave = PendingSave(original: expected, intendedHash: staged.contentHash)
+            }
             throw error
         }
 
         committed = true
-        return try finishCommit(at: finalURL)
+        return try finishCommit(
+            at: finalURL,
+            original: expected,
+            intendedHash: staged.contentHash
+        )
     }
 
     /// Writes `contents` to `destination` and returns a **new** session for it.
@@ -383,13 +460,17 @@ public final class DocumentSession: @unchecked Sendable {
                     try? io.setPermissions(0o644, at: coordinatedURL)
                     return coordinatedURL
                 }
-            } catch let error as DocumentStoreError {
-                guard case let .replacementStateUncertain(recovery) = error else { throw error }
-
-                if let current = try? io.version(of: recovery.targetURL),
-                   current.contentHash == staged.contentHash {
+            } catch {
+                // Same rule as `save`: an error out of the coordinated write
+                // does not prove the copy was not created. The hash decides.
+                if (try? io.version(of: destination))?.contentHash == staged.contentHash {
                     committed = true
-                    return try makeSession(at: recovery.targetURL, lease: newLease)
+                    return try makeSession(at: destination, lease: newLease)
+                }
+
+                guard let storeError = error as? DocumentStoreError,
+                      case let .replacementStateUncertain(recovery) = storeError else {
+                    throw error
                 }
                 if let expectedTarget,
                    let current = try? io.version(of: recovery.targetURL),
@@ -474,18 +555,23 @@ public final class DocumentSession: @unchecked Sendable {
 
     /// Reads back the version after a successful replacement. A failure here is
     /// not a failed save: the file was written. It is reported separately and
-    /// leaves the session in `needsRefresh`.
-    private func finishCommit(at finalURL: URL) throws -> DocumentVersion {
+    /// leaves the session in `needsRefresh`, with the expected outcome recorded
+    /// so `refresh()` can verify what it finds instead of trusting it.
+    private func finishCommit(
+        at finalURL: URL,
+        original: DocumentVersion,
+        intendedHash: String
+    ) throws -> DocumentVersion {
         adoptLocation(finalURL)
         do {
             let updated = try io.version(of: finalURL)
-            stateLock.withLock {
-                currentVersion = updated
-                currentState = .open
-            }
+            adopt(updated)
             return updated
         } catch {
-            stateLock.withLock { currentState = .needsRefresh }
+            stateLock.withLock {
+                currentState = .needsRefresh
+                pendingSave = PendingSave(original: original, intendedHash: intendedHash)
+            }
             let reason = (error as? DocumentStoreError)?.localizedDescription ?? error.localizedDescription
             throw DocumentStoreError.committedButUnverified(finalURL, reason)
         }

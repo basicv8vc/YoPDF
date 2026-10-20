@@ -150,4 +150,27 @@ final class DocumentStoreSaveAsSafetyTests: XCTestCase {
         XCTAssertEqual(spy.starts, [url, destination])
         XCTAssertEqual(spy.stops, [destination], "no session was returned, so its lease must not leak")
     }
+
+    // MARK: - A coordinator error after the write block ran
+
+    func testCoordinatorErrorAfterSaveAsWriteRanKeepsTheCopy() throws {
+        let (url, session, io) = try makeSession()
+        defer { session.close() }
+        let destination = directory.url.appendingPathComponent("copy.pdf")
+        io.coordinationFailsAfterWrite = true
+        let contents = TestPayload.bytes(640, seed: 0x72)
+
+        // The copy exists, so Save As committed even though the coordinator
+        // reported an error afterwards. Reporting a failure here would invite
+        // the caller to write the file a second time.
+        let copy = try session.saveAs(contents, to: destination)
+        defer { copy.close() }
+
+        XCTAssertEqual(try Data(contentsOf: destination), contents)
+        XCTAssertEqual(copy.version.contentHash, TestPayload.sha256(contents))
+        XCTAssertEqual(copy.state, .open)
+        XCTAssertEqual(try Data(contentsOf: url), TestPayload.bytes(4096), "the original is untouched")
+        XCTAssertEqual(session.state, .open, "the receiver keeps its own baseline")
+        XCTAssertEqual(directory.stagingLeftovers(), [])
+    }
 }
