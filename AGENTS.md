@@ -87,8 +87,8 @@ Keep responsibilities separate:
 Architecture boundaries:
 
 - **ShuaMac is a product, not a library.** Use it as a reference for proven behavior. Do not copy its source, assets, or product-specific features (accounts, subscriptions, paper feeds, cloud sync, arXiv integration) into this repository unless the rights and the scope are explicitly confirmed.
-- **AgentChat remains an independent project.** Integrate it through a pinned version and a thin adapter. Do not vendor or fork it into YoPDF for long-term maintenance, and do not add PDF-specific business logic to its daemon.
-- **PDF Context Bridge is the only document-context boundary.** It assembles the user-authorized selection, page, and annotation context for an agent, and it is the only component allowed to apply authorized annotation writes.
+- **AgentChat remains an independent project.** Prefer a pinned upstream AgentChat version and a thin integration adapter. Avoid long-lived forks and duplicated protocol implementations. Any necessary fork or security patch must be explicitly justified, documented, and preferably contributed upstream.
+- **PDF Context Bridge is the authorization boundary for AI-initiated document operations.** It assembles user-authorized reading context and validates agent-initiated modification requests. Actual annotation mutations are handled by the shared `AnnotationStore`, which also serves direct user interactions. Normal PDF annotation must not depend on AgentChat or the PDF Context Bridge.
 
 Do not add agent capabilities unless they are part of the approved task.
 
