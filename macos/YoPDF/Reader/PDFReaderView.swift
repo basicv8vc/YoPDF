@@ -425,8 +425,21 @@ struct PDFReaderView: View {
 
     private func discardThen(_ action: PendingAction) {
         prompt = nil
-        model.abandonUnsavedChanges()
-        perform(action)
+        switch action {
+        case let .open(url):
+            // Opening with `discardingUnsavedChanges` only abandons the edits as
+            // part of a successful switch. If the new file cannot be opened, the
+            // old document, its annotations and its dirty state all stay — so a
+            // failed open cannot leave a document on screen whose edits nothing
+            // is protecting any more.
+            model.open(url: url, discardingUnsavedChanges: true)
+        case .closeWindow, .quit:
+            // Nothing is going to be shown afterwards, so the edits really are
+            // being discarded. Clearing the flag first is also what lets the
+            // close and the termination proceed instead of asking again.
+            model.abandonUnsavedChanges()
+            perform(action)
+        }
     }
 
     private func perform(_ action: PendingAction) {

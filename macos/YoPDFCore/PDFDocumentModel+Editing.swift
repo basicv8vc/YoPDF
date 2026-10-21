@@ -184,32 +184,64 @@ extension PDFDocumentModel {
         case let .externalModificationDetected(change):
             return .conflict(.externalModificationDetected(change))
         case let .replacementStateUncertain(recovery):
-            return .uncertain(
-                reason: DocumentStoreError.replacementStateUncertain(recovery).localizedDescription,
-                recovery: recovery.recoverableURLs
-            )
+            return uncertainOutcome(recovery)
         default:
             return .failed(.store(error))
         }
     }
 
+    /// Save As, in the same three-way split as a save: committed, not
+    /// committed, or undecided.
+    ///
+    /// The distinction matters more here than for a save in place, because the
+    /// original file is untouched either way — what is at stake is whether the
+    /// *copy* exists and whether this window still owns unsaved edits.
     private func resolveSaveAsFailure(_ error: DocumentStoreError) -> SaveOutcome {
         switch error {
-        case let .committedButUnverified(url, _):
-            // The copy exists; the store could not hand back a session for it.
-            // Opening one here keeps the reader pointed at a real file instead
-            // of leaving it on the original while claiming nothing happened.
+        case let .committedButUnverified(url, reason):
+            // The copy was written; only taking ownership of it failed. Opening
+            // a session here is what keeps the window pointed at a real file
+            // instead of leaving it on the original while claiming nothing
+            // happened.
             if let reopened = try? store.open(url) {
                 adoptSession(reopened)
                 adoptFileLocation(url)
                 return finishWrite()
             }
-            return .failed(.store(error))
+            // Still committed, and still not adoptable. Reporting this as a
+            // plain failure would invite the user to save again on top of a
+            // copy that already exists, so it is reported as what it is: the
+            // bytes are on disk, the window could not switch to them, and the
+            // edits stay marked unsaved because this window is still showing
+            // the original file.
+            return .savedUnverified(
+                reason: "“\(url.lastPathComponent)” was written, but it could not be opened, "
+                    + "so this window is still showing the original file. \(reason)",
+                editsOnDisk: true
+            )
         case let .externalModificationDetected(change):
+            // The destination changed between the panel and the commit. The
+            // copy was not written; the edits are still only in memory.
             return .conflict(.externalModificationDetected(change))
+        case let .replacementStateUncertain(recovery):
+            // The destination may hold the copy, the original of the
+            // destination, or neither. Nothing was deleted.
+            return uncertainOutcome(recovery)
         default:
             return .failed(.store(error))
         }
+    }
+
+    /// A replacement that ended in a state the store could not classify.
+    ///
+    /// Every surviving file is listed and the edits stay unsaved: the outcome is
+    /// "unknown", which is not the same as "failed" and must not be presented as
+    /// one.
+    private func uncertainOutcome(_ recovery: ReplacementRecovery) -> SaveOutcome {
+        .uncertain(
+            reason: DocumentStoreError.replacementStateUncertain(recovery).localizedDescription,
+            recovery: recovery.recoverableURLs
+        )
     }
 
     /// Re-opens the file the session now owns and swaps it in, keeping the

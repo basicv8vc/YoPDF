@@ -329,6 +329,170 @@ final class DocumentEditingTests: XCTestCase {
         XCTAssertEqual(model.fileURL, second)
         XCTAssertEqual(annotationCount(inFileAt: first), 0, "discarding writes nothing")
     }
+
+    // MARK: - Discarding edits for an open that fails
+
+    /// "Don't Save" is a decision about the *next* document, not a promise that
+    /// the next document will open. When the open fails the old document is still
+    /// on screen, so its edits must still be marked unsaved — otherwise the next
+    /// close would drop them without asking.
+    func testDiscardingOpenToAnUnreadableFileKeepsTheDocumentAndItsEdits() throws {
+        let first = try makeFixture(named: "first")
+        let broken = try PDFFixtureFactory.writeTemporaryFile(
+            named: "broken.pdf",
+            contents: Data("this is not a PDF".utf8)
+        )
+        temporaryFiles.append(broken)
+
+        let spy = SecurityScopeSpy()
+        let model = PDFDocumentModel(access: spy)
+        XCTAssertTrue(model.open(url: first))
+        try highlight(model)
+        let documentBefore = try XCTUnwrap(model.document)
+        let sessionBefore = try XCTUnwrap(model.documentSession)
+
+        XCTAssertFalse(model.open(url: broken, discardingUnsavedChanges: true))
+
+        XCTAssertEqual(model.lastError, .unreadable)
+        XCTAssertTrue(model.document === documentBefore, "the old document stays on screen")
+        XCTAssertEqual(model.fileURL, first)
+        XCTAssertTrue(model.documentSession === sessionBefore, "the old session is not replaced")
+        XCTAssertEqual(model.documentSession?.state, .open)
+        XCTAssertTrue(model.hasUnsavedChanges, "the edits were not actually discarded")
+        XCTAssertEqual(model.document?.page(at: 0)?.annotations.count, 1)
+        XCTAssertEqual(annotationCount(inFileAt: first), 0, "nothing was written")
+
+        // The two-phase open still releases the access it took for the candidate.
+        XCTAssertTrue(spy.starts.contains(broken), "the candidate scope was acquired")
+        XCTAssertTrue(spy.stops.contains(broken), "and released when the load failed")
+        XCTAssertEqual(spy.stops.filter { $0 == first }.count, 0, "the open document keeps its scope")
+    }
+
+    func testDiscardingOpenToAMissingFileKeepsTheDocumentAndItsEdits() throws {
+        let first = try makeFixture(named: "first")
+        let missing = first.deletingLastPathComponent().appendingPathComponent("gone.pdf")
+
+        let model = PDFDocumentModel(access: SecurityScopeSpy())
+        XCTAssertTrue(model.open(url: first))
+        try highlight(model)
+
+        XCTAssertFalse(model.open(url: missing, discardingUnsavedChanges: true))
+
+        XCTAssertEqual(model.lastError, .fileMissing)
+        XCTAssertEqual(model.fileURL, first)
+        XCTAssertTrue(model.hasUnsavedChanges)
+        XCTAssertEqual(model.document?.page(at: 0)?.annotations.count, 1)
+        XCTAssertEqual(model.documentSession?.state, .open)
+    }
+
+    /// The successful half of the same decision: the edits are dropped only
+    /// because the new document is now the one on screen.
+    func testDiscardingOpenThatSucceedsClearsTheEdits() throws {
+        let first = try makeFixture(named: "first")
+        let second = try makeFixture(named: "second")
+
+        let model = PDFDocumentModel(access: SecurityScopeSpy())
+        XCTAssertTrue(model.open(url: first))
+        try highlight(model)
+        XCTAssertTrue(model.hasUnsavedChanges)
+
+        XCTAssertTrue(model.open(url: second, discardingUnsavedChanges: true))
+
+        XCTAssertEqual(model.fileURL, second)
+        XCTAssertFalse(model.hasUnsavedChanges)
+        XCTAssertEqual(model.document?.page(at: 0)?.annotations.count, 0)
+        XCTAssertEqual(model.documentSession?.url, second)
+        XCTAssertEqual(annotationCount(inFileAt: first), 0, "discarding writes nothing")
+    }
+
+    // MARK: - Save As failures
+
+    /// A Save As whose commit cannot be classified is **not** a failed save:
+    /// something may well be on disk, and nothing was deleted.
+    ///
+    /// The destination has to exist for this to be the interesting case: with a
+    /// new file the copy is installed with a rename, and a rename that reports an
+    /// error but left the bytes in place is a plain success.
+    func testSaveAsUncertainReplacementReportsRecoveryAndKeepsTheEdits() throws {
+        let original = try makeFixture(named: "original")
+        let copy = try makeFixture(named: "copy")
+        let backup = copy.deletingLastPathComponent().appendingPathComponent("copy-moved.pdf")
+        temporaryFiles.append(backup)
+
+        let io = ScriptedDocumentStoreIO()
+        io.partialCommit = .originalMovedTo(backup)
+        let model = PDFDocumentModel(access: SecurityScopeSpy(), io: io)
+        XCTAssertTrue(model.open(url: original))
+        try highlight(model)
+
+        let outcome = model.saveAs(to: copy, overwrite: true)
+        guard case let .uncertain(_, recovery) = outcome else {
+            return XCTFail("expected an uncertain outcome, got \(outcome)")
+        }
+        XCTAssertFalse(recovery.isEmpty, "the files that may hold a copy are reported")
+        for url in recovery {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: url.path), "nothing is deleted")
+        }
+        XCTAssertTrue(model.hasUnsavedChanges, "the edits are still only in memory")
+        XCTAssertEqual(model.fileURL, original, "the window still points at the original")
+        XCTAssertEqual(model.documentSession?.url, original)
+        XCTAssertEqual(model.document?.page(at: 0)?.annotations.count, 1)
+        XCTAssertEqual(annotationCount(inFileAt: original), 0, "the original is not written")
+    }
+
+    /// The copy was written; only taking ownership of it failed. That is a
+    /// committed save, so it must not be reported as "nothing was written".
+    func testSaveAsCommittedButUnverifiedKeepsTheEditsWhenTheCopyCannotBeReopened() throws {
+        let original = try makeFixture(named: "original")
+        let copy = original.deletingLastPathComponent().appendingPathComponent("copy.pdf")
+        temporaryFiles.append(copy)
+
+        let io = ScriptedDocumentStoreIO()
+        io.failVersionAfterCommit = true
+        let model = PDFDocumentModel(access: SecurityScopeSpy(), io: io)
+        XCTAssertTrue(model.open(url: original))
+        try highlight(model)
+
+        let outcome = model.saveAs(to: copy)
+        guard case let .savedUnverified(reason, editsOnDisk) = outcome else {
+            return XCTFail("expected an unverified save, got \(outcome)")
+        }
+        XCTAssertTrue(editsOnDisk, "the copy really was written")
+        XCTAssertTrue(reason.contains(copy.lastPathComponent), "the user is told which file: \(reason)")
+
+        // The window never switched, so it must still be dirty and still show the
+        // original: a second save has to keep going to the file it names.
+        XCTAssertTrue(model.hasUnsavedChanges)
+        XCTAssertEqual(model.fileURL, original)
+        XCTAssertEqual(model.documentSession?.url, original)
+        XCTAssertEqual(model.documentSession?.state, .open)
+        XCTAssertEqual(model.document?.page(at: 0)?.annotations.count, 1)
+
+        XCTAssertEqual(annotationCount(inFileAt: copy), 1, "the copy holds the highlight")
+        XCTAssertEqual(annotationCount(inFileAt: original), 0)
+    }
+
+    /// The same commit, but the copy can be reopened: the window adopts it and
+    /// the save is a normal success.
+    func testSaveAsCommittedButUnverifiedAdoptsTheCopyWhenItCanBeReopened() throws {
+        let original = try makeFixture(named: "original")
+        let copy = original.deletingLastPathComponent().appendingPathComponent("copy.pdf")
+        temporaryFiles.append(copy)
+
+        let io = FailingVersionOnceIO()
+        let model = PDFDocumentModel(access: SecurityScopeSpy(), io: io)
+        XCTAssertTrue(model.open(url: original))
+        try highlight(model)
+        io.failNextVersionCallAfterCommit()
+
+        XCTAssertEqual(model.saveAs(to: copy), .saved)
+        XCTAssertFalse(model.hasUnsavedChanges)
+        XCTAssertEqual(model.fileURL, copy)
+        XCTAssertEqual(model.documentSession?.url, copy)
+        XCTAssertEqual(model.documentSession?.state, .open)
+        XCTAssertEqual(annotationCount(inFileAt: copy), 1)
+        XCTAssertEqual(annotationCount(inFileAt: original), 0)
+    }
 }
 
 /// Fails the first `version(of:)` call after a commit, then behaves normally.

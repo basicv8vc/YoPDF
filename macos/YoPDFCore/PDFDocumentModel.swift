@@ -97,18 +97,20 @@ public final class PDFDocumentModel: ObservableObject {
     /// A document with unsaved edits is refused with `.unsavedChanges` instead
     /// of being replaced: dropping the edits is a decision the user makes, not
     /// a side effect of opening a file. The caller saves or discards first.
+    ///
+    /// `discardingUnsavedChanges` is that decision, but it is **not** taken on
+    /// trust: the edits are only abandoned as part of the commit in phase 3, so
+    /// an open that fails still leaves the previous document, its annotations
+    /// and its dirty state exactly as they were. Discarding before the new
+    /// document is known to be readable would clear the flag on a document that
+    /// is still on screen, and the next close would drop its edits without
+    /// asking.
     @discardableResult
-    public func open(url: URL) -> Bool {
-        guard !hasUnsavedChanges else {
+    public func open(url: URL, discardingUnsavedChanges: Bool = false) -> Bool {
+        guard discardingUnsavedChanges || !hasUnsavedChanges else {
             lastError = .unsavedChanges
             return false
         }
-        return openIgnoringUnsavedChanges(url: url)
-    }
-
-    /// The raw open path, without the unsaved-changes gate.
-    @discardableResult
-    func openIgnoringUnsavedChanges(url: URL) -> Bool {
         guard url.isFileURL else {
             lastError = .notAFileURL
             return false
