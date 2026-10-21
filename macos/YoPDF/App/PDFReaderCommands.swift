@@ -10,6 +10,9 @@ struct PDFReaderCommands: Commands {
 
     @FocusedValue(\.documentModel) private var model
     @FocusedValue(\.openDocument) private var openDocument
+    @FocusedValue(\.saveDocument) private var saveDocument
+    @FocusedValue(\.saveDocumentAs) private var saveDocumentAs
+    @FocusedValue(\.highlightSelection) private var highlightSelection
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
@@ -18,6 +21,47 @@ struct PDFReaderCommands: Commands {
             }
             .keyboardShortcut("o", modifiers: .command)
             .disabled(openDocument == nil)
+
+            // Replacing `.newItem` and `.saveItem` removes the standard Close
+            // item, so it is added back. Closing goes through `performClose:`
+            // and therefore through `WindowCloseGuard`, which is what keeps ⌘W
+            // from dropping unsaved edits.
+            Button("Close") {
+                NSApp.sendAction(#selector(NSWindow.performClose(_:)), to: nil, from: nil)
+            }
+            .keyboardShortcut("w", modifiers: .command)
+            .disabled(model == nil)
+        }
+
+        // P2a has no undoable edits: annotation undo/redo is P2b. The standard
+        // items would offer a command that cannot work, and if PDFView ever
+        // supplied an undo manager they could change the document without the
+        // model noticing.
+        CommandGroup(replacing: .undoRedo) {}
+
+        // Replaces the standard Save/Save As items: those would call into AppKit
+        // document machinery this app does not use, and would skip the
+        // unsaved-changes and save-outcome handling the reader owns.
+        CommandGroup(replacing: .saveItem) {
+            Button("Save") {
+                saveDocument?()
+            }
+            .keyboardShortcut("s", modifiers: .command)
+            .disabled(model?.isLoaded != true)
+
+            Button("Save As…") {
+                saveDocumentAs?()
+            }
+            .keyboardShortcut("s", modifiers: [.command, .shift])
+            .disabled(model?.isLoaded != true)
+        }
+
+        CommandMenu("Annotate") {
+            Button("Highlight") {
+                highlightSelection?()
+            }
+            .keyboardShortcut("h", modifiers: [.command, .shift])
+            .disabled(model?.canAddHighlight != true)
         }
 
         CommandMenu("Page") {

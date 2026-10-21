@@ -13,6 +13,23 @@ struct OpenDocumentActionKey: FocusedValueKey {
     typealias Value = @MainActor () -> Void
 }
 
+/// Menu-bar counterparts of the toolbar's editing actions.
+///
+/// They are actions rather than model calls because the reader has to route them
+/// through the same unsaved-changes and save-outcome handling as the buttons; a
+/// menu item that called `model.save()` directly would skip it.
+struct SaveDocumentActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
+struct SaveDocumentAsActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
+struct HighlightSelectionActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
 extension FocusedValues {
     var documentModel: PDFDocumentModel? {
         get { self[DocumentModelFocusKey.self] }
@@ -22,5 +39,20 @@ extension FocusedValues {
     var openDocument: (@MainActor () -> Void)? {
         get { self[OpenDocumentActionKey.self] }
         set { self[OpenDocumentActionKey.self] = newValue }
+    }
+
+    var saveDocument: (@MainActor () -> Void)? {
+        get { self[SaveDocumentActionKey.self] }
+        set { self[SaveDocumentActionKey.self] = newValue }
+    }
+
+    var saveDocumentAs: (@MainActor () -> Void)? {
+        get { self[SaveDocumentAsActionKey.self] }
+        set { self[SaveDocumentAsActionKey.self] = newValue }
+    }
+
+    var highlightSelection: (@MainActor () -> Void)? {
+        get { self[HighlightSelectionActionKey.self] }
+        set { self[HighlightSelectionActionKey.self] = newValue }
     }
 }

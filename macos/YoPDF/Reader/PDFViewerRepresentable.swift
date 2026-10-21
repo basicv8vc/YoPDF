@@ -6,11 +6,15 @@ import YoPDFCore
 /// Bridges PDFView into SwiftUI.
 ///
 /// The wrapper owns no reader state: page index and zoom live in
-/// `PDFDocumentModel`, and the coordinator only reports what PDFView did.
+/// `PDFDocumentModel`, and the coordinator only reports what PDFView did. The
+/// one exception is the text selection, which is written back through a binding
+/// because the model needs it to decide whether a highlight is possible — and
+/// because clearing it from the model must clear it in the view.
 struct PDFViewerRepresentable: NSViewRepresentable {
 
     let document: PDFDocument?
     @Binding var currentPageIndex: Int
+    @Binding var selection: PDFSelection?
     let autoScales: Bool
     let zoomScale: CGFloat
     let onScaleChange: (CGFloat) -> Void
@@ -42,6 +46,13 @@ struct PDFViewerRepresentable: NSViewRepresentable {
         if !autoScales,
            ReaderViewSync.shouldApplyZoom(current: view.scaleFactor, target: zoomScale) {
             view.scaleFactor = zoomScale
+        }
+
+        // The model cleared the selection: the highlight consumed it, or a new
+        // document replaced it. PDFView keeps drawing its own selection until
+        // told otherwise, so it has to be cleared here rather than in the model.
+        if selection == nil, view.currentSelection != nil {
+            view.clearSelection()
         }
 
         guard let document,
@@ -80,6 +91,12 @@ struct PDFViewerRepresentable: NSViewRepresentable {
                 name: .PDFViewScaleChanged,
                 object: view
             )
+            center.addObserver(
+                self,
+                selector: #selector(selectionDidChange(_:)),
+                name: .PDFViewSelectionChanged,
+                object: view
+            )
         }
 
         @objc private func pageDidChange(_ notification: Notification) {
@@ -94,6 +111,13 @@ struct PDFViewerRepresentable: NSViewRepresentable {
         @objc private func scaleDidChange(_ notification: Notification) {
             guard let view = pdfView else { return }
             parent.onScaleChange(view.scaleFactor)
+        }
+
+        @objc private func selectionDidChange(_ notification: Notification) {
+            guard let view = pdfView else { return }
+            let current = view.currentSelection
+            guard current !== parent.selection else { return }
+            parent.selection = current
         }
 
         deinit {

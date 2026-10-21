@@ -5,9 +5,13 @@ directly from disk and renders them; there is no managed library, no network
 code, no account system, and no agent integration.
 
 P1 adds a file-first `DocumentStore` in `YoPDFCore`: file identity and version
-tracking, external-change detection, and safe in-place saving. There is no Save
-command in the UI yet — the save path is exercised through the Core API and its
-tests, and no document is presented as "edited" before annotations exist.
+tracking, external-change detection, and safe in-place saving.
+
+P2a adds the first editing feature on top of it: select text, add a yellow
+highlight, save, reopen. A highlight is a standard PDF `/Highlight` annotation
+with `/QuadPoints`, so other readers see it as their own. Editing introduces a
+minimal dirty state and a manual Save; there is no autosave, undo, or annotation
+sidebar yet.
 
 ## Requirements
 
@@ -23,7 +27,7 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (97)
+./scripts/test.sh                     # unit tests (117)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
@@ -53,16 +57,20 @@ macos/
 │   ├── DocumentStoreIO.swift   # filesystem seam + POSIX implementation
 │   ├── DocumentStoreError.swift
 │   ├── DocumentVersion.swift   # identity, version, external-change types
+│   ├── HighlightService.swift  # selection → standard /Highlight annotation
 │   ├── PDFDocumentModel.swift
+│   ├── PDFDocumentModel+Editing.swift # dirty state, save, Save As, re-sync
 │   ├── ReaderViewSync.swift    # pure page/zoom decisions used by the bridge
 │   └── SecurityScopeAccess.swift
 ├── YoPDF/
 │   ├── App/YoPDFApp.swift      # @main, one model per window
+│   ├── App/AppDelegate.swift   # quitting with unsaved edits
+│   ├── App/WindowCloseGuard.swift # window close interception
 │   ├── App/PDFReaderCommands.swift
 │   ├── App/ReaderFocusedValues.swift
 │   └── Reader/
 │       ├── PDFViewerRepresentable.swift # PDFView ↔ SwiftUI bridge
-│       └── PDFReaderView.swift          # toolbar, empty state, drag & drop
+│       └── PDFReaderView.swift          # toolbar, prompts, empty state
 ├── YoPDFTests/
 │   ├── PDFFixtureFactory.swift # generates real PDFs at runtime
 │   ├── SecurityScopeSpy.swift
@@ -77,6 +85,8 @@ macos/
 │   ├── DocumentStoreLifecycleTests.swift    # close vs. in-flight operations
 │   ├── DocumentStoreScaleTests.swift    # 200 MB streaming and save
 │   ├── DocumentStoreModelIntegrationTests.swift
+│   ├── HighlightAnnotationTests.swift   # real PDFKit highlight geometry
+│   ├── DocumentEditingTests.swift       # dirty state, save outcomes, re-sync
 │   └── ReaderViewSyncTests.swift
 └── scripts/{generate,build,test}.sh
 ```
@@ -129,6 +139,71 @@ What the save path does and does not promise:
   staging file and its directory before the replacement, but "power loss at every
   instant still leaves a consistent result" is not something these tests show.
 
+### Highlight, dirty state and save (P2a)
+
+A highlight is built from the `PDFView` selection in `HighlightService`:
+
+- `PDFSelection.selectionsByLine()` gives one rectangle per line. Those
+  rectangles become `/QuadPoints` on a single `/Highlight` annotation, so a
+  multi-line mark paints the lines and not the empty space beside a short line.
+- Each line is attributed to the page it belongs to, so a selection that spans
+  pages becomes one annotation per page. A page is never annotated with geometry
+  that belongs to another page.
+- A selection with no text (a margin, an image, an empty drag) throws before
+  anything is added. The button and the menu item use the same predicate, so they
+  are never enabled for a selection that cannot produce a valid annotation.
+- The colour is a fixed sRGB `(1, 0.8, 0)`, written as `/C [1 0.8 0]`. It is not
+  a dynamic system colour, so the stored value does not depend on the app's
+  appearance at the moment of the click.
+
+Editing is manual-save only:
+
+- Adding a highlight marks the document edited. Nothing is written until the user
+  saves, and there is no autosave.
+- `PDFDocumentModel.save()` serialises the document with PDFKit and hands the
+  bytes to `DocumentSession.save`. It never calls `PDFDocument.write(to:)` on the
+  original path: that would bypass the version check that makes a save safe.
+- A save that wrote the file and then failed to re-open it is **not** reported as
+  a failed save. `SaveOutcome` distinguishes "saved", "saved but unverified"
+  (with a flag for whether the edits are on disk), "conflict", "uncertain" and
+  "failed". A conflict or an uncertain replacement keeps the edits in memory and
+  never clears the edited flag.
+- `committedButUnverified` is resolved by calling `refresh()` immediately. If the
+  session can confirm the bytes it wrote, the save is a normal success; if it
+  cannot, the edits stay marked unsaved and the user is told the result is
+  unconfirmed.
+- After a successful write the document is re-opened from the file. The
+  replacement gives the file a new inode, so the `PDFDocument` that was
+  memory-mapping the old one no longer describes the file the session owns.
+  Re-opening is also the only end-to-end check that what was written is readable.
+  The page index, the zoom and the `PDFView` instance are preserved, so saving
+  does not jump back to page one.
+- Closing the window, opening another document and quitting all check for unsaved
+  edits first and offer Save / Don't Save / Cancel. Opening another document is
+  also refused by the model itself (`LoadError.unsavedChanges`), so no caller can
+  drop edits as a side effect of opening a file.
+- Save As is available as the escape hatch for read-only files, hard links and
+  conflicts; after it succeeds the reader continues editing the copy.
+
+Known P2a limitations:
+
+- No undo/redo, no annotation sidebar, no underline/strike-out/note, no
+  annotation deletion. All of that is P2b or later.
+- Text geometry is whatever PDFKit reports. Selections over rotated pages,
+  right-to-left text or unusual font encodings are not corrected here; when a
+  PDFKit geometry problem is found, the sample belongs in a P3 regression set.
+- PDFKit writes the system user's full name into the annotation's `/T` (author)
+  entry, the same way Preview does. YoPDF does not change or suppress it yet;
+  whether a highlight should carry an author at all is an open product decision.
+- The window-close and quit interception is implemented on the `NSWindow`
+  delegate. It is covered by code review and by the model-level tests for the
+  underlying decisions, but it has not been exercised through a real window in
+  an automated test.
+- Apple Preview interoperability was checked by inspecting the written
+  annotation dictionary (`/Subtype /Highlight`, `/QuadPoints`, `/C`, `/AP`) and by
+  rendering the saved file in a separate PDFKit process, not by observing
+  Preview's window.
+
 `YoPDFCore` is a framework so tests are pure logic tests: they link the module
 and never launch the app, so no window server or accessibility permission is
 needed. It also keeps reader semantics independent of the SwiftUI layer, which
@@ -150,8 +225,9 @@ separate task; see `internal/` notes (not published).
 ## Scope
 
 P0 excluded annotations, search, recent documents, tabs, agent integration,
-accounts, sync and PDF editing. P1 adds only file access and safe persistence:
-no annotations, no undo, no autosave, no document library, no Save UI.
+accounts, sync and PDF editing. P1 added file access and safe persistence. P2a
+adds yellow highlights with a manual save: no undo, no autosave, no document
+library, no annotation sidebar, no other annotation types.
 
 Known P1 boundaries:
 
