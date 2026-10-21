@@ -34,6 +34,12 @@ struct UnderlineSelectionActionKey: FocusedValueKey {
     typealias Value = @MainActor () -> Void
 }
 
+/// Add Note needs the reader's state, not just the model: with no selection the
+/// action switches the page into placement mode.
+struct AddNoteActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
 extension FocusedValues {
     var documentModel: PDFDocumentModel? {
         get { self[DocumentModelFocusKey.self] }
@@ -63,5 +69,10 @@ extension FocusedValues {
     var underlineSelection: (@MainActor () -> Void)? {
         get { self[UnderlineSelectionActionKey.self] }
         set { self[UnderlineSelectionActionKey.self] = newValue }
+    }
+
+    var addNote: (@MainActor () -> Void)? {
+        get { self[AddNoteActionKey.self] }
+        set { self[AddNoteActionKey.self] = newValue }
     }
 }

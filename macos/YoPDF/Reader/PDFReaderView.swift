@@ -1,4 +1,5 @@
 import AppKit
+import PDFKit
 import SwiftUI
 import UniformTypeIdentifiers
 import YoPDFCore
@@ -12,6 +13,12 @@ struct PDFReaderView: View {
     @State private var prompt: Prompt?
     /// Installed on the window so closing it cannot drop unsaved edits.
     @State private var closeGuard = WindowCloseGuard()
+    /// The open note composer, if any.
+    @State private var noteComposer: NoteComposerPresentation?
+    /// True while the next page click places a page note.
+    @State private var isPlacingNote = false
+    /// Converts page rectangles into popover anchors through the live PDFView.
+    @State private var anchorResolver = PageAnchorResolver()
 
     /// Something the reader was asked to do that would discard edits.
     private enum PendingAction: Equatable {
@@ -82,6 +89,7 @@ struct PDFReaderView: View {
         .focusedSceneValue(\.saveDocumentAs, { presentSaveAsPanel() })
         .focusedSceneValue(\.highlightSelection, { _ = model.addMarkup(.highlight) })
         .focusedSceneValue(\.underlineSelection, { _ = model.addMarkup(.underline) })
+        .focusedSceneValue(\.addNote, { beginNote() })
         .background(
             WindowCloseGuardInstaller(
                 guardObject: closeGuard,
@@ -216,6 +224,27 @@ struct PDFReaderView: View {
                 model.setDefaultMarkupColor(color, for: .underline)
             }
 
+            Divider().frame(height: 18)
+
+            Button {
+                if isPlacingNote {
+                    isPlacingNote = false
+                } else {
+                    beginNote()
+                }
+            } label: {
+                Label(
+                    isPlacingNote ? "Cancel Note" : "Add Note",
+                    systemImage: isPlacingNote ? "xmark.circle" : "note.text.badge.plus"
+                )
+            }
+            .disabled(!model.canCreateNote)
+            .help(
+                isPlacingNote
+                    ? "Click a page to place the note, or press Esc to cancel"
+                    : "Note the selected text, or click a page to place a note (⇧⌘N)"
+            )
+
             if let selected = model.selectedMarkup {
                 Divider().frame(height: 18)
 
@@ -327,14 +356,49 @@ struct PDFReaderView: View {
                 zoomScale: model.zoomScale,
                 onScaleChange: { model.updateEffectiveScale($0) },
                 selectedMarkup: model.selectedMarkup,
+                noteMarkers: model.noteMarkers,
+                isPlacingNote: isPlacingNote,
                 annotationRevision: model.annotationRevision,
                 changedAnnotationPageIndices: model.changedAnnotationPageIndices,
                 onMarkupClick: { point, page in
                     model.selectMarkup(at: point, on: page)
                 },
-                makeMarkupMenuItems: { markupMenuItems() }
+                onNoteHit: { point, page in
+                    model.noteSelection(at: point, on: page)
+                },
+                onNoteActivated: { note, anchor in
+                    presentNoteComposer(for: note, anchor: anchor)
+                },
+                onPlaceNote: { point, page, anchor in
+                    placePageNote(at: point, on: page, anchor: anchor)
+                },
+                onCancelPlacement: { isPlacingNote = false },
+                makeMenuItems: { context in
+                    pageMenuItems(for: context)
+                },
+                anchorResolver: anchorResolver
             )
             .id(model.loadGeneration)
+            .popover(
+                item: $noteComposer,
+                attachmentAnchor: .rect(.rect(noteComposer?.anchorRect ?? Self.fallbackAnchor)),
+                arrowEdge: .top
+            ) { presentation in
+                NoteComposerView(presentation: presentation, model: model) {
+                    noteComposer = nil
+                }
+            }
+            // A composer describes one anchor in one document. Both a new
+            // document and a changed annotation set can invalidate it — the note
+            // may have been undone, deleted or reloaded from disk — so it closes
+            // rather than saving into something it no longer describes.
+            .onChange(of: model.loadGeneration) { _, _ in
+                noteComposer = nil
+                isPlacingNote = false
+            }
+            .onChange(of: model.annotationRevision) { _, _ in
+                noteComposer = nil
+            }
             .alert(
                 "Couldn’t open this document",
                 isPresented: Binding(
@@ -350,6 +414,10 @@ struct PDFReaderView: View {
             emptyState
         }
     }
+
+    /// Used only if the PDFView is not in the hierarchy yet, which cannot happen
+    /// while a document is loaded. A visible popover beats no popover.
+    private static let fallbackAnchor = CGRect(x: 180, y: 180, width: 1, height: 1)
 
     private var emptyState: some View {
         VStack(spacing: 16) {
@@ -480,7 +548,97 @@ struct PDFReaderView: View {
         }
     }
 
+    // MARK: - Notes
+
+    /// Starts the Add Note action: a selection becomes a note about that text,
+    /// otherwise the reader switches to placing a page note.
+    private func beginNote() {
+        guard model.canCreateNote else { return }
+
+        guard let draft = model.selectionNoteDraft() else {
+            isPlacingNote = true
+            return
+        }
+
+        isPlacingNote = false
+        let anchor = anchorResolver.containerRect(
+            forPageBounds: draft.bounds,
+            pageIndex: draft.pageIndex
+        )
+        noteComposer = NoteComposerPresentation(
+            mode: .create(draft),
+            anchorRect: anchor ?? Self.fallbackAnchor,
+            pageLabel: draft.pageLabel,
+            excerpt: draft.excerpt,
+            contents: "",
+            paper: .honey
+        )
+    }
+
+    /// Captures a page note at a click point.
+    ///
+    /// The draft comes from the model, which never looks at the text selection:
+    /// a page note created while text is still selected must not inherit it.
+    private func placePageNote(at point: CGPoint, on page: PDFPage, anchor: CGRect) {
+        guard let draft = model.pageNoteDraft(at: point, on: page) else { return }
+        isPlacingNote = false
+        noteComposer = NoteComposerPresentation(
+            mode: .create(draft),
+            anchorRect: anchor,
+            pageLabel: draft.pageLabel,
+            excerpt: nil,
+            contents: "",
+            paper: .honey
+        )
+    }
+
+    private func presentNoteComposer(for note: NoteSelection, anchor: CGRect) {
+        isPlacingNote = false
+        noteComposer = NoteComposerPresentation(
+            mode: .edit(note),
+            anchorRect: anchor,
+            pageLabel: note.pageLabel,
+            excerpt: note.excerpt,
+            contents: note.contents,
+            paper: note.paperColor
+        )
+    }
+
     // MARK: - Annotation menu
+
+    /// Right-click actions for the click that opened the menu.
+    ///
+    /// Note items come first because a marker is a small target on top of the
+    /// page; the markup items keep their existing order and behaviour.
+    private func pageMenuItems(for context: PageMenuContext) -> [NSMenuItem] {
+        var items: [NSMenuItem] = []
+
+        if let note = context.note {
+            let anchor = context.anchorRect
+            items.append(MarkupActionMenuItem(title: "Edit Note") { [note] in
+                presentNoteComposer(for: note, anchor: anchor)
+            })
+            if model.notePermissions(for: note).canDelete {
+                items.append(MarkupActionMenuItem(title: "Delete Note") { [note] in
+                    _ = model.deleteNote(note)
+                })
+            }
+        } else if model.canCreateNote {
+            let point = context.pagePoint
+            let page = context.page
+            let anchor = context.anchorRect
+            items.append(MarkupActionMenuItem(title: "Add Note Here") {
+                placePageNote(at: point, on: page, anchor: anchor)
+            })
+        }
+
+        let markup = markupMenuItems()
+        if !items.isEmpty, !markup.isEmpty {
+            items.append(.separator())
+        }
+        items.append(contentsOf: markup)
+        return items
+    }
 
     /// Right-click actions for the selected markup.
     ///

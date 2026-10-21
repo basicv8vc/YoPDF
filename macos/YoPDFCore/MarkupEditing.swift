@@ -17,12 +17,31 @@ enum MarkupEditChange {
         from: NSColor,
         to: NSColor
     )
+    /// A note body change. `/Contents` is the only entry this touches, so a
+    /// LockedContents annotation must be refused here even though its paper
+    /// colour and deletion stay editable.
+    case setContents(
+        annotation: PDFAnnotation,
+        pageIndex: Int,
+        from: String?,
+        to: String?
+    )
+    /// A note paper change. This writes `/C` and the optional YoPDF style key,
+    /// neither of which is `/Contents`.
+    case setNoteStyle(
+        annotation: PDFAnnotation,
+        pageIndex: Int,
+        from: NotePaperColor,
+        to: NotePaperColor
+    )
 
     var pageIndex: Int {
         switch self {
         case let .insert(_, pageIndex),
              let .remove(_, pageIndex),
-             let .recolor(_, pageIndex, _, _):
+             let .recolor(_, pageIndex, _, _),
+             let .setContents(_, pageIndex, _, _),
+             let .setNoteStyle(_, pageIndex, _, _):
             return pageIndex
         }
     }
@@ -31,7 +50,9 @@ enum MarkupEditChange {
         switch self {
         case let .insert(annotation, _),
              let .remove(annotation, _),
-             let .recolor(annotation, _, _, _):
+             let .recolor(annotation, _, _, _),
+             let .setContents(annotation, _, _, _),
+             let .setNoteStyle(annotation, _, _, _):
             return annotation
         }
     }
@@ -339,7 +360,10 @@ extension PDFDocumentModel {
     ///
     /// The edit is validated before any change is made, so a failed call cannot
     /// leave half a cross-page annotation behind.
-    private func performMarkupEdit(
+    ///
+    /// Internal rather than private so `NoteEditing` uses the same pipeline
+    /// instead of a second mutation path.
+    func performMarkupEdit(
         _ edit: MarkupEdit,
         coalescingRecolour: Bool = false
     ) -> Bool {
@@ -408,7 +432,11 @@ extension PDFDocumentModel {
                           !page.annotations.contains(where: { $0 === annotation })
                     else { return .invalidHistory }
                 }
-            case .recolor:
+            case .recolor, .setNoteStyle:
+                guard annotation.page === page,
+                      page.annotations.contains(where: { $0 === annotation })
+                else { return .invalidHistory }
+            case .setContents:
                 guard annotation.page === page,
                       page.annotations.contains(where: { $0 === annotation })
                 else { return .invalidHistory }
@@ -417,8 +445,17 @@ extension PDFDocumentModel {
             // The same `/F` and document rules as a direct edit. This also
             // covers annotations that are currently detached, so undoing a
             // delete cannot restore a mark whose flags have since been locked.
-            guard MarkupPermissions.allowsAnnotationChanges(annotation, in: document) else {
-                return .permissionDenied
+            // Contents have one extra bit: LockedContents blocks the body but
+            // not the paper colour or deletion of the note. The document-level
+            // commenting permission applies to every change.
+            switch change {
+            case .setContents:
+                guard document.allowsCommenting,
+                      MarkupPermissions.allowsContentsChanges(annotation)
+                else { return .permissionDenied }
+            case .insert, .remove, .recolor, .setNoteStyle:
+                guard MarkupPermissions.allowsAnnotationChanges(annotation, in: document)
+                else { return .permissionDenied }
             }
         }
 
@@ -429,16 +466,22 @@ extension PDFDocumentModel {
                 if forward {
                     page.addAnnotation(annotation)
                 } else {
-                    page.removeAnnotation(annotation)
+                    removeAnnotationAndPopup(annotation, from: page)
                 }
             case let .remove(annotation, _):
                 if forward {
-                    page.removeAnnotation(annotation)
+                    removeAnnotationAndPopup(annotation, from: page)
                 } else {
                     page.addAnnotation(annotation)
+                    restorePopup(of: annotation, on: page)
                 }
             case let .recolor(annotation, _, from, to):
                 annotation.color = forward ? to : from
+                annotation.modificationDate = Date()
+            case let .setContents(annotation, _, from, to):
+                NoteService.setContents(forward ? to : from, on: annotation)
+            case let .setNoteStyle(annotation, _, from, to):
+                NoteService.setPaperColor(forward ? to : from, on: annotation)
                 annotation.modificationDate = Date()
             }
         }
@@ -461,6 +504,31 @@ extension PDFDocumentModel {
     private func noteAnnotationsChanged(on pageIndices: [Int]) {
         changedAnnotationPageIndices = Array(Set(pageIndices)).sorted()
         annotationRevision &+= 1
+        refreshNoteMarkers()
+    }
+
+    /// Removes an annotation together with the popup PDFKit may have attached.
+    ///
+    /// A `/Text` annotation is commonly paired with a `/Popup` child. Removing
+    /// only the parent leaves the popup behind as an empty, unclickable icon, so
+    /// both objects go in the same undoable step.
+    func removeAnnotationAndPopup(_ annotation: PDFAnnotation, from page: PDFPage) {
+        if let popup = annotation.popup,
+           page.annotations.contains(where: { $0 === popup }) {
+            page.removeAnnotation(popup)
+        }
+        page.removeAnnotation(annotation)
+    }
+
+    /// Puts back the popup that belonged to a restored annotation.
+    ///
+    /// PDFKit keeps the popup object on the annotation, so undoing a delete can
+    /// reattach it. It is only re-added when it is not already on the page.
+    func restorePopup(of annotation: PDFAnnotation, on page: PDFPage) {
+        guard let popup = annotation.popup,
+              !page.annotations.contains(where: { $0 === popup })
+        else { return }
+        page.addAnnotation(popup)
     }
 
     private static func validPageIndex(for page: PDFPage, in document: PDFDocument) -> Int? {
