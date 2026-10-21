@@ -69,6 +69,79 @@ enum PDFFixtureFactory {
         return url
     }
 
+    /// One page of several real text lines, so a selection can span lines and
+    /// pages without inventing geometry.
+    ///
+    /// Lines are drawn at a known height, which lets tests compare an
+    /// annotation's rectangles against the line they were selected from instead
+    /// of only checking that "something" was added.
+    static func makeParagraphData(
+        pageCount: Int = 2,
+        linesPerPage: Int = 4
+    ) throws -> Data {
+        precondition(pageCount > 0, "a fixture needs at least one page")
+        precondition(linesPerPage > 0, "a fixture needs at least one line")
+
+        var mediaBox = CGRect(x: 0, y: 0, width: 612, height: 792) // US Letter
+        let data = NSMutableData()
+
+        guard let consumer = CGDataConsumer(data: data as CFMutableData) else {
+            throw Failure.cannotCreateConsumer
+        }
+        guard let context = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else {
+            throw Failure.cannotCreateContext
+        }
+
+        for page in 0..<pageCount {
+            context.beginPDFPage(nil)
+            context.saveGState()
+            for line in 0..<linesPerPage {
+                let attributed = NSAttributedString(
+                    string: paragraphLine(page: page, line: line),
+                    attributes: [.font: NSFont.systemFont(ofSize: 14)]
+                )
+                let ctLine = CTLineCreateWithAttributedString(attributed)
+                context.textPosition = CGPoint(x: 72, y: paragraphBaseline(page: page, line: line))
+                CTLineDraw(ctLine, context)
+            }
+            context.restoreGState()
+            context.endPDFPage()
+        }
+
+        context.closePDF()
+        return data as Data
+    }
+
+    /// The text of one line in a paragraph fixture.
+    ///
+    /// Lines deliberately differ in length: a highlight that only stores its
+    /// bounding box would paint the empty space to the right of a short line, so
+    /// the fixture has to make that space exist.
+    static func paragraphLine(page: Int, line: Int) -> String {
+        let tail = String(repeating: "word ", count: line * 4 + 1)
+        return "Page \(page + 1) line \(line + 1) alpha \(tail)"
+    }
+
+    /// Baseline of one line, in PDF user space (origin bottom-left).
+    static func paragraphBaseline(page: Int, line: Int) -> CGFloat {
+        _ = page
+        return 720 - CGFloat(line) * 20
+    }
+
+    static func writeTemporaryParagraphPDF(
+        pageCount: Int = 2,
+        linesPerPage: Int = 4,
+        named name: String = "paragraph"
+    ) throws -> URL {
+        let data = try makeParagraphData(pageCount: pageCount, linesPerPage: linesPerPage)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("YoPDFTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("\(name).pdf")
+        try data.write(to: url, options: .atomic)
+        return url
+    }
+
     /// Writes arbitrary bytes with a `.pdf` extension, for corruption tests.
     static func writeTemporaryFile(named name: String, contents: Data) throws -> URL {
         let directory = FileManager.default.temporaryDirectory
