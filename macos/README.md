@@ -27,7 +27,7 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (117)
+./scripts/test.sh                     # unit tests (123)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
@@ -182,8 +182,21 @@ Editing is manual-save only:
   edits first and offer Save / Don't Save / Cancel. Opening another document is
   also refused by the model itself (`LoadError.unsavedChanges`), so no caller can
   drop edits as a side effect of opening a file.
+- "Don't Save" is a decision about the next document, not a promise that it will
+  open. `open(url:discardingUnsavedChanges:)` only abandons the edits as part of
+  the successful switch, so an open that fails leaves the old document, its
+  annotations and its dirty state untouched — and the next close still asks.
 - Save As is available as the escape hatch for read-only files, hard links and
-  conflicts; after it succeeds the reader continues editing the copy.
+  conflicts; after it succeeds the reader continues editing the copy. Its
+  failures use the same three-way split as a save: a copy that was written but
+  could not be reopened is reported as "saved, not verified" (and this window
+  stays on the original, still dirty), an unclassifiable replacement is reported
+  as "uncertain" with the recovery files listed, and only a write that did not
+  happen is reported as a failure.
+- The reader has exactly one way in for a file: the toolbar, the Open panel,
+  drag and drop, and `.onOpenURL` all funnel through `PDFReaderView.requestOpen`,
+  which is where the unsaved-changes prompt lives. There is no second
+  `.onOpenURL` handler that could open a file behind that prompt.
 
 Known P2a limitations:
 
@@ -196,13 +209,33 @@ Known P2a limitations:
   entry, the same way Preview does. YoPDF does not change or suppress it yet;
   whether a highlight should carry an author at all is an open product decision.
 - The window-close and quit interception is implemented on the `NSWindow`
-  delegate. It is covered by code review and by the model-level tests for the
-  underlying decisions, but it has not been exercised through a real window in
-  an automated test.
+  delegate (`WindowCloseGuard`). It owns the delegate that was installed before
+  it, because `NSWindow.delegate` does not retain its delegate and replacing the
+  slot would otherwise deallocate SwiftUI's and stop its teardown callbacks. It
+  re-takes the slot on every view update and whenever the window becomes key or
+  main, and every guard registers itself so quitting finds dirty windows even if
+  the delegate slot was taken by something else. This is covered by code review
+  and by the model-level tests for the underlying decisions; it has **not** been
+  exercised through a real window here — see the manual checklist below.
 - Apple Preview interoperability was checked by inspecting the written
   annotation dictionary (`/Subtype /Highlight`, `/QuadPoints`, `/C`, `/AP`) and by
   rendering the saved file in a separate PDFKit process, not by observing
   Preview's window.
+
+Window-level behaviour that still needs a human with a GUI session (this
+environment cannot drive windows: `screencapture`, `osascript` against
+System Events / Preview and `qlmanage -t` are all blocked here):
+
+1. Highlight, then click the red close button: Save / Don't Save / Cancel each do
+   what they say, and Cancel leaves the window open with the highlight intact.
+2. Highlight, then ⌘W — same prompt.
+3. Highlight, then ⌘Q — same prompt, and with several dirty windows the app asks
+   once per window instead of quitting halfway.
+4. Highlight, then open a corrupt PDF and choose "Don't Save": the corrupt file
+   fails to open, and the original document is still there, still marked edited,
+   still holding its highlight.
+5. Select text with the mouse and click the Highlight toolbar button: moving
+   focus to the button must not drop the selection before it is applied.
 
 `YoPDFCore` is a framework so tests are pure logic tests: they link the module
 and never launch the app, so no window server or accessibility permission is
