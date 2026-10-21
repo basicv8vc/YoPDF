@@ -16,6 +16,9 @@ public final class PDFDocumentModel: ObservableObject {
         case unreadable
         case emptyDocument
         case unsupportedFileSituation(UnsupportedFileSituation)
+        /// The current document has edits that are not on disk. Replacing it
+        /// would discard them, so the caller has to save or discard first.
+        case unsavedChanges
     }
 
     public static let minimumZoomScale: CGFloat = 0.25
@@ -38,6 +41,18 @@ public final class PDFDocumentModel: ObservableObject {
     /// Bumped on every successful open so the view can re-apply layout.
     @Published public private(set) var loadGeneration: Int = 0
 
+    /// True while the in-memory document holds changes the file does not.
+    ///
+    /// Only annotation edits set this in P2a. It exists so that closing,
+    /// switching documents or quitting cannot silently drop them; it is not a
+    /// general document-modification flag yet.
+    @Published public private(set) var hasUnsavedChanges: Bool = false
+    /// The reader's current text selection, mirrored from `PDFView`.
+    ///
+    /// Owned by the model so that the Highlight button, the menu command and
+    /// the annotation call all read the same value.
+    @Published public private(set) var currentSelection: PDFSelection?
+
     /// PDFKit memory-maps the file, so a security-scoped URL must stay open for
     /// as long as the document is displayed. The session is the single owner of
     /// that access; the model never starts or stops a scope itself, which is
@@ -46,14 +61,20 @@ public final class PDFDocumentModel: ObservableObject {
     /// A candidate session is replaced only after its document has been fully
     /// loaded, so a failed open leaves the previous document and its access
     /// intact.
-    private let store: DocumentStore
+    ///
+    /// Internal rather than private so the editing extension can reuse the
+    /// store when a Save As leaves a file on disk without a session.
+    let store: DocumentStore
 
     /// The open file session, or nil when nothing is loaded. Exposed so later
     /// phases can save through the same session that owns the access.
     public private(set) var documentSession: DocumentSession?
 
-    public init(access: any SecurityScopeAccessing = SystemSecurityScopeAccess()) {
-        self.store = DocumentStore(access: access)
+    public init(
+        access: any SecurityScopeAccessing = SystemSecurityScopeAccess(),
+        io: any DocumentStoreIO = SystemDocumentStoreIO()
+    ) {
+        self.store = DocumentStore(access: access, io: io)
     }
 
     public var isLoaded: Bool { document != nil }
@@ -72,8 +93,22 @@ public final class PDFDocumentModel: ObservableObject {
     ///
     /// A failed open therefore leaves the loaded document *and* its security
     /// scope untouched. Returns `false` and records `lastError` on failure.
+    ///
+    /// A document with unsaved edits is refused with `.unsavedChanges` instead
+    /// of being replaced: dropping the edits is a decision the user makes, not
+    /// a side effect of opening a file. The caller saves or discards first.
     @discardableResult
     public func open(url: URL) -> Bool {
+        guard !hasUnsavedChanges else {
+            lastError = .unsavedChanges
+            return false
+        }
+        return openIgnoringUnsavedChanges(url: url)
+    }
+
+    /// The raw open path, without the unsaved-changes gate.
+    @discardableResult
+    func openIgnoringUnsavedChanges(url: URL) -> Bool {
         guard url.isFileURL else {
             lastError = .notAFileURL
             return false
@@ -133,6 +168,8 @@ public final class PDFDocumentModel: ObservableObject {
         effectiveScale = 1
         isAutoScaling = true
         lastError = nil
+        hasUnsavedChanges = false
+        currentSelection = nil
         loadGeneration &+= 1
     }
 
@@ -149,8 +186,90 @@ public final class PDFDocumentModel: ObservableObject {
         effectiveScale = 1
         isAutoScaling = true
         lastError = nil
+        hasUnsavedChanges = false
+        currentSelection = nil
         title = Self.resolvedTitle(for: document, fileURL: fileURL)
         loadGeneration &+= 1
+    }
+
+    // MARK: - Editing support
+
+    /// Where the reader is, so that replacing the in-memory document does not
+    /// send the user back to page one.
+    struct ReadingPosition {
+        let pageIndex: Int
+        let zoomScale: CGFloat
+        let effectiveScale: CGFloat
+        let isAutoScaling: Bool
+    }
+
+    var readingPosition: ReadingPosition {
+        ReadingPosition(
+            pageIndex: currentPageIndex,
+            zoomScale: zoomScale,
+            effectiveScale: effectiveScale,
+            isAutoScaling: isAutoScaling
+        )
+    }
+
+    /// Replaces the displayed document without touching the navigation state
+    /// the user chose.
+    ///
+    /// Deliberately does **not** bump `loadGeneration`: the view keeps its
+    /// `PDFView` and re-attaches the new document, so scroll position within the
+    /// page survives a save. Bumping the generation would rebuild the view and
+    /// jump back to the top of the page.
+    func swapDocument(_ newDocument: PDFDocument, at position: ReadingPosition) {
+        document = newDocument
+        pageCount = newDocument.pageCount
+        currentPageIndex = Self.clamped(position.pageIndex, pageCount: newDocument.pageCount)
+        zoomScale = position.zoomScale
+        effectiveScale = position.effectiveScale
+        isAutoScaling = position.isAutoScaling
+        currentSelection = nil
+        title = Self.resolvedTitle(for: newDocument, fileURL: fileURL)
+    }
+
+    /// Points the model at a new file, used by Save As.
+    func adoptFileLocation(_ url: URL) {
+        fileURL = url
+        if let document {
+            title = Self.resolvedTitle(for: document, fileURL: url)
+        }
+    }
+
+    /// Swaps in the session that now owns the file, closing the old one.
+    ///
+    /// Used after Save As: the new session already holds the destination's
+    /// access, and the previous file must stop being held.
+    func adoptSession(_ session: DocumentSession?) {
+        let previous = documentSession
+        documentSession = session
+        if previous !== session {
+            previous?.close()
+        }
+    }
+
+    func markEdited() {
+        hasUnsavedChanges = true
+    }
+
+    func markSaved() {
+        hasUnsavedChanges = false
+    }
+
+    /// Mirrors the view's selection into the model.
+    ///
+    /// The view is the only writer: it reports what `PDFView` selected, and
+    /// reports `nil` after the model cleared it (a highlight consumed it).
+    public func updateSelection(_ selection: PDFSelection?) {
+        guard selection !== currentSelection else { return }
+        currentSelection = selection
+    }
+
+    private static func clamped(_ index: Int, pageCount: Int) -> Int {
+        guard pageCount > 0 else { return 0 }
+        return min(max(index, 0), pageCount - 1)
     }
 
     private static func resolvedTitle(for document: PDFDocument, fileURL: URL?) -> String {
@@ -264,6 +383,8 @@ extension PDFDocumentModel.LoadError: LocalizedError {
             return "This file is not a readable PDF. It may be damaged or password protected."
         case .emptyDocument:
             return "This PDF contains no pages."
+        case .unsavedChanges:
+            return "Save or discard your changes before opening another document."
         case let .unsupportedFileSituation(situation):
             switch situation {
             case .symbolicLink:
