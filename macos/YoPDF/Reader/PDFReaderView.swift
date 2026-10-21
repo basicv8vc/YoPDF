@@ -63,7 +63,7 @@ struct PDFReaderView: View {
             Divider()
             content
         }
-        .frame(minWidth: 720, minHeight: 520)
+        .frame(minWidth: 900, minHeight: 520)
         .background(Color(nsColor: .windowBackgroundColor))
         .fileImporter(
             isPresented: $isImporterPresented,
@@ -80,7 +80,8 @@ struct PDFReaderView: View {
         .focusedSceneValue(\.openDocument, { isImporterPresented = true })
         .focusedSceneValue(\.saveDocument, { _ = performSave() })
         .focusedSceneValue(\.saveDocumentAs, { presentSaveAsPanel() })
-        .focusedSceneValue(\.highlightSelection, { _ = model.addHighlightToSelection() })
+        .focusedSceneValue(\.highlightSelection, { _ = model.addMarkup(.highlight) })
+        .focusedSceneValue(\.underlineSelection, { _ = model.addMarkup(.underline) })
         .background(
             WindowCloseGuardInstaller(
                 guardObject: closeGuard,
@@ -184,12 +185,71 @@ struct PDFReaderView: View {
             Divider().frame(height: 18)
 
             Button {
-                model.addHighlightToSelection()
+                model.addMarkup(.highlight)
             } label: {
                 Label("Highlight", systemImage: "highlighter")
             }
-            .disabled(!model.canAddHighlight)
+            .disabled(!model.canAddMarkup(.highlight))
             .help("Highlight the selected text (⇧⌘H)")
+
+            MarkupColorButton(
+                title: "Highlight Colour",
+                help: "Colour for new highlights",
+                color: model.defaultMarkupColor(for: .highlight)
+            ) { color in
+                model.setDefaultMarkupColor(color, for: .highlight)
+            }
+
+            Button {
+                model.addMarkup(.underline)
+            } label: {
+                Label("Underline", systemImage: "underline")
+            }
+            .disabled(!model.canAddMarkup(.underline))
+            .help("Underline the selected text (⇧⌘U)")
+
+            MarkupColorButton(
+                title: "Underline Colour",
+                help: "Colour for new underlines",
+                color: model.defaultMarkupColor(for: .underline)
+            ) { color in
+                model.setDefaultMarkupColor(color, for: .underline)
+            }
+
+            if let selected = model.selectedMarkup {
+                Divider().frame(height: 18)
+
+                MarkupColorButton(
+                    title: "\(selected.kind.title) Colour",
+                    help: "Change the selected annotation’s colour",
+                    color: selected.color
+                ) { color in
+                    model.recolorSelectedMarkup(to: color)
+                }
+                .disabled(!model.canModifySelectedMarkup)
+
+                Button {
+                    model.convertSelectedMarkup()
+                } label: {
+                    Image(systemName: selected.kind.converted.symbolName)
+                }
+                .disabled(!model.canModifySelectedMarkup)
+                .help("Convert to \(selected.kind.converted.title)")
+
+                if model.selectedMarkupIsProtected {
+                    Image(systemName: "lock.fill")
+                        .foregroundStyle(.secondary)
+                        .help("This annotation is protected and cannot be changed")
+                }
+
+                Button {
+                    model.deleteSelectedMarkup()
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .disabled(!model.canModifySelectedMarkup)
+                .help("Delete the selected annotation")
+            }
 
             Button {
                 performSave()
@@ -265,7 +325,14 @@ struct PDFReaderView: View {
                 ),
                 autoScales: model.isAutoScaling,
                 zoomScale: model.zoomScale,
-                onScaleChange: { model.updateEffectiveScale($0) }
+                onScaleChange: { model.updateEffectiveScale($0) },
+                selectedMarkup: model.selectedMarkup,
+                annotationRevision: model.annotationRevision,
+                changedAnnotationPageIndices: model.changedAnnotationPageIndices,
+                onMarkupClick: { point, page in
+                    model.selectMarkup(at: point, on: page)
+                },
+                makeMarkupMenuItems: { markupMenuItems() }
             )
             .id(model.loadGeneration)
             .alert(
@@ -411,6 +478,63 @@ struct PDFReaderView: View {
                 return true
             }
         }
+    }
+
+    // MARK: - Annotation menu
+
+    /// Right-click actions for the selected markup.
+    ///
+    /// Built from the same model methods as the toolbar so there is no second
+    /// editing path. The standard PDFView menu is kept and extended, not
+    /// replaced: zoom, display mode and navigation still belong to PDFKit.
+    private func markupMenuItems() -> [NSMenuItem] {
+        guard let selected = model.selectedMarkup else { return [] }
+        let canModify = model.canModifySelectedMarkup
+        var items: [NSMenuItem] = []
+
+        if model.selectedMarkupIsProtected {
+            items.append(MarkupActionMenuItem(
+                title: "Protected annotation",
+                isEnabled: false
+            ) {})
+        }
+
+        let colorItem = NSMenuItem(
+            title: "\(selected.kind.title) Colour",
+            action: nil,
+            keyEquivalent: ""
+        )
+        let colorMenu = NSMenu(title: "\(selected.kind.title) Colour")
+        let currentHex = MarkupColorPalette.hex(from: selected.color)
+        for preset in MarkupColorPalette.presets {
+            let item = MarkupActionMenuItem(title: preset.name) { [weak model] in
+                _ = model?.recolorSelectedMarkup(to: preset.color)
+            }
+            item.state = currentHex?.caseInsensitiveCompare(preset.hex) == .orderedSame
+                ? .on
+                : .off
+            item.isEnabled = canModify
+            colorMenu.addItem(item)
+        }
+        colorItem.submenu = colorMenu
+        colorItem.isEnabled = canModify
+        items.append(colorItem)
+
+        let convert = MarkupActionMenuItem(
+            title: "Convert to \(selected.kind.converted.title)"
+        ) { [weak model] in
+            _ = model?.convertSelectedMarkup()
+        }
+        convert.isEnabled = canModify
+        items.append(convert)
+
+        let delete = MarkupActionMenuItem(title: "Delete \(selected.kind.title)") { [weak model] in
+            _ = model?.deleteSelectedMarkup()
+        }
+        delete.isEnabled = canModify
+        items.append(delete)
+
+        return items
     }
 
     // MARK: - Unsaved changes
