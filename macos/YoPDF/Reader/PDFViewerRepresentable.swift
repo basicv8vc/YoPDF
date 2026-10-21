@@ -25,7 +25,7 @@ struct PDFViewerRepresentable: NSViewRepresentable {
     let makeMarkupMenuItems: () -> [NSMenuItem]
 
     func makeNSView(context: Context) -> MarkupPDFView {
-        let view = MarkupPDFView()
+        let view = MarkupPDFView(frame: .zero)
         view.autoScales = true
         view.displayMode = .singlePageContinuous
         view.displayDirection = .vertical
@@ -43,6 +43,7 @@ struct PDFViewerRepresentable: NSViewRepresentable {
         context.coordinator.updateHandlers(on: view, parent: self)
 
         if view.document !== document {
+            view.clearOverlayViews()
             view.document = document
             if document != nil {
                 view.autoScales = true
@@ -65,8 +66,6 @@ struct PDFViewerRepresentable: NSViewRepresentable {
 
         if view.selectedMarkup != selectedMarkup {
             view.selectedMarkup = selectedMarkup
-            view.needsDisplay = true
-            view.documentView?.needsDisplay = true
         }
 
         if context.coordinator.lastAnnotationRevision != annotationRevision {
@@ -169,14 +168,38 @@ struct PDFViewerRepresentable: NSViewRepresentable {
 /// that mark instead. Right-click reuses the same model hit test and merges the
 /// markup actions into PDFKit's existing context menu instead of replacing it.
 @MainActor
-final class MarkupPDFView: PDFView {
+final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
 
-    var selectedMarkup: MarkupSelection?
+    var selectedMarkup: MarkupSelection? {
+        didSet {
+            guard selectedMarkup != oldValue else { return }
+            refreshOverlayViews()
+        }
+    }
     var onMarkupClick: ((CGPoint, PDFPage) -> Bool)?
     var makeMarkupMenuItems: (() -> [NSMenuItem])?
 
     private var mouseDownPoint: CGPoint?
     private var mouseDidDrag = false
+    private var overlayViews: [ObjectIdentifier: MarkupSelectionOverlayView] = [:]
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        // This must be installed before a document is assigned. PDFKit asks for
+        // page overlays while it builds the page view hierarchy.
+        pageOverlayViewProvider = self
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        pageOverlayViewProvider = self
+    }
+
+    /// Drop references to overlays belonging to the previous document. PDFKit
+    /// removes the views themselves when the page views go away.
+    func clearOverlayViews() {
+        overlayViews.removeAll()
+    }
 
     override func mouseDown(with event: NSEvent) {
         mouseDownPoint = convert(event.locationInWindow, from: nil)
@@ -232,36 +255,70 @@ final class MarkupPDFView: PDFView {
         return menu
     }
 
-    override func drawPagePost(_ page: PDFPage, to context: CGContext) {
-        super.drawPagePost(page, to: context)
-        guard let selectedMarkup,
-              let document,
-              document.index(for: page) == selectedMarkup.pageIndex
-        else { return }
+    func pdfView(_ view: PDFView, overlayViewFor page: PDFPage) -> NSView? {
+        let overlay = MarkupSelectionOverlayView()
+        overlay.pageIndex = view.document?.index(for: page) ?? -1
+        overlay.pageBounds = page.bounds(for: view.displayBox)
+        overlay.selectedMarkup = selectedMarkup
+        overlayViews[ObjectIdentifier(page)] = overlay
+        return overlay
+    }
+
+    func pdfView(
+        _ pdfView: PDFView,
+        willEndDisplayingOverlayView overlayView: NSView,
+        for page: PDFPage
+    ) {
+        overlayViews.removeValue(forKey: ObjectIdentifier(page))
+    }
+
+    private func refreshOverlayViews() {
+        for overlay in overlayViews.values {
+            overlay.selectedMarkup = selectedMarkup
+        }
+    }
+}
+
+/// Draws the selected markup outline in page coordinates.
+///
+/// The outline must not be implemented in `PDFView.drawPagePost`: PDFKit calls
+/// that hook from its tiled-rendering queue, and overriding it on a main-actor
+/// `PDFView` subclass traps the process with an executor-isolation assertion.
+/// A page overlay is PDFKit's supported hook for content that sits above a page
+/// and is automatically resized and rotated with it.
+@MainActor
+private final class MarkupSelectionOverlayView: NSView {
+
+    var pageIndex = -1
+    var pageBounds: CGRect = .zero
+    var selectedMarkup: MarkupSelection? {
+        didSet { needsDisplay = true }
+    }
+
+    override var isOpaque: Bool { false }
+
+    /// The overlay is presentation-only; clicks must continue to reach the
+    /// PDFView beneath it for text selection and markup hit-testing.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let selectedMarkup, selectedMarkup.pageIndex == pageIndex else { return }
 
         let accent = NSColor.controlAccentColor
-        context.saveGState()
-        defer { context.restoreGState() }
-
         for rect in selectedMarkup.quadRects {
-            let viewRect = convert(rect, from: page).insetBy(dx: -1.5, dy: -1.5)
-            guard viewRect.width > 0, viewRect.height > 0 else { continue }
-            let path = CGPath(
-                roundedRect: viewRect,
-                cornerWidth: 2,
-                cornerHeight: 2,
-                transform: nil
-            )
+            let pageRect = rect.offsetBy(dx: -pageBounds.minX, dy: -pageBounds.minY)
+            let drawRect = pageRect.insetBy(dx: -1.5, dy: -1.5)
+            guard drawRect.width > 0, drawRect.height > 0 else { continue }
 
-            context.addPath(path)
-            context.setFillColor(accent.withAlphaComponent(0.12).cgColor)
-            context.fillPath()
+            let path = NSBezierPath(roundedRect: drawRect, xRadius: 2, yRadius: 2)
 
-            context.addPath(path)
-            context.setStrokeColor(accent.withAlphaComponent(0.95).cgColor)
-            context.setLineWidth(1.5)
-            context.setLineDash(phase: 0, lengths: [4, 2])
-            context.strokePath()
+            accent.withAlphaComponent(0.12).setFill()
+            path.fill()
+
+            accent.withAlphaComponent(0.95).setStroke()
+            path.lineWidth = 1.5
+            path.setLineDash([4, 2], count: 2, phase: 0)
+            path.stroke()
         }
     }
 }

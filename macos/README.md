@@ -237,8 +237,8 @@ annotation per page.
 - **Click selection uses the painted quads.** `MarkupGeometry.contains` tests
   the `/QuadPoints` rectangles, not the annotation's multi-line bounding box,
   so the empty area beside a short line does not select the mark. The selected
-  quads are outlined by a view-only `drawPagePost` overlay; the overlay is not
-  written into the PDF.
+  quads are outlined by a view-only PDFKit page overlay; the overlay is not
+  written into the PDF and does not intercept clicks.
 - **One editing entry point.** `PDFDocumentModel.addMarkup`,
   `recolorSelectedMarkup`, `deleteSelectedMarkup`, `convertSelectedMarkup`,
   `undoMarkup` and `redoMarkup` are what the toolbar, menu bar and context menu
@@ -284,6 +284,13 @@ Known P2a/P2b limitations:
 - An annotation without valid `/QuadPoints` falls back to its bounds for
   hit-testing and for the selection overlay. Every mark YoPDF creates has
   quads, but a malformed third-party one has no better geometry available.
+- The selection outline is a `PDFPageOverlayViewProvider` view, not a
+  `drawPagePost` drawing hook. PDFKit calls `drawPagePost` from its
+  tile-rendering queue, which violates `PDFView`'s main-actor isolation and
+  traps the process. Opening and rendering a document was exercised here, but
+  the environment cannot drive or capture the window, so the selected-outline
+  appearance after zoom/scroll, rotated pages and non-zero crop-box origins
+  remain manual checks.
 - Recolour coalescing uses consecutive history entries, not an explicit gesture
   boundary. Recolouring the same mark in two separate interactions can therefore
   produce one Undo entry rather than two. This is a known limitation; a later
@@ -330,7 +337,9 @@ System Events / Preview and `qlmanage -t` are all blocked here):
 6. Click a highlight on the page: its painted quads get the accent outline, the
    editing controls appear in the toolbar, and a single Undo reverses the last
    add/recolour/delete/convert. Clicking the empty space inside a multi-line
-   annotation's bounding box must **not** select it.
+   annotation's bounding box must **not** select it. Scroll and zoom while the
+   mark is selected: the outline stays aligned, and text selection and
+   right-click still reach PDFKit through the overlay.
 7. Right-click a highlight: the colour, convert and delete items appear above
    PDFKit's zoom/display/navigation items; each action does the same thing as
    the toolbar equivalent, and the PDFKit items still work.
