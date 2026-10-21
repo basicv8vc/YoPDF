@@ -16,7 +16,12 @@ yet.
 P2b extends that to editable **Highlight** and **Underline** annotations:
 six presets plus a custom `ColorPicker`, click selection, recolouring, deletion,
 conversion between the two subtypes, a context menu, and model-owned Undo/Redo.
-Notes and strike-out remain later work.
+
+P2c adds **notes**: a compact SwiftUI composer writes a standard PDF `/Text`
+annotation, either about the selected text or at a point the user clicks on the
+page. Six paper tints, a marker drawn over the page, editing, deletion and
+Undo/Redo all go through the same model pipeline as Highlight and Underline.
+There is still no autosave, annotation sidebar or template library.
 
 ## Requirements
 
@@ -32,7 +37,7 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (158)
+./scripts/test.sh                     # unit tests (181)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
@@ -65,6 +70,8 @@ macos/
 │   ├── HighlightService.swift  # selection → /Highlight or /Underline
 │   ├── MarkupAnnotation.swift  # kinds, palette, preferences, permissions, quads
 │   ├── MarkupEditing.swift     # model-owned add/edit/delete/convert/undo
+│   ├── NoteAnnotation.swift    # /Text notes, paper tints, drafts, markers
+│   ├── NoteEditing.swift       # model-owned add/edit/delete notes
 │   ├── PDFDocumentModel.swift
 │   ├── PDFDocumentModel+Editing.swift # dirty state, save, Save As, re-sync
 │   ├── QuitCoordinator.swift   # quit-attempt decisions, no AppKit
@@ -79,6 +86,7 @@ macos/
 │   ├── App/ReaderFocusedValues.swift
 │   └── Reader/
 │       ├── PDFViewerRepresentable.swift # PDFView ↔ SwiftUI bridge
+│       ├── NoteComposer.swift          # compact note popover and paper tints
 │       ├── MarkupColorControls.swift   # presets + custom ColorPicker
 │       ├── MarkupActionMenuItem.swift  # closure-backed context-menu item
 │       └── PDFReaderView.swift          # toolbar, prompts, empty state
@@ -98,6 +106,7 @@ macos/
 │   ├── DocumentStoreModelIntegrationTests.swift
 │   ├── HighlightAnnotationTests.swift   # real PDFKit highlight geometry
 │   ├── MarkupEditingTests.swift         # select, edit, undo, save integration
+│   ├── NoteAnnotationTests.swift        # real PDFKit /Text notes end to end
 │   ├── DocumentEditingTests.swift       # dirty state, save outcomes, re-sync
 │   ├── QuitCoordinatorTests.swift       # multi-window quit decisions
 │   └── ReaderViewSyncTests.swift
@@ -276,11 +285,77 @@ annotation per page.
   preserves a square, a sticky note and a link next to an edited mark in the
   real-PDFKit tests.
 
+### Notes (P2c)
+
+A note is one standard PDF `/Text` annotation. The body is `/Contents` and
+nothing else; the paper tint is written to `/C` and mirrored in an optional
+`/YoPDFNotePaper` key, and the quoted excerpt and the page-note flag live in
+`/YoPDFNoteExcerpt` and `/YoPDFNotePageLevel`. Losing any of the three custom
+keys loses the tint and the quote, never the text, and there is no sidecar or
+database — the saved PDF is the whole document.
+
+- **The anchor is captured when the composer opens, not when Save is pressed.**
+  A selection note records the page and the marker rectangle up front, so a
+  click or a new selection while the popover is open cannot move it.
+- **A cross-page selection is anchored on the first page of the selection, and
+  only there.** The page comes from each line's own page, so a selection that
+  passes through a page never annotates it. The marker sits just outside the
+  top-right of the selected text, and flips to the left or clamps into the page
+  when that would leave the sheet.
+- **A page note never consults the text selection.** `pageNoteDraft(at:on:)`
+  reads only the click point, so creating one while text is still selected
+  cannot inherit that text or that page. The composer is reached from the
+  toolbar (Add Note), `⇧⌘N`, the page context menu ("Add Note Here") or, with no
+  selection, by placing the note with the crosshair that Add Note turns on.
+- **The composer writes nothing until Save.** Body and paper are local SwiftUI
+  state; Cancel closes the popover without a model call, so it cannot dirty the
+  document or leave an Undo entry. A blank or whitespace-only body is refused by
+  the model as well as disabled in the UI.
+- **The input grows to four lines and then scrolls.** A vertical `TextField`
+  with `lineLimit(1...4)` gives that behaviour; Return inserts a newline and
+  `⌘Return` submits. "Expand" turns the same popover into a larger `TextEditor`
+  for long notes, with the same Save and Cancel, so there is only one commit
+  path. An existing note reopens from its marker with its body and tint.
+- **Six paper tints, drawn natively.** Honey, Rose, Mint, Sky, Lavender and Sand
+  are opaque sRGB values used for `/C`, for the composer card and for the page
+  marker. No artwork, fonts or third-party assets are involved, and none of
+  ShuaMac's sticker illustrations are copied.
+- **The page marker is a page overlay, not a written appearance.** PDFKit draws
+  its own icon for a `/Text` annotation; the overlay paints an opaque paper
+  marker over the same rectangle, so the page shows one marker and the file
+  still holds a plain standard note. A pixel check in this environment measured
+  the icon at 360 red pixels and 0 after the marker was drawn over it. Markers
+  are derived from the document (`noteMarkers`), never stored separately, so a
+  marker cannot outlive its annotation.
+- **Notes share the markup edit pipeline.** `addNote`, `updateNote` and
+  `deleteNote` build one `MarkupEdit`, so a body change and a paper change in
+  one Save are a single Undo entry, and a successful save clears the history
+  exactly as it does for highlights. A save reloads the document and rebuilds
+  the markers from the file.
+- **Permissions are re-read at execution time.** ReadOnly and Locked refuse
+  body, colour and deletion; LockedContents refuses only `/Contents`, so the
+  tint can still change and the note can still be deleted. The edit pipeline
+  checks again for Undo and Redo, which is why a note that becomes protected
+  keeps its history and stays editable once unlocked. A document that forbids
+  commenting refuses new notes and every change.
+- **PDFKit's popup companion is handled.** Adding a `/Text` annotation makes
+  PDFKit attach a `/Popup` child; delete removes both and Undo restores both, so
+  no empty popup icon is left behind. `/NM` is not written: PDFKit accepts one in
+  memory and drops it on serialisation, so a note is identified by its object,
+  not by a name the file would not keep.
+- **Interoperability.** A note written here reads back through a separate
+  `PDFDocument` with its body, tint and rectangle, and a `/Text` annotation
+  created by another application (no YoPDF keys at all) can be read, edited and
+  deleted here; its highlight and square neighbours survive the round trip.
+  Apple Preview reads the body from `/Contents`. That was checked by inspecting
+  the written annotation dictionary and by reopening the file in a separate
+  PDFKit process, not by watching Preview's window.
+
 Known P2a/P2b limitations:
 
-- No annotation sidebar, no StrikeOut, note, free-text or ink annotations, and
-  no annotation search. The Note work is a separate P2b PR; this PR only covers
-  Highlight and Underline.
+- No annotation sidebar, no StrikeOut, free-text or ink annotations, and no
+  annotation search. Notes are a single body per annotation: no threads, no
+  templates, no sticker library, and no note list.
 - An annotation without valid `/QuadPoints` falls back to its bounds for
   hit-testing and for the selection overlay. Every mark YoPDF creates has
   quads, but a malformed third-party one has no better geometry available.
@@ -317,6 +392,30 @@ Known P2a/P2b limitations:
   annotation dictionary (`/Subtype /Highlight`, `/QuadPoints`, `/C`, `/AP`) and by
   rendering the saved file in a separate PDFKit process, not by observing
   Preview's window.
+
+Known P2c limitations:
+
+- A note body is plain text. `/Contents` holds no formatting, and the composer
+  does not offer any.
+- The paper tint is written to `/C`, so another viewer that draws the standard
+  note icon draws it in that colour too. "Paper colour only affects YoPDF" is
+  true of the marker and the composer card; it cannot be true of a viewer that
+  renders `/C` itself, and suppressing `/C` would make the note look unrelated
+  in other applications.
+- The marker is an overlay drawn at the annotation rectangle. It follows the
+  page transform like the P2b selection outline, but this environment cannot
+  capture a window, so marker alignment after zoom/scroll and on rotated pages
+  is still a manual check. The artwork itself and its coverage of PDFKit's icon
+  were verified offscreen.
+- Popover placement is computed from the PDFView's bounds (converted from the
+  unflipped AppKit origin). The composer's layout was rendered offscreen, but
+  the arrow's position on a real window — including near a screen edge — has not
+  been observed.
+- Placement mode consumes the click that places the note, so a drag cannot
+  position it; one click, one note. There is no drag-to-move for an existing
+  marker yet.
+- A note is deleted without a confirmation dialog. It is a single Undo away and
+  the composer says so, but a user who does not know ⌘Z may be surprised.
 
 Window-level behaviour that still needs a human with a GUI session (this
 environment cannot drive windows: `screencapture`, `osascript` against
@@ -356,6 +455,31 @@ System Events / Preview and `qlmanage -t` are all blocked here):
 11. Simulate a save conflict (change the file from another app) after recolouring:
     the save is refused, the annotation and the Undo history stay in the window,
     and Save As remains available.
+12. Select a sentence and press Add Note (or ⇧⌘N): the popover points at the
+    marker position, the quote is the selected text, Return inserts a newline and
+    ⌘Return saves. Esc or Cancel closes it with no "Edited" indicator and no Undo
+    entry.
+13. With no selection, press Add Note: the cursor becomes a crosshair and one
+    click on a page places the note there. Esc cancels the placement. Do this
+    while text is still selected: the new note must be a page note, on the page
+    that was clicked.
+14. Select text across a page break, add a note, and check the marker: it must be
+    on the first page of the selection, and the second page must have no marker.
+15. Click a marker: the note reopens with its body and tint. Change the body and
+    the paper, Save, then ⌘Z twice: the tint and then the body revert.
+16. Zoom to 200% and 50%, and scroll: markers stay on their notes and stay
+    clickable; the popover still points at the marker it belongs to.
+17. Type a note long enough to pass four lines: the field stops growing and
+    scrolls internally. Expand it, keep typing, collapse, and save: the body is
+    the same either way.
+18. Save a note, quit, reopen the file in YoPDF and in Apple Preview: the marker
+    is where it was, and Preview's note list shows the body text.
+19. Open a PDF whose notes come from another application: their markers appear,
+    their body can be edited, and deleting one does not disturb a highlight next
+    to it.
+20. Right-click a marker: Edit Note and Delete Note appear above PDFKit's items;
+    right-click empty page space: Add Note Here appears. Neither replaces the
+    PDFKit zoom/display items.
 
 `YoPDFCore` is a framework so tests are pure logic tests: they link the module
 and never launch the app, so no window server or accessibility permission is
@@ -381,8 +505,10 @@ P0 excluded annotations, search, recent documents, tabs, agent integration,
 accounts, sync and PDF editing. P1 added file access and safe persistence. P2a
 adds yellow highlights with a manual save. P2b makes Highlight and Underline
 editable: selection, six presets plus custom colours, recolour, delete, convert
-and Undo/Redo. There is still no autosave, document library, annotation sidebar,
-Note/StrikeOut support or agent integration.
+and Undo/Redo. P2c adds standard `/Text` notes with a compact composer, six paper
+tints, page markers, editing, deletion and Undo/Redo. There is still no autosave,
+document library, annotation sidebar, StrikeOut support, note templates or agent
+integration.
 
 Known P1 boundaries:
 
