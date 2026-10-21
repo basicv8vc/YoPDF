@@ -30,6 +30,10 @@ struct HighlightSelectionActionKey: FocusedValueKey {
     typealias Value = @MainActor () -> Void
 }
 
+struct UnderlineSelectionActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
 extension FocusedValues {
     var documentModel: PDFDocumentModel? {
         get { self[DocumentModelFocusKey.self] }
@@ -54,5 +58,10 @@ extension FocusedValues {
     var highlightSelection: (@MainActor () -> Void)? {
         get { self[HighlightSelectionActionKey.self] }
         set { self[HighlightSelectionActionKey.self] = newValue }
+    }
+
+    var underlineSelection: (@MainActor () -> Void)? {
+        get { self[UnderlineSelectionActionKey.self] }
+        set { self[UnderlineSelectionActionKey.self] = newValue }
     }
 }

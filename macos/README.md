@@ -10,8 +10,13 @@ tracking, external-change detection, and safe in-place saving.
 P2a adds the first editing feature on top of it: select text, add a yellow
 highlight, save, reopen. A highlight is a standard PDF `/Highlight` annotation
 with `/QuadPoints`, so other readers see it as their own. Editing introduces a
-minimal dirty state and a manual Save; there is no autosave, undo, or annotation
-sidebar yet.
+minimal dirty state and a manual Save; there is no autosave or annotation sidebar
+yet.
+
+P2b extends that to editable **Highlight** and **Underline** annotations:
+six presets plus a custom `ColorPicker`, click selection, recolouring, deletion,
+conversion between the two subtypes, a context menu, and model-owned Undo/Redo.
+Notes and strike-out remain later work.
 
 ## Requirements
 
@@ -27,7 +32,7 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (131)
+./scripts/test.sh                     # unit tests (152)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
@@ -57,7 +62,9 @@ macos/
 │   ├── DocumentStoreIO.swift   # filesystem seam + POSIX implementation
 │   ├── DocumentStoreError.swift
 │   ├── DocumentVersion.swift   # identity, version, external-change types
-│   ├── HighlightService.swift  # selection → standard /Highlight annotation
+│   ├── HighlightService.swift  # selection → /Highlight or /Underline
+│   ├── MarkupAnnotation.swift  # kinds, palette, preferences, permissions, quads
+│   ├── MarkupEditing.swift     # model-owned add/edit/delete/convert/undo
 │   ├── PDFDocumentModel.swift
 │   ├── PDFDocumentModel+Editing.swift # dirty state, save, Save As, re-sync
 │   ├── QuitCoordinator.swift   # quit-attempt decisions, no AppKit
@@ -72,6 +79,8 @@ macos/
 │   ├── App/ReaderFocusedValues.swift
 │   └── Reader/
 │       ├── PDFViewerRepresentable.swift # PDFView ↔ SwiftUI bridge
+│       ├── MarkupColorControls.swift   # presets + custom ColorPicker
+│       ├── MarkupActionMenuItem.swift  # closure-backed context-menu item
 │       └── PDFReaderView.swift          # toolbar, prompts, empty state
 ├── YoPDFTests/
 │   ├── PDFFixtureFactory.swift # generates real PDFs at runtime
@@ -88,6 +97,7 @@ macos/
 │   ├── DocumentStoreScaleTests.swift    # 200 MB streaming and save
 │   ├── DocumentStoreModelIntegrationTests.swift
 │   ├── HighlightAnnotationTests.swift   # real PDFKit highlight geometry
+│   ├── MarkupEditingTests.swift         # select, edit, undo, save integration
 │   ├── DocumentEditingTests.swift       # dirty state, save outcomes, re-sync
 │   ├── QuitCoordinatorTests.swift       # multi-window quit decisions
 │   └── ReaderViewSyncTests.swift
@@ -155,9 +165,9 @@ A highlight is built from the `PDFView` selection in `HighlightService`:
 - A selection with no text (a margin, an image, an empty drag) throws before
   anything is added. The button and the menu item use the same predicate, so they
   are never enabled for a selection that cannot produce a valid annotation.
-- The colour is a fixed sRGB `(1, 0.8, 0)`, written as `/C [1 0.8 0]`. It is not
-  a dynamic system colour, so the stored value does not depend on the app's
-  appearance at the moment of the click.
+- P2a wrote a fixed sRGB `(1, 0.8, 0)`. P2b replaced that with the `FFD60A`
+  default and a configurable palette; the geometry and saving rules below are
+  unchanged.
 
 Editing is manual-save only:
 
@@ -208,10 +218,67 @@ Editing is manual-save only:
   which is where the unsaved-changes prompt lives. There is no second
   `.onOpenURL` handler that could open a file behind that prompt.
 
-Known P2a limitations:
+### Markup editing (P2b)
 
-- No undo/redo, no annotation sidebar, no underline/strike-out/note, no
-  annotation deletion. All of that is P2b or later.
+Highlight and Underline share one construction path. Both are standard PDF
+annotations with `/QuadPoints`; a selection that spans pages is still one
+annotation per page.
+
+- **Defaults are independent.** New highlights use `#FFD60A` and new underlines
+  use `#007AFF`. The values live in YoPDF's own `UserDefaults` keys,
+  `dev.yopdf.markup.highlightColorHex` and
+  `dev.yopdf.markup.underlineColorHex`. Choosing a colour for an existing
+  annotation is a document edit and never rewrites either default.
+- **Six presets and a custom colour.** The presets are `FFD60A`, `34C759`,
+  `007AFF`, `FF2D55`, `AF52DE` and `FF9500`. The custom path uses SwiftUI's
+  `ColorPicker` with opacity disabled. PDFKit writes `/C` as RGB and a
+  save/reopen round trip discards alpha, so YoPDF stores an opaque colour;
+  a fully transparent choice is rejected instead of becoming invisible.
+- **Click selection uses the painted quads.** `MarkupGeometry.contains` tests
+  the `/QuadPoints` rectangles, not the annotation's multi-line bounding box,
+  so the empty area beside a short line does not select the mark. The selected
+  quads are outlined by a view-only `drawPagePost` overlay; the overlay is not
+  written into the PDF.
+- **One editing entry point.** `PDFDocumentModel.addMarkup`,
+  `recolorSelectedMarkup`, `deleteSelectedMarkup`, `convertSelectedMarkup`,
+  `undoMarkup` and `redoMarkup` are what the toolbar, menu bar and context menu
+  call. There is no second mutation path in the view.
+- **Undo/Redo is model-owned.** A cross-page add, delete or conversion is one
+  history entry, and rapid recolours from the colour picker coalesce into one
+  gesture. Every accepted edit bumps `hasUnsavedChanges` and `editRevision`;
+  Undo and Redo count as edits too. A successful save or Save As reload clears
+  the history and the selected annotation, because the `PDFDocument` and its
+  annotation objects have been replaced. Failed, conflicting and
+  uncertain-replacement saves leave the history and the selection in place. A
+  committed write clears them even when the reload could not be verified: the
+  bytes are on disk, so the old in-memory document is no longer the source of
+  truth.
+- **Permissions are checked at mutation time.** `/F` ReadOnly (bit 7) and
+  Locked (bit 8) annotations can be selected and inspected, but recolouring,
+  deleting and converting them are refused. A context menu opened before a
+  document switch cannot edit the old document: every call revalidates the
+  annotation against the current page and document.
+- **Conversion preserves the mark's document metadata.** Bounds, `/QuadPoints`,
+  `/C`, `/Contents`, `/T`, `/NM`, `/F` and custom annotation keys are copied to
+  the replacement subtype. `/AP`, `/AS`, `/Subtype` and the geometry keys are
+  regenerated by PDFKit. Converting and undoing it restores the original object,
+  contents and flags.
+- **The context menu extends PDFKit's menu.** Right-clicking a mark selects it
+  and prepends colour, convert and delete items to the standard zoom, display
+  and navigation menu instead of replacing it. Colour presets and all actions
+  use the same model calls as the toolbar.
+- Other annotations, links and navigation are not touched. A save round trip
+  preserves a square, a sticky note and a link next to an edited mark in the
+  real-PDFKit tests.
+
+Known P2a/P2b limitations:
+
+- No annotation sidebar, no StrikeOut, note, free-text or ink annotations, and
+  no annotation search. The Note work is a separate P2b PR; this PR only covers
+  Highlight and Underline.
+- An annotation without valid `/QuadPoints` falls back to its bounds for
+  hit-testing and for the selection overlay. Every mark YoPDF creates has
+  quads, but a malformed third-party one has no better geometry available.
 - Text geometry is whatever PDFKit reports. Selections over rotated pages,
   right-to-left text or unusual font encodings are not corrected here; when a
   PDFKit geometry problem is found, the sample belongs in a P3 regression set.
@@ -251,6 +318,26 @@ System Events / Preview and `qlmanage -t` are all blocked here):
    still holding its highlight.
 5. Select text with the mouse and click the Highlight toolbar button: moving
    focus to the button must not drop the selection before it is applied.
+6. Click a highlight on the page: its painted quads get the accent outline, the
+   editing controls appear in the toolbar, and a single Undo reverses the last
+   add/recolour/delete/convert. Clicking the empty space inside a multi-line
+   annotation's bounding box must **not** select it.
+7. Right-click a highlight: the colour, convert and delete items appear above
+   PDFKit's zoom/display/navigation items; each action does the same thing as
+   the toolbar equivalent, and the PDFKit items still work.
+8. Change the Highlight and Underline swatches to different presets, quit and
+   reopen the app: each tool keeps its own default. Recolouring an existing mark
+   must not change either swatch.
+9. Open the custom colour popover and drag through the spectrum: the annotation
+   follows, one Undo returns the original colour, and the saved PDF reopens with
+   the final colour.
+10. Convert a highlight to an underline, undo, redo, delete and undo: the
+    contents and flags set by another app survive, and saving is still a normal
+    manual Save. After a successful save, Undo is disabled because the document
+    was reloaded from disk.
+11. Simulate a save conflict (change the file from another app) after recolouring:
+    the save is refused, the annotation and the Undo history stay in the window,
+    and Save As remains available.
 
 `YoPDFCore` is a framework so tests are pure logic tests: they link the module
 and never launch the app, so no window server or accessibility permission is
@@ -274,8 +361,10 @@ separate task; see `internal/` notes (not published).
 
 P0 excluded annotations, search, recent documents, tabs, agent integration,
 accounts, sync and PDF editing. P1 added file access and safe persistence. P2a
-adds yellow highlights with a manual save: no undo, no autosave, no document
-library, no annotation sidebar, no other annotation types.
+adds yellow highlights with a manual save. P2b makes Highlight and Underline
+editable: selection, six presets plus custom colours, recolour, delete, convert
+and Undo/Redo. There is still no autosave, document library, annotation sidebar,
+Note/StrikeOut support or agent integration.
 
 Known P1 boundaries:
 

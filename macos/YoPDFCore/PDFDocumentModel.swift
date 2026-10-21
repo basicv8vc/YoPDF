@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import PDFKit
 
@@ -58,6 +59,20 @@ public final class PDFDocumentModel: ObservableObject {
     /// Owned by the model so that the Highlight button, the menu command and
     /// the annotation call all read the same value.
     @Published public private(set) var currentSelection: PDFSelection?
+    /// The markup annotation the user last clicked, if any.
+    ///
+    /// The selection is only a UI concept. Every mutation revalidates that the
+    /// annotation is still attached to the current document, so a menu opened
+    /// before a document switch cannot edit the old PDF.
+    @Published public internal(set) var selectedMarkup: MarkupSelection?
+    /// Bumped whenever annotations are added, removed, recoloured or replaced.
+    /// The PDF view uses it to tell PDFKit to redraw the affected pages.
+    @Published public internal(set) var annotationRevision = 0
+    /// Pages affected by the latest `annotationRevision`, sorted.
+    public internal(set) var changedAnnotationPageIndices: [Int] = []
+    /// Whether the current document has an undoable markup edit.
+    @Published public internal(set) var canUndoMarkup = false
+    @Published public internal(set) var canRedoMarkup = false
 
     /// PDFKit memory-maps the file, so a security-scoped URL must stay open for
     /// as long as the document is displayed. The session is the single owner of
@@ -72,15 +87,31 @@ public final class PDFDocumentModel: ObservableObject {
     /// store when a Save As leaves a file on disk without a session.
     let store: DocumentStore
 
+    /// The persisted colour defaults. Owned by the model so the toolbar and the
+    /// annotations created from it read one value, and so tests can point it at
+    /// an isolated `UserDefaults` suite.
+    let markupPreferences: MarkupColorPreferences
+
+    /// Model-owned undo history.
+    ///
+    /// Not `UndoManager`: a cross-page mark is one action here, and the history
+    /// can be cleared at exactly the moments the document is replaced. The model
+    /// also owns edit semantics, so a menu action and a context-menu action use
+    /// the same path.
+    var markupUndoStack: [MarkupEdit] = []
+    var markupRedoStack: [MarkupEdit] = []
+
     /// The open file session, or nil when nothing is loaded. Exposed so later
     /// phases can save through the same session that owns the access.
     public private(set) var documentSession: DocumentSession?
 
     public init(
         access: any SecurityScopeAccessing = SystemSecurityScopeAccess(),
-        io: any DocumentStoreIO = SystemDocumentStoreIO()
+        io: any DocumentStoreIO = SystemDocumentStoreIO(),
+        markupPreferences: MarkupColorPreferences = MarkupColorPreferences()
     ) {
         self.store = DocumentStore(access: access, io: io)
+        self.markupPreferences = markupPreferences
     }
 
     public var isLoaded: Bool { document != nil }
@@ -179,6 +210,7 @@ public final class PDFDocumentModel: ObservableObject {
         hasUnsavedChanges = false
         editRevision &+= 1
         currentSelection = nil
+        resetMarkupState()
         loadGeneration &+= 1
     }
 
@@ -198,6 +230,7 @@ public final class PDFDocumentModel: ObservableObject {
         hasUnsavedChanges = false
         editRevision &+= 1
         currentSelection = nil
+        resetMarkupState()
         title = Self.resolvedTitle(for: document, fileURL: fileURL)
         loadGeneration &+= 1
     }
@@ -237,6 +270,9 @@ public final class PDFDocumentModel: ObservableObject {
         effectiveScale = position.effectiveScale
         isAutoScaling = position.isAutoScaling
         currentSelection = nil
+        resetMarkupState()
+        changedAnnotationPageIndices = Array(0..<newDocument.pageCount)
+        annotationRevision &+= 1
         title = Self.resolvedTitle(for: newDocument, fileURL: fileURL)
     }
 
@@ -268,6 +304,25 @@ public final class PDFDocumentModel: ObservableObject {
     func markSaved() {
         hasUnsavedChanges = false
         editRevision &+= 1
+        // A successful write is the one point where the old undo history stops
+        // describing the file. Failed and conflicting saves never call this, so
+        // their history stays available for a retry.
+        resetMarkupState()
+    }
+
+    /// Clears every reference to the annotations of the document being replaced.
+    ///
+    /// The undo entries hold `PDFAnnotation` objects, and an annotation belongs
+    /// to the `PDFDocument` that created it. Keeping them after an open, close,
+    /// save reload or Save As would leave a menu action able to mutate an old
+    /// in-memory document that is no longer on screen.
+    func resetMarkupState() {
+        markupUndoStack.removeAll()
+        markupRedoStack.removeAll()
+        canUndoMarkup = false
+        canRedoMarkup = false
+        selectedMarkup = nil
+        changedAnnotationPageIndices = []
     }
 
     /// Mirrors the view's selection into the model.
@@ -277,6 +332,13 @@ public final class PDFDocumentModel: ObservableObject {
     public func updateSelection(_ selection: PDFSelection?) {
         guard selection !== currentSelection else { return }
         currentSelection = selection
+        // A real text selection starts a new intent. Clearing the annotation
+        // controls here also covers a drag that begins over a mark: the mark is
+        // only selected by a click that did not drag.
+        if let selection,
+           !(selection.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            selectedMarkup = nil
+        }
     }
 
     private static func clamped(_ index: Int, pageCount: Int) -> Int {

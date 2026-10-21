@@ -96,8 +96,57 @@ final class HighlightAnnotationTests: XCTestCase {
 
         let color = try XCTUnwrap(annotation.color.usingColorSpace(.sRGB))
         XCTAssertEqual(color.redComponent, 1.0, accuracy: 0.02)
-        XCTAssertEqual(color.greenComponent, 0.8, accuracy: 0.02)
-        XCTAssertEqual(color.blueComponent, 0.0, accuracy: 0.02)
+        XCTAssertEqual(color.greenComponent, 214.0 / 255.0, accuracy: 0.02)
+        XCTAssertEqual(color.blueComponent, 10.0 / 255.0, accuracy: 0.02)
+        XCTAssertEqual(color.alphaComponent, 1.0, accuracy: 0.02)
+    }
+
+    // MARK: - Underline
+
+    func testUnderlineIsWrittenAsAStandardAnnotationWithQuadsAndColour() throws {
+        let url = try makeFixture(pageCount: 1, linesPerPage: 2)
+        let document = try XCTUnwrap(PDFDocument(url: url))
+        let page = try XCTUnwrap(document.page(at: 0))
+
+        let selection = try selectWholePage(document, pageIndex: 0)
+        let lineRects = HighlightService.lineRects(for: selection, on: page)
+        let pink = MarkupColorPalette.color(fromHex: "FF2D55")
+
+        let summary = try HighlightService.addMarkup(
+            .underline,
+            from: selection,
+            to: document,
+            color: pink
+        )
+        XCTAssertEqual(summary.annotationCount, 1)
+        XCTAssertEqual(summary.quadCount, lineRects.count)
+
+        let data = try XCTUnwrap(document.dataRepresentation())
+        XCTAssertGreaterThan(
+            RawPDFInspector.occurrences(of: "/Underline", in: data),
+            0,
+            "the subtype must be written as a standard /Underline annotation"
+        )
+        XCTAssertEqual(
+            RawPDFInspector.quadPointArrays(in: data).count,
+            1,
+            "the underline must carry one /QuadPoints array"
+        )
+        XCTAssertGreaterThan(
+            RawPDFInspector.occurrences(of: "/C", in: data),
+            0,
+            "the chosen colour must be written as /C"
+        )
+
+        try data.write(to: url, options: .atomic)
+        let reopened = try XCTUnwrap(PDFDocument(url: url))
+        let annotation = try XCTUnwrap(reopened.page(at: 0)?.annotations.first)
+        XCTAssertTrue(annotation.isType("Underline"))
+        XCTAssertEqual(annotation.quadrilateralPoints?.count, lineRects.count * 4)
+        let color = try XCTUnwrap(annotation.color.usingColorSpace(.sRGB))
+        XCTAssertEqual(color.redComponent, 1.0, accuracy: 0.02)
+        XCTAssertEqual(color.greenComponent, 45.0 / 255.0, accuracy: 0.02)
+        XCTAssertEqual(color.blueComponent, 85.0 / 255.0, accuracy: 0.02)
         XCTAssertEqual(color.alphaComponent, 1.0, accuracy: 0.02)
     }
 

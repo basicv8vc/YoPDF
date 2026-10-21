@@ -58,9 +58,7 @@ extension PDFDocumentModel {
     /// Drives the button and the menu item, so both agree with what
     /// `HighlightService` will accept.
     public var canAddHighlight: Bool {
-        guard document != nil, let selection = currentSelection else { return false }
-        let text = (selection.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        return !text.isEmpty
+        canAddMarkup(.highlight)
     }
 
     /// Highlights the current selection, if it holds text.
@@ -69,13 +67,13 @@ extension PDFDocumentModel {
     /// in which case the document is left exactly as it was.
     @discardableResult
     public func addHighlightToSelection() -> HighlightService.Summary? {
-        guard let document, let selection = currentSelection else { return nil }
-        guard let summary = try? HighlightService.addHighlight(from: selection, to: document) else {
-            return nil
-        }
-        markEdited()
-        updateSelection(nil)
-        return summary
+        addMarkup(.highlight)
+    }
+
+    /// Underlines the current selection, using the Underline default colour.
+    @discardableResult
+    public func addUnderlineToSelection() -> HighlightService.Summary? {
+        addMarkup(.underline)
     }
 
     // MARK: - Saving

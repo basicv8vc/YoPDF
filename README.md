@@ -4,16 +4,17 @@ A free, open-source, local-first PDF reader and annotator for macOS and Windows,
 built natively for each platform. **Your PDF. Your way.**
 
 YoPDF is in early development. The repository currently contains the macOS
-skeleton: opening a local PDF, continuous scrolling, page navigation, and zoom.
-Annotations, search, and AI-assisted reading are not implemented yet.
+reader: opening a local PDF, continuous scrolling, page navigation, zoom, and
+standard PDF Highlight/Underline annotations with manual save. Search and
+AI-assisted reading are not implemented yet.
 
 ## Status
 
 | Area | State |
 | --- | --- |
-| macOS app (SwiftUI + AppKit + PDFKit) | Reader skeleton, builds and runs |
-| Unit tests | 31 logic tests |
-| Annotations | Not started |
+| macOS app (SwiftUI + AppKit + PDFKit) | Reader with editable Highlight/Underline annotations |
+| Unit tests | 152 logic tests |
+| Annotations | Standard `/Highlight` and `/Underline`: selection, colours, recolour, delete, convert, Undo/Redo |
 | Windows (WinUI 3 + PDFium) | Feasibility work, not in this repository yet |
 | AI / agent integration | Not started |
 

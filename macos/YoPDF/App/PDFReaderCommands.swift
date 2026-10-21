@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import YoPDFCore
 
@@ -13,6 +14,7 @@ struct PDFReaderCommands: Commands {
     @FocusedValue(\.saveDocument) private var saveDocument
     @FocusedValue(\.saveDocumentAs) private var saveDocumentAs
     @FocusedValue(\.highlightSelection) private var highlightSelection
+    @FocusedValue(\.underlineSelection) private var underlineSelection
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
@@ -33,11 +35,22 @@ struct PDFReaderCommands: Commands {
             .disabled(model == nil)
         }
 
-        // P2a has no undoable edits: annotation undo/redo is P2b. The standard
-        // items would offer a command that cannot work, and if PDFView ever
-        // supplied an undo manager they could change the document without the
-        // model noticing.
-        CommandGroup(replacing: .undoRedo) {}
+        // Annotation edits use the model's own history rather than PDFKit's
+        // UndoManager. A cross-page mark is one entry, a recolour gesture is one
+        // entry, and the history is cleared when a save reloads the document.
+        CommandGroup(replacing: .undoRedo) {
+            Button("Undo") {
+                model?.undoMarkup()
+            }
+            .keyboardShortcut("z", modifiers: .command)
+            .disabled(model?.canUndoMarkup != true)
+
+            Button("Redo") {
+                model?.redoMarkup()
+            }
+            .keyboardShortcut("z", modifiers: [.command, .shift])
+            .disabled(model?.canRedoMarkup != true)
+        }
 
         // Replaces the standard Save/Save As items: those would call into AppKit
         // document machinery this app does not use, and would skip the
@@ -61,7 +74,26 @@ struct PDFReaderCommands: Commands {
                 highlightSelection?()
             }
             .keyboardShortcut("h", modifiers: [.command, .shift])
-            .disabled(model?.canAddHighlight != true)
+            .disabled(model?.canAddMarkup(.highlight) != true)
+
+            Button("Underline") {
+                underlineSelection?()
+            }
+            .keyboardShortcut("u", modifiers: [.command, .shift])
+            .disabled(model?.canAddMarkup(.underline) != true)
+
+            Divider()
+
+            Button("Convert Annotation") {
+                model?.convertSelectedMarkup()
+            }
+            .disabled(model?.canModifySelectedMarkup != true)
+
+            Button("Delete Annotation") {
+                model?.deleteSelectedMarkup()
+            }
+            .keyboardShortcut(.delete, modifiers: .command)
+            .disabled(model?.canModifySelectedMarkup != true)
         }
 
         CommandMenu("Page") {
