@@ -96,6 +96,33 @@ final class DocumentEditingTests: XCTestCase {
         )
     }
 
+    /// Every change to the edit set advances the revision, including an edit
+    /// made while the document is already dirty. Quit approvals rely on this to
+    /// tell "the edits the user answered for" from "edits made afterwards".
+    func testEditRevisionAdvancesOnEveryEditAndSave() throws {
+        let url = try makeFixture()
+        let model = PDFDocumentModel(access: SecurityScopeSpy())
+        XCTAssertTrue(model.open(url: url))
+        let opened = model.editRevision
+
+        try highlight(model, from: 0, to: 10)
+        let firstEdit = model.editRevision
+        XCTAssertGreaterThan(firstEdit, opened)
+
+        try highlight(model, from: 0, to: 20)
+        let secondEdit = model.editRevision
+        XCTAssertGreaterThan(
+            secondEdit,
+            firstEdit,
+            "a second edit while already dirty is still a new revision"
+        )
+        XCTAssertTrue(model.hasUnsavedChanges)
+
+        XCTAssertEqual(model.save(), .saved)
+        XCTAssertGreaterThan(model.editRevision, secondEdit)
+        XCTAssertFalse(model.hasUnsavedChanges)
+    }
+
     /// A save replaces the file, which gives it a new inode. The reader must not
     /// treat that as "start over": the page, the zoom and the view instance are
     /// all preserved, and the re-opened document is the one now on disk.

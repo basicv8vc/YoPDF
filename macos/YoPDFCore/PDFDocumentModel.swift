@@ -47,6 +47,12 @@ public final class PDFDocumentModel: ObservableObject {
     /// switching documents or quitting cannot silently drop them; it is not a
     /// general document-modification flag yet.
     @Published public private(set) var hasUnsavedChanges: Bool = false
+    /// Monotonic revision of the in-memory edits.
+    ///
+    /// Bumped whenever edits are made, saved, discarded, or replaced by another
+    /// document. A quit approval records the revision it was given for, so a
+    /// later edit cannot inherit an earlier "Don't Save".
+    public private(set) var editRevision: Int = 0
     /// The reader's current text selection, mirrored from `PDFView`.
     ///
     /// Owned by the model so that the Highlight button, the menu command and
@@ -171,6 +177,7 @@ public final class PDFDocumentModel: ObservableObject {
         isAutoScaling = true
         lastError = nil
         hasUnsavedChanges = false
+        editRevision &+= 1
         currentSelection = nil
         loadGeneration &+= 1
     }
@@ -189,6 +196,7 @@ public final class PDFDocumentModel: ObservableObject {
         isAutoScaling = true
         lastError = nil
         hasUnsavedChanges = false
+        editRevision &+= 1
         currentSelection = nil
         title = Self.resolvedTitle(for: document, fileURL: fileURL)
         loadGeneration &+= 1
@@ -254,10 +262,12 @@ public final class PDFDocumentModel: ObservableObject {
 
     func markEdited() {
         hasUnsavedChanges = true
+        editRevision &+= 1
     }
 
     func markSaved() {
         hasUnsavedChanges = false
+        editRevision &+= 1
     }
 
     /// Mirrors the view's selection into the model.

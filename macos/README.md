@@ -27,7 +27,7 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (123)
+./scripts/test.sh                     # unit tests (131)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
@@ -60,11 +60,13 @@ macos/
 │   ├── HighlightService.swift  # selection → standard /Highlight annotation
 │   ├── PDFDocumentModel.swift
 │   ├── PDFDocumentModel+Editing.swift # dirty state, save, Save As, re-sync
+│   ├── QuitCoordinator.swift   # quit-attempt decisions, no AppKit
 │   ├── ReaderViewSync.swift    # pure page/zoom decisions used by the bridge
 │   └── SecurityScopeAccess.swift
 ├── YoPDF/
 │   ├── App/YoPDFApp.swift      # @main, one model per window
 │   ├── App/AppDelegate.swift   # quitting with unsaved edits
+│   ├── App/QuitSession.swift   # the app-wide quit attempt
 │   ├── App/WindowCloseGuard.swift # window close interception
 │   ├── App/PDFReaderCommands.swift
 │   ├── App/ReaderFocusedValues.swift
@@ -87,6 +89,7 @@ macos/
 │   ├── DocumentStoreModelIntegrationTests.swift
 │   ├── HighlightAnnotationTests.swift   # real PDFKit highlight geometry
 │   ├── DocumentEditingTests.swift       # dirty state, save outcomes, re-sync
+│   ├── QuitCoordinatorTests.swift       # multi-window quit decisions
 │   └── ReaderViewSyncTests.swift
 └── scripts/{generate,build,test}.sh
 ```
@@ -186,6 +189,13 @@ Editing is manual-save only:
   open. `open(url:discardingUnsavedChanges:)` only abandons the edits as part of
   the successful switch, so an open that fails leaves the old document, its
   annotations and its dirty state untouched — and the next close still asks.
+- Quitting with several dirty windows is a sequence, not a broadcast. Each
+  "Don't Save" is recorded in `QuitCoordinator`, tied to the document's edit
+  revision, and the window stays open and dirty. The edits are only abandoned
+  once the last dirty window has answered and `applicationShouldTerminate`
+  returns `.terminateNow`. Cancelling any prompt clears the whole attempt, so a
+  later ⌘Q asks every still-dirty window again; an edit made after a "Don't Save"
+  also invalidates that answer instead of being discarded with it.
 - Save As is available as the escape hatch for read-only files, hard links and
   conflicts; after it succeeds the reader continues editing the copy. Its
   failures use the same three-way split as a save: a copy that was written but
@@ -214,9 +224,12 @@ Known P2a limitations:
   slot would otherwise deallocate SwiftUI's and stop its teardown callbacks. It
   re-takes the slot on every view update and whenever the window becomes key or
   main, and every guard registers itself so quitting finds dirty windows even if
-  the delegate slot was taken by something else. This is covered by code review
-  and by the model-level tests for the underlying decisions; it has **not** been
-  exercised through a real window here — see the manual checklist below.
+  the delegate slot was taken by something else. The quit decision itself —
+  which window is asked next, when a temporary "Don't Save" expires, and when
+  the edits may finally be abandoned — is `QuitCoordinator` in `YoPDFCore` and
+  is covered by logic tests with stand-in windows. The `NSWindow` and SwiftUI
+  glue around it is covered by code review only; it has **not** been exercised
+  through a real window here — see the manual checklist below.
 - Apple Preview interoperability was checked by inspecting the written
   annotation dictionary (`/Subtype /Highlight`, `/QuadPoints`, `/C`, `/AP`) and by
   rendering the saved file in a separate PDFKit process, not by observing
@@ -229,8 +242,10 @@ System Events / Preview and `qlmanage -t` are all blocked here):
 1. Highlight, then click the red close button: Save / Don't Save / Cancel each do
    what they say, and Cancel leaves the window open with the highlight intact.
 2. Highlight, then ⌘W — same prompt.
-3. Highlight, then ⌘Q — same prompt, and with several dirty windows the app asks
-   once per window instead of quitting halfway.
+3. Highlight in two windows, then ⌘Q. The app asks once per window. With A
+   answering "Don't Save" and B answering "Cancel", both windows must stay open,
+   A must still show its "Edited" indicator, and a second ⌘Q must ask A again.
+   With both answering "Don't Save", the app quits.
 4. Highlight, then open a corrupt PDF and choose "Don't Save": the corrupt file
    fails to open, and the original document is still there, still marked edited,
    still holding its highlight.

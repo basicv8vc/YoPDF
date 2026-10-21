@@ -85,6 +85,8 @@ struct PDFReaderView: View {
             WindowCloseGuardInstaller(
                 guardObject: closeGuard,
                 isDirty: { model.hasUnsavedChanges },
+                editRevision: { model.editRevision },
+                discardUnsavedChanges: { model.abandonUnsavedChanges() },
                 onUnsavedChanges: handleCloseIntent
             )
         )
@@ -100,7 +102,12 @@ struct PDFReaderView: View {
             case let .unsavedChanges(action):
                 Button("Save") { saveThen(action) }
                 Button("Don’t Save", role: .destructive) { discardThen(action) }
-                Button("Cancel", role: .cancel) { self.prompt = nil }
+                Button("Cancel", role: .cancel) {
+                    self.prompt = nil
+                    if action == .quit {
+                        QuitSession.coordinator.cancel()
+                    }
+                }
             case let .saveProblem(_, _, offersSaveAs):
                 if offersSaveAs {
                     Button("Save As…") {
@@ -419,7 +426,13 @@ struct PDFReaderView: View {
 
     private func saveThen(_ action: PendingAction) {
         prompt = nil
-        guard performSave() else { return }
+        guard performSave() else {
+            // A failed save stops the quit before termination is requested.
+            // Any "Don't Save" answers collected from other windows belong to
+            // an attempt that is no longer running, so they must not survive.
+            if action == .quit { QuitSession.coordinator.cancel() }
+            return
+        }
         perform(action)
     }
 
@@ -433,11 +446,15 @@ struct PDFReaderView: View {
             // failed open cannot leave a document on screen whose edits nothing
             // is protecting any more.
             model.open(url: url, discardingUnsavedChanges: true)
-        case .closeWindow, .quit:
-            // Nothing is going to be shown afterwards, so the edits really are
-            // being discarded. Clearing the flag first is also what lets the
-            // close and the termination proceed instead of asking again.
+        case .closeWindow:
+            // The window is closing now, so the edits really are being discarded.
             model.abandonUnsavedChanges()
+            closeGuard.closeNow()
+        case .quit:
+            // The window stays open and keeps its dirty state: this records the
+            // answer for the quit that is still in progress. The edits are only
+            // abandoned once every dirty window has answered, in `commit`.
+            QuitSession.coordinator.approveDiscard(of: closeGuard)
             perform(action)
         }
     }

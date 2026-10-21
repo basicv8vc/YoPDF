@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import YoPDFCore
 
 /// Stops a window from closing while it holds unsaved edits.
 ///
@@ -18,7 +19,7 @@ import SwiftUI
 ///   because `NSWindow.delegate` is a weak reference and taking over the slot
 ///   would otherwise deallocate it;
 /// - every guard registers itself, so quitting does not depend on the guard
-///   still being the window's delegate (see `firstWithUnsavedChanges(among:)`).
+///   still being the window's delegate (see `installedGuards(among:)`).
 @MainActor
 final class WindowCloseGuard: NSObject, NSWindowDelegate {
 
@@ -31,6 +32,8 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
 
     private(set) weak var window: NSWindow?
     private var isDirty: () -> Bool = { false }
+    private var revision: () -> Int = { 0 }
+    private var onDiscardUnsavedChanges: () -> Void = {}
     private var onUnsavedChanges: (Intent) -> Void = { _ in }
     /// Set just before the guard closes the window itself, so the close it asked
     /// for is not refused by the same check.
@@ -54,7 +57,8 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
     /// `windowWillClose` and in `deinit`.
     nonisolated(unsafe) private var observers: [NSObjectProtocol] = []
 
-    var hasUnsavedChanges: Bool { isDirty() }
+    public var hasUnsavedChanges: Bool { isDirty() }
+    public var editRevision: Int { revision() }
 
     deinit {
         for observer in observers {
@@ -65,10 +69,14 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
     func install(
         on window: NSWindow,
         isDirty: @escaping () -> Bool,
+        editRevision: @escaping () -> Int,
+        discardUnsavedChanges: @escaping () -> Void,
         onUnsavedChanges: @escaping (Intent) -> Void
     ) {
         // The closures read live state, so they are refreshed on every update.
         self.isDirty = isDirty
+        self.revision = editRevision
+        self.onDiscardUnsavedChanges = discardUnsavedChanges
         self.onUnsavedChanges = onUnsavedChanges
 
         if self.window !== window {
@@ -210,15 +218,27 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
         installed.removeAll { $0.value == nil || $0.value === guardObject }
     }
 
-    /// The first of `windows` whose guard still holds unsaved edits.
-    static func firstWithUnsavedChanges(among windows: [NSWindow]) -> WindowCloseGuard? {
+    /// The guards attached to any of `windows`, in registration order.
+    ///
+    /// Quitting has to find dirty windows even when a guard no longer owns the
+    /// delegate slot, so this never reads the delegate slot.
+    static func installedGuards(among windows: [NSWindow]) -> [WindowCloseGuard] {
         let candidates = Set(windows.map(ObjectIdentifier.init))
-        return installed.compactMap(\.value).first { candidate in
-            guard let window = candidate.window, candidates.contains(ObjectIdentifier(window)) else {
-                return false
-            }
-            return candidate.hasUnsavedChanges
+        return installed.compactMap(\.value).filter { candidate in
+            guard let window = candidate.window else { return false }
+            return candidates.contains(ObjectIdentifier(window))
         }
+    }
+}
+
+extension WindowCloseGuard: QuitConfirmingWindow {
+
+    public func requestQuitConfirmation() {
+        onUnsavedChanges(.quit)
+    }
+
+    public func discardUnsavedChangesForQuit() {
+        onDiscardUnsavedChanges()
     }
 }
 
@@ -230,6 +250,8 @@ struct WindowCloseGuardInstaller: NSViewRepresentable {
 
     let guardObject: WindowCloseGuard
     let isDirty: () -> Bool
+    let editRevision: () -> Int
+    let discardUnsavedChanges: () -> Void
     let onUnsavedChanges: (WindowCloseGuard.Intent) -> Void
 
     func makeNSView(context: Context) -> NSView {
@@ -248,6 +270,8 @@ struct WindowCloseGuardInstaller: NSViewRepresentable {
             guardObject.install(
                 on: window,
                 isDirty: isDirty,
+                editRevision: editRevision,
+                discardUnsavedChanges: discardUnsavedChanges,
                 onUnsavedChanges: onUnsavedChanges
             )
         }
