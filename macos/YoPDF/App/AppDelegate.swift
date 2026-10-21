@@ -9,12 +9,15 @@ import AppKit
 /// Save / Don't Save / Cancel choice. When the user finishes, the reader asks to
 /// terminate again and this method runs once more — with one fewer dirty window
 /// each time.
+///
+/// The lookup goes through the guards' own registry rather than through
+/// `window.delegate`: if anything replaced the delegate on a window, reading the
+/// delegate slot would miss that window and quitting would drop its edits.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        let guards = sender.windows.compactMap { $0.delegate as? WindowCloseGuard }
-        guard let dirty = guards.first(where: { $0.hasUnsavedChanges }) else {
+        guard let dirty = WindowCloseGuard.firstWithUnsavedChanges(among: sender.windows) else {
             return .terminateNow
         }
         dirty.requestResolution(for: .quit)

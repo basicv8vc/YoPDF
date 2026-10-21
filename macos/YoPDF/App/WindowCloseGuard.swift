@@ -11,6 +11,14 @@ import SwiftUI
 /// The guard never decides what to do about the edits. It reports the intent and
 /// refuses the close; the reader presents Save / Don't Save / Cancel and then
 /// either closes the window explicitly or leaves it open.
+///
+/// Two things make that reliable rather than best-effort:
+///
+/// - the delegate that was there before is **owned** (see `previousDelegate`),
+///   because `NSWindow.delegate` is a weak reference and taking over the slot
+///   would otherwise deallocate it;
+/// - every guard registers itself, so quitting does not depend on the guard
+///   still being the window's delegate (see `firstWithUnsavedChanges(among:)`).
 @MainActor
 final class WindowCloseGuard: NSObject, NSWindowDelegate {
 
@@ -21,18 +29,38 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
         case quit
     }
 
-    private weak var window: NSWindow?
+    private(set) weak var window: NSWindow?
     private var isDirty: () -> Bool = { false }
     private var onUnsavedChanges: (Intent) -> Void = { _ in }
     /// Set just before the guard closes the window itself, so the close it asked
     /// for is not refused by the same check.
     private var allowsNextClose = false
 
-    /// The delegate SwiftUI installed. Kept so its `windowWillClose` and friends
-    /// still run: the guard replaces the delegate, it does not remove it.
-    nonisolated(unsafe) private weak var previousDelegate: NSWindowDelegate?
+    /// The delegate that was on the window before the guard took the slot.
+    ///
+    /// Held **strongly** on purpose. `NSWindow.delegate` does not retain its
+    /// delegate, so whatever SwiftUI put there is kept alive by the window
+    /// alone; replacing it would let it die and the forwarding below would
+    /// quietly stop working — taking SwiftUI's window teardown with it. The
+    /// reference is dropped in `windowWillClose`, so it never outlives the
+    /// window it belongs to.
+    ///
+    /// `nonisolated(unsafe)` only because `responds(to:)` and
+    /// `forwardingTarget(for:)` are Objective-C overrides that cannot be
+    /// actor-isolated; every write happens on the main actor.
+    nonisolated(unsafe) private var previousDelegate: NSWindowDelegate?
+
+    /// Re-takes the delegate slot if something replaced the guard. Removed in
+    /// `windowWillClose` and in `deinit`.
+    nonisolated(unsafe) private var observers: [NSObjectProtocol] = []
 
     var hasUnsavedChanges: Bool { isDirty() }
+
+    deinit {
+        for observer in observers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
 
     func install(
         on window: NSWindow,
@@ -43,11 +71,13 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
         self.isDirty = isDirty
         self.onUnsavedChanges = onUnsavedChanges
 
-        guard self.window !== window else { return }
-        self.window = window
-        guard window.delegate !== self else { return }
-        previousDelegate = window.delegate
-        window.delegate = self
+        if self.window !== window {
+            detachFromCurrentWindow()
+            self.window = window
+            Self.register(self)
+            startObserving(window)
+        }
+        assertDelegation()
     }
 
     /// Asks the reader to resolve the edits, without closing anything.
@@ -57,8 +87,14 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
 
     /// Closes the window, bypassing the unsaved-changes check once.
     func closeNow() {
+        guard let window else { return }
         allowsNextClose = true
-        window?.performClose(nil)
+        window.performClose(nil)
+        // `performClose:` asks `windowShouldClose:` synchronously and that call
+        // consumes the flag. Clearing it afterwards means a close that never
+        // asked — an unclosable window, a refused `performClose:` — cannot leave
+        // a standing bypass behind.
+        allowsNextClose = false
     }
 
     // MARK: - NSWindowDelegate
@@ -75,6 +111,67 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
         return previousDelegate?.windowShouldClose?(sender) ?? true
     }
 
+    func windowWillClose(_ notification: Notification) {
+        // Forward first, then let go: the previous delegate is what tears the
+        // scene down, and it must still be alive while it runs.
+        let previous = previousDelegate
+        previousDelegate = nil
+        stopObserving()
+        Self.unregister(self)
+        window = nil
+        previous?.windowWillClose?(notification)
+    }
+
+    // MARK: - Delegation
+
+    /// Re-takes the delegate slot when something else has taken it.
+    ///
+    /// SwiftUI re-hosts windows (full-screen transitions, scene updates) and can
+    /// install a delegate of its own without telling anyone. Losing the slot
+    /// silently disables the close guard, so every view update re-checks it and
+    /// chains onto whatever is there now instead of assuming the install from
+    /// the first update is still in place.
+    private func assertDelegation() {
+        guard let window, window.delegate !== self else { return }
+        previousDelegate = window.delegate
+        window.delegate = self
+    }
+
+    /// Hands the window back to the delegate that was there before, if the guard
+    /// still owns the slot.
+    private func detachFromCurrentWindow() {
+        if let window, window.delegate === self {
+            window.delegate = previousDelegate
+        }
+        previousDelegate = nil
+        stopObserving()
+        Self.unregister(self)
+        window = nil
+    }
+
+    private func startObserving(_ window: NSWindow) {
+        let center = NotificationCenter.default
+        // Becoming key or main is the moment before any close the user can
+        // initiate on this window, so it is where a stolen delegate has to be
+        // noticed. `queue: .main` is what makes `assumeIsolated` sound.
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didBecomeMainNotification] {
+            let observer = center.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.assertDelegation()
+                }
+            }
+            observers.append(observer)
+        }
+    }
+
+    private func stopObserving() {
+        let center = NotificationCenter.default
+        for observer in observers {
+            center.removeObserver(observer)
+        }
+        observers.removeAll()
+    }
+
     // MARK: - Forwarding
 
     nonisolated override func responds(to selector: Selector!) -> Bool {
@@ -87,6 +184,41 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
             return previousDelegate
         }
         return super.forwardingTarget(for: selector)
+    }
+
+    // MARK: - Registry
+
+    private final class WeakGuard {
+        weak var value: WindowCloseGuard?
+        init(_ value: WindowCloseGuard) { self.value = value }
+    }
+
+    /// Every guard currently attached to a window.
+    ///
+    /// Quitting has to find dirty windows even when the guard no longer owns the
+    /// delegate slot; going through this list means the protection does not
+    /// depend on that slot at all.
+    private static var installed: [WeakGuard] = []
+
+    private static func register(_ guardObject: WindowCloseGuard) {
+        installed.removeAll { $0.value == nil }
+        guard !installed.contains(where: { $0.value === guardObject }) else { return }
+        installed.append(WeakGuard(guardObject))
+    }
+
+    private static func unregister(_ guardObject: WindowCloseGuard) {
+        installed.removeAll { $0.value == nil || $0.value === guardObject }
+    }
+
+    /// The first of `windows` whose guard still holds unsaved edits.
+    static func firstWithUnsavedChanges(among windows: [NSWindow]) -> WindowCloseGuard? {
+        let candidates = Set(windows.map(ObjectIdentifier.init))
+        return installed.compactMap(\.value).first { candidate in
+            guard let window = candidate.window, candidates.contains(ObjectIdentifier(window)) else {
+                return false
+            }
+            return candidate.hasUnsavedChanges
+        }
     }
 }
 
