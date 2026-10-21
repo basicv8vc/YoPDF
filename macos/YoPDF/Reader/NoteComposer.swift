@@ -2,77 +2,27 @@ import AppKit
 import SwiftUI
 import YoPDFCore
 
-/// One presentation of the note composer.
-///
-/// The mode decides what Save means. `create` carries the anchor that was
-/// captured when the composer opened; `edit` carries the note that was clicked.
-/// Both are values, so a stale composer can be recognised and refused by the
-/// model instead of writing into whatever document is on screen by then.
-struct NoteComposerPresentation: Identifiable {
-
-    enum Mode {
-        case create(NoteDraft)
-        case edit(NoteSelection)
-    }
-
-    let id = UUID()
-    let mode: Mode
-    /// Where the popover's arrow should point, in the reader's top-left-origin
-    /// space.
-    let anchorRect: CGRect
-    let pageLabel: String
-    let excerpt: String?
-    let initialContents: String
-    let initialPaper: NotePaperColor
-
-    init(mode: Mode, anchorRect: CGRect, pageLabel: String, excerpt: String?, contents: String, paper: NotePaperColor) {
-        self.mode = mode
-        self.anchorRect = anchorRect
-        self.pageLabel = pageLabel
-        self.excerpt = excerpt
-        self.initialContents = contents
-        self.initialPaper = paper
-    }
-
-    var isEditing: Bool {
-        if case .edit = mode { return true }
-        return false
-    }
-}
-
 /// The compact note composer.
 ///
-/// Nothing here writes to the PDF. The body and the paper colour are local state
-/// until Save, which is what makes Cancel a true no-op: it cannot leave a dirty
-/// document or an Undo entry behind, because no edit was ever made.
+/// Nothing here writes to the PDF. The body and the paper colour live in the
+/// `NoteComposerSession`, not in this view's state, so Save is still the only
+/// thing that mutates the document — which is what makes Cancel a true no-op —
+/// while rebuilding the popover cannot throw the text away.
 struct NoteComposerView: View {
 
-    let presentation: NoteComposerPresentation
+    @ObservedObject var session: NoteComposerSession
     @ObservedObject var model: PDFDocumentModel
     let onDismiss: () -> Void
 
-    @State private var text: String
-    @State private var paper: NotePaperColor
-    @State private var isExpanded = false
+    /// A failure reported by the last Save. Local on purpose: it describes one
+    /// attempt, and the text it failed to save is not local state.
     @State private var errorMessage: String?
     @FocusState private var isFocused: Bool
 
-    init(
-        presentation: NoteComposerPresentation,
-        model: PDFDocumentModel,
-        onDismiss: @escaping () -> Void
-    ) {
-        self.presentation = presentation
-        self.model = model
-        self.onDismiss = onDismiss
-        _text = State(initialValue: presentation.initialContents)
-        _paper = State(initialValue: presentation.initialPaper)
-    }
-
-    /// Read from the model on every render: another application can change
-    /// `/F` while the composer is open, and the Save button must follow.
+    /// Read from the model on every render: another application can change `/F`
+    /// while the composer is open, and the Save button must follow.
     private var permissions: NotePermissions {
-        switch presentation.mode {
+        switch session.mode {
         case .create:
             return model.canCreateNote
                 ? NotePermissions(canEditContents: true, canChangeStyle: true, canDelete: true)
@@ -82,18 +32,26 @@ struct NoteComposerView: View {
         }
     }
 
+    /// Whether the note this composer is working on is still there.
+    private var status: NoteDraftStatus {
+        session.status(in: model)
+    }
+
     private var trimmedText: String {
-        text.trimmingCharacters(in: .whitespacesAndNewlines)
+        session.contents.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private var canSave: Bool {
-        !trimmedText.isEmpty && !permissions.isReadOnly
+        status.isReady && !trimmedText.isEmpty && !permissions.isReadOnly
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
             editor
+            if !status.isReady {
+                detachedNotice
+            }
             if let errorMessage {
                 Text(errorMessage)
                     .font(.caption)
@@ -104,7 +62,7 @@ struct NoteComposerView: View {
             buttons
         }
         .padding(14)
-        .frame(width: isExpanded ? 420 : 344)
+        .frame(width: session.isExpanded ? 420 : 344)
         .background(paperBackground)
         .onAppear {
             Task { @MainActor in
@@ -112,7 +70,7 @@ struct NoteComposerView: View {
                 isFocused = true
             }
         }
-        .onChange(of: isExpanded) { _, _ in
+        .onChange(of: session.isExpanded) { _, _ in
             isFocused = true
         }
     }
@@ -122,10 +80,10 @@ struct NoteComposerView: View {
     private var header: some View {
         HStack(alignment: .top, spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(presentation.isEditing ? "Note" : "New Note")
+                Text(session.isEditing ? "Note" : "New Note")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(ink.opacity(0.65))
-                if let excerpt = presentation.excerpt, !excerpt.isEmpty {
+                if let excerpt = session.excerpt, !excerpt.isEmpty {
                     Text(excerpt)
                         .font(.callout)
                         .foregroundStyle(ink.opacity(0.85))
@@ -149,7 +107,7 @@ struct NoteComposerView: View {
                         .font(.caption)
                         .help("This note is protected and cannot be changed.")
                 }
-                Text(presentation.pageLabel)
+                Text(session.pageLabel)
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(ink.opacity(0.55))
             }
@@ -158,8 +116,8 @@ struct NoteComposerView: View {
 
     @ViewBuilder
     private var editor: some View {
-        if isExpanded {
-            TextEditor(text: $text)
+        if session.isExpanded {
+            TextEditor(text: $session.contents)
                 .font(.system(size: 13))
                 .foregroundStyle(ink)
                 .scrollContentBackground(.hidden)
@@ -174,7 +132,7 @@ struct NoteComposerView: View {
             // A vertical TextField grows with its content and scrolls internally
             // after the limit, which is exactly the four-line behaviour the
             // compact composer wants. Return inserts a newline; ⌘Return submits.
-            TextField("Write a note…", text: $text, axis: .vertical)
+            TextField("Write a note…", text: $session.contents, axis: .vertical)
                 .textFieldStyle(.plain)
                 .font(.system(size: 13))
                 .foregroundStyle(ink)
@@ -188,18 +146,56 @@ struct NoteComposerView: View {
         }
     }
 
+    /// Shown when the note has gone away — deleted, undone, or left behind by a
+    /// document that was replaced.
+    ///
+    /// The text is deliberately still here. Nothing is redirected to another
+    /// note, because there is no way to know which note the user meant.
+    private var detachedNotice: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(detachedMessage)
+                .font(.caption)
+                .foregroundStyle(Color(red: 0.62, green: 0.16, blue: 0.12))
+                .fixedSize(horizontal: false, vertical: true)
+            if !trimmedText.isEmpty {
+                Button("Copy Text") {
+                    copyContents()
+                }
+                .buttonStyle(.link)
+                .font(.caption)
+                .help("Copy the note’s text so it is not lost")
+            }
+        }
+    }
+
+    private var detachedMessage: String {
+        switch status {
+        case .ready:
+            return ""
+        case .documentReplaced:
+            return "This note was started in a document that is no longer open. Your text is still here — copy it, or cancel."
+        case .noteRemoved:
+            return "This note is no longer in the document. Your text is still here — copy it, or cancel."
+        case .commentingDisabled:
+            return "This document no longer accepts notes. Your text is still here — copy it, or cancel."
+        }
+    }
+
     private var palette: some View {
         HStack(spacing: 6) {
             ForEach(NotePaperColor.allCases, id: \.self) { candidate in
                 Button {
-                    paper = candidate
+                    session.paper = candidate
                 } label: {
                     Circle()
                         .fill(Color(nsColor: candidate.color))
                         .frame(width: 17, height: 17)
                         .overlay {
                             Circle()
-                                .strokeBorder(ink.opacity(paper == candidate ? 0.75 : 0.18), lineWidth: paper == candidate ? 2 : 1)
+                                .strokeBorder(
+                                    ink.opacity(session.paper == candidate ? 0.75 : 0.18),
+                                    lineWidth: session.paper == candidate ? 2 : 1
+                                )
                         }
                         .padding(2)
                 }
@@ -207,15 +203,15 @@ struct NoteComposerView: View {
                 .disabled(!permissions.canChangeStyle)
                 .help(candidate.title)
                 .accessibilityLabel(candidate.title)
-                .accessibilityAddTraits(paper == candidate ? .isSelected : [])
+                .accessibilityAddTraits(session.paper == candidate ? .isSelected : [])
             }
 
             Spacer(minLength: 4)
 
             Button {
-                isExpanded.toggle()
+                session.isExpanded.toggle()
             } label: {
-                Image(systemName: isExpanded
+                Image(systemName: session.isExpanded
                       ? "arrow.down.right.and.arrow.up.left"
                       : "arrow.up.left.and.arrow.down.right")
                     .font(.system(size: 11))
@@ -223,14 +219,14 @@ struct NoteComposerView: View {
                     .frame(width: 22, height: 20)
             }
             .buttonStyle(.plain)
-            .help(isExpanded ? "Collapse the note" : "Expand to edit a long note")
-            .accessibilityLabel(isExpanded ? "Collapse note editor" : "Expand note editor")
+            .help(session.isExpanded ? "Collapse the note" : "Expand to edit a long note")
+            .accessibilityLabel(session.isExpanded ? "Collapse note editor" : "Expand note editor")
         }
     }
 
     private var buttons: some View {
         HStack(spacing: 8) {
-            if case let .edit(note) = presentation.mode, permissions.canDelete {
+            if case let .edit(note) = session.mode, permissions.canDelete, status.isReady {
                 Button("Delete") {
                     if model.deleteNote(note) {
                         onDismiss()
@@ -246,15 +242,16 @@ struct NoteComposerView: View {
 
             Spacer(minLength: 4)
 
-            Button(permissions.isReadOnly ? "Close" : "Cancel") {
+            Button(dismissTitle) {
                 onDismiss()
             }
             .keyboardShortcut(.cancelAction)
             .buttonStyle(.plain)
             .font(.callout)
             .foregroundStyle(ink.opacity(0.7))
+            .help(dismissHelp)
 
-            if !permissions.isReadOnly {
+            if !permissions.isReadOnly && status.isReady {
                 Button("Save") {
                     save()
                 }
@@ -267,26 +264,36 @@ struct NoteComposerView: View {
         }
     }
 
+    /// A draft with text that can no longer be saved is discarded by an explicit
+    /// choice, not by a button that looks like "Close".
+    private var dismissTitle: String {
+        if !status.isReady, !trimmedText.isEmpty { return "Discard Draft" }
+        return permissions.isReadOnly ? "Close" : "Cancel"
+    }
+
+    private var dismissHelp: String {
+        if !status.isReady, !trimmedText.isEmpty {
+            return "Discard this draft. Use Copy Text first to keep the text."
+        }
+        return permissions.isReadOnly ? "Close this note" : "Close without saving"
+    }
+
     // MARK: - Actions
 
     private func save() {
         errorMessage = nil
-        switch presentation.mode {
-        case let .create(draft):
-            switch model.addNote(draft, contents: text, paperColor: paper) {
-            case .success:
-                onDismiss()
-            case let .failure(error):
-                errorMessage = error.errorDescription
-            }
-        case let .edit(note):
-            switch model.updateNote(note, contents: text, paperColor: paper) {
-            case .success:
-                onDismiss()
-            case let .failure(error):
-                errorMessage = error.errorDescription
-            }
+        switch session.commit(to: model) {
+        case .success:
+            onDismiss()
+        case let .failure(error):
+            errorMessage = error.errorDescription
         }
+    }
+
+    private func copyContents() {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(session.contents, forType: .string)
     }
 
     // MARK: - Paper
@@ -298,7 +305,7 @@ struct NoteComposerView: View {
 
     private var paperBackground: some View {
         RoundedRectangle(cornerRadius: 12, style: .continuous)
-            .fill(Color(nsColor: paper.color))
+            .fill(Color(nsColor: session.paper.color))
             .overlay {
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .strokeBorder(ink.opacity(0.14), lineWidth: 1)

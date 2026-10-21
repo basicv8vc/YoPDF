@@ -90,6 +90,30 @@ extension PDFDocumentModel {
         return nil
     }
 
+    /// Whether a captured anchor still describes the document on screen.
+    ///
+    /// A composer can outlive the document its anchor was taken from, and a
+    /// draft committed into a different document would land on a page the user
+    /// never pointed at.
+    public func isCurrent(_ draft: NoteDraft) -> Bool {
+        guard let document else { return false }
+        return draft.documentIdentifier == ObjectIdentifier(document)
+    }
+
+    /// Whether `note` is still attached to the page it was read from.
+    ///
+    /// Re-checked before every write: an Undo, a delete from the context menu or
+    /// a document reload can detach the annotation while the composer is open.
+    public func isAttached(_ note: NoteSelection) -> Bool {
+        guard let document,
+              let page = document.page(at: note.pageIndex),
+              page.document === document,
+              note.annotation.page === page,
+              page.annotations.contains(where: { $0 === note.annotation })
+        else { return false }
+        return true
+    }
+
     /// The permissions the composer should offer for `note` right now.
     public func notePermissions(for note: NoteSelection) -> NotePermissions {
         guard let document,
@@ -115,9 +139,7 @@ extension PDFDocumentModel {
         paperColor: NotePaperColor
     ) -> Result<NoteSelection, NoteEditError> {
         guard let document else { return .failure(.noDocument) }
-        guard draft.documentIdentifier == ObjectIdentifier(document) else {
-            return .failure(.documentChanged)
-        }
+        guard isCurrent(draft) else { return .failure(.documentChanged) }
         guard document.allowsCommenting else { return .failure(.permissionDenied) }
 
         let text = contents.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -162,11 +184,8 @@ extension PDFDocumentModel {
         contents: String,
         paperColor: NotePaperColor
     ) -> Result<NoteSelection, NoteEditError> {
-        guard let document,
-              let page = document.page(at: note.pageIndex),
-              page.document === document,
-              note.annotation.page === page,
-              page.annotations.contains(where: { $0 === note.annotation })
+        guard let document, isAttached(note),
+              let page = document.page(at: note.pageIndex)
         else { return .failure(.annotationUnavailable) }
 
         guard document.allowsCommenting,
