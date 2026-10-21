@@ -32,7 +32,7 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (152)
+./scripts/test.sh                     # unit tests (158)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
@@ -253,11 +253,16 @@ annotation per page.
   committed write clears them even when the reload could not be verified: the
   bytes are on disk, so the old in-memory document is no longer the source of
   truth.
-- **Permissions are checked at mutation time.** `/F` ReadOnly (bit 7) and
-  Locked (bit 8) annotations can be selected and inspected, but recolouring,
-  deleting and converting them are refused. A context menu opened before a
-  document switch cannot edit the old document: every call revalidates the
-  annotation against the current page and document.
+- **Permissions are checked at mutation time — including Undo/Redo.** `/F`
+  ReadOnly (bit 7) and Locked (bit 8) annotations can be selected and
+  inspected, but recolouring, deleting and converting them are refused. A
+  context menu opened before a document switch cannot edit the old document:
+  every call revalidates the annotation against the current page and document.
+  Undo and Redo preflight every annotation in the entry and the document's
+  commenting permission before changing anything. A protected annotation blocks
+  the whole entry — including a cross-page one — without advancing
+  `editRevision`, clearing the dirty state, or discarding the history; after the
+  protection is removed, the same Undo/Redo is available again.
 - **Conversion preserves the mark's document metadata.** Bounds, `/QuadPoints`,
   `/C`, `/Contents`, `/T`, `/NM`, `/F` and custom annotation keys are copied to
   the replacement subtype. `/AP`, `/AS`, `/Subtype` and the geometry keys are
@@ -279,6 +284,10 @@ Known P2a/P2b limitations:
 - An annotation without valid `/QuadPoints` falls back to its bounds for
   hit-testing and for the selection overlay. Every mark YoPDF creates has
   quads, but a malformed third-party one has no better geometry available.
+- Recolour coalescing uses consecutive history entries, not an explicit gesture
+  boundary. Recolouring the same mark in two separate interactions can therefore
+  produce one Undo entry rather than two. This is a known limitation; a later
+  iteration can add begin/end gesture tracking if it proves surprising.
 - Text geometry is whatever PDFKit reports. Selections over rotated pages,
   right-to-left text or unusual font encodings are not corrected here; when a
   PDFKit geometry problem is found, the sample belongs in a P3 regression set.

@@ -13,7 +13,7 @@ AI-assisted reading are not implemented yet.
 | Area | State |
 | --- | --- |
 | macOS app (SwiftUI + AppKit + PDFKit) | Reader with editable Highlight/Underline annotations |
-| Unit tests | 152 logic tests |
+| Unit tests | 158 logic tests |
 | Annotations | Standard `/Highlight` and `/Underline`: selection, colours, recolour, delete, convert, Undo/Redo |
 | Windows (WinUI 3 + PDFium) | Feasibility work, not in this repository yet |
 | AI / agent integration | Not started |

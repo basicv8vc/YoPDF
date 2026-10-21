@@ -26,6 +26,15 @@ enum MarkupEditChange {
             return pageIndex
         }
     }
+
+    var annotation: PDFAnnotation {
+        switch self {
+        case let .insert(annotation, _),
+             let .remove(annotation, _),
+             let .recolor(annotation, _, _, _):
+            return annotation
+        }
+    }
 }
 
 /// A user-visible edit, which may touch several pages.
@@ -261,33 +270,46 @@ extension PDFDocumentModel {
     @discardableResult
     public func undoMarkup() -> Bool {
         guard let edit = markupUndoStack.last else { return false }
-        guard applyMarkupEdit(edit, forward: false) else {
+        switch applyMarkupEdit(edit, forward: false) {
+        case .applied:
+            markupUndoStack.removeLast()
+            markupRedoStack.append(edit)
+            selectedMarkup = nil
+            updateMarkupAvailability()
+            markEdited()
+            return true
+        case .permissionDenied:
+            // The history is still valid; the annotation is simply protected at
+            // the moment. Keep the entry, the selection and the dirty state so
+            // that unlocking the annotation makes the same Undo available again.
+            return false
+        case .invalidHistory:
             resetMarkupHistory()
             selectedMarkup = nil
             return false
         }
-        markupUndoStack.removeLast()
-        markupRedoStack.append(edit)
-        selectedMarkup = nil
-        updateMarkupAvailability()
-        markEdited()
-        return true
     }
 
     @discardableResult
     public func redoMarkup() -> Bool {
         guard let edit = markupRedoStack.last else { return false }
-        guard applyMarkupEdit(edit, forward: true) else {
+        switch applyMarkupEdit(edit, forward: true) {
+        case .applied:
+            markupRedoStack.removeLast()
+            markupUndoStack.append(edit)
+            selectedMarkup = nil
+            updateMarkupAvailability()
+            markEdited()
+            return true
+        case .permissionDenied:
+            // See `undoMarkup`: a protected annotation does not invalidate the
+            // redo history.
+            return false
+        case .invalidHistory:
             resetMarkupHistory()
             selectedMarkup = nil
             return false
         }
-        markupRedoStack.removeLast()
-        markupUndoStack.append(edit)
-        selectedMarkup = nil
-        updateMarkupAvailability()
-        markEdited()
-        return true
     }
 
     // MARK: - Edit plumbing
@@ -321,7 +343,7 @@ extension PDFDocumentModel {
         _ edit: MarkupEdit,
         coalescingRecolour: Bool = false
     ) -> Bool {
-        guard applyMarkupEdit(edit, forward: true) else { return false }
+        guard applyMarkupEdit(edit, forward: true) == .applied else { return false }
 
         if coalescingRecolour,
            let previous = markupUndoStack.last,
@@ -336,49 +358,72 @@ extension PDFDocumentModel {
         return true
     }
 
+    private enum MarkupReplayOutcome {
+        case applied
+        case permissionDenied
+        case invalidHistory
+    }
+
     /// Replays an edit against the current document.
     ///
     /// Every change is checked first. A stale history entry — an annotation
     /// another caller removed, or a page that no longer exists — is treated as
     /// an unusable history rather than as a reason to mutate some other page.
-    private func applyMarkupEdit(_ edit: MarkupEdit, forward: Bool) -> Bool {
-        guard let document, !edit.changes.isEmpty else { return false }
+    /// Permission checks run in the same preflight pass and cover the whole
+    /// edit, so a locked annotation on one page blocks a cross-page Undo before
+    /// any page is touched.
+    private func applyMarkupEdit(_ edit: MarkupEdit, forward: Bool) -> MarkupReplayOutcome {
+        guard let document, !edit.changes.isEmpty else { return .invalidHistory }
 
         var pages: [Int: PDFPage] = [:]
         for change in edit.changes {
             guard let page = document.page(at: change.pageIndex),
                   page.document === document
-            else { return false }
+            else { return .invalidHistory }
             pages[change.pageIndex] = page
 
+            let annotation = change.annotation
             switch change {
-            case let .insert(annotation, _):
+            case .insert:
                 if forward {
-                    if let attached = annotation.page, attached !== page { return false }
-                    if page.annotations.contains(where: { $0 === annotation }) { return false }
+                    // Redo of an insert, or the insertion half of a conversion.
+                    guard annotation.page == nil,
+                          !page.annotations.contains(where: { $0 === annotation })
+                    else { return .invalidHistory }
                 } else {
-                    guard page.annotations.contains(where: { $0 === annotation }) else {
-                        return false
-                    }
+                    // Undo of an add: the mark must still be on this page.
+                    guard annotation.page === page,
+                          page.annotations.contains(where: { $0 === annotation })
+                    else { return .invalidHistory }
                 }
-            case let .remove(annotation, _):
+            case .remove:
                 if forward {
-                    guard page.annotations.contains(where: { $0 === annotation }) else {
-                        return false
-                    }
+                    // Redo of a delete: the mark must be there to remove.
+                    guard annotation.page === page,
+                          page.annotations.contains(where: { $0 === annotation })
+                    else { return .invalidHistory }
                 } else {
-                    if let attached = annotation.page, attached !== page { return false }
-                    if page.annotations.contains(where: { $0 === annotation }) { return false }
+                    // Undo of a delete: the mark must still be detached.
+                    guard annotation.page == nil,
+                          !page.annotations.contains(where: { $0 === annotation })
+                    else { return .invalidHistory }
                 }
-            case let .recolor(annotation, _, _, _):
-                guard page.annotations.contains(where: { $0 === annotation }) else {
-                    return false
-                }
+            case .recolor:
+                guard annotation.page === page,
+                      page.annotations.contains(where: { $0 === annotation })
+                else { return .invalidHistory }
+            }
+
+            // The same `/F` and document rules as a direct edit. This also
+            // covers annotations that are currently detached, so undoing a
+            // delete cannot restore a mark whose flags have since been locked.
+            guard MarkupPermissions.allowsAnnotationChanges(annotation, in: document) else {
+                return .permissionDenied
             }
         }
 
         for change in forward ? edit.changes : edit.changes.reversed() {
-            guard let page = pages[change.pageIndex] else { return false }
+            guard let page = pages[change.pageIndex] else { return .invalidHistory }
             switch change {
             case let .insert(annotation, _):
                 if forward {
@@ -399,7 +444,7 @@ extension PDFDocumentModel {
         }
 
         noteAnnotationsChanged(on: edit.pageIndices)
-        return true
+        return .applied
     }
 
     private func resetMarkupHistory() {

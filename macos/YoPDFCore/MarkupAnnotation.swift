@@ -246,16 +246,28 @@ public enum MarkupPermissions {
             && flags(of: annotation) & lockedContentsFlag == 0
     }
 
+    /// The checks that do not depend on the annotation still being attached.
+    ///
+    /// Undo and Redo also add annotations that are currently detached (an undo
+    /// of a delete, or a redo of an insert), so attachment is validated by the
+    /// caller. The document-level commenting permission and the annotation's
+    /// own `/F` flags apply either way.
+    public static func allowsAnnotationChanges(
+        _ annotation: PDFAnnotation,
+        in document: PDFDocument
+    ) -> Bool {
+        document.allowsCommenting && allowsPropertyChanges(annotation)
+    }
+
     public static func canModify(
         _ annotation: PDFAnnotation,
         in document: PDFDocument,
         on page: PDFPage
     ) -> Bool {
-        document.allowsCommenting
+        allowsAnnotationChanges(annotation, in: document)
             && page.document === document
             && annotation.page === page
             && page.annotations.contains(where: { $0 === annotation })
-            && allowsPropertyChanges(annotation)
     }
 }
 

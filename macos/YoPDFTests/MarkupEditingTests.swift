@@ -67,6 +67,45 @@ final class MarkupEditingTests: XCTestCase {
         return url
     }
 
+    /// An encrypted copy of `document` whose access permissions forbid
+    /// commenting.
+    ///
+    /// PDFKit exposes `allowsCommenting` as read-only and derives it from the
+    /// encryption dictionary, so the only reliable way to produce this case is
+    /// to write a document with an owner password and no commenting permission.
+    /// No user password is set, so the file still opens without a prompt.
+    ///
+    /// The copy is made after any annotations are added: PDFKit itself refuses
+    /// `addAnnotation` on a document whose permissions are already restricted.
+    private func makeCommentingRestrictedCopy(
+        of document: PDFDocument,
+        named name: String = "restricted"
+    ) throws -> URL {
+        let source = try XCTUnwrap(document.documentURL)
+        let restricted = source.deletingLastPathComponent()
+            .appendingPathComponent("\(name)-\(UUID().uuidString).pdf")
+        let wrote = document.write(
+            to: restricted,
+            withOptions: [
+                PDFDocumentWriteOption.ownerPasswordOption: "yopdf-test-owner",
+                PDFDocumentWriteOption.accessPermissionsOption: NSNumber(value: 1 << 0)
+            ]
+        )
+        XCTAssertTrue(wrote, "the restricted fixture must be written")
+        temporaryFiles.append(restricted)
+
+        let reopened = try XCTUnwrap(PDFDocument(url: restricted))
+        XCTAssertFalse(
+            reopened.allowsCommenting,
+            "the fixture must actually forbid commenting"
+        )
+        return restricted
+    }
+
+    private func setFlags(_ flags: Int, on annotation: PDFAnnotation) {
+        annotation.setValue(NSNumber(value: flags), forAnnotationKey: .flags)
+    }
+
     private func selection(
         in document: PDFDocument,
         pageIndex: Int,
@@ -521,6 +560,237 @@ final class MarkupEditingTests: XCTestCase {
             XCTAssertEqual(model.document?.page(at: 0)?.annotations.filter(\.isMarkup).count, 1)
             XCTAssertEqual(model.editRevision, revision, "a refused edit is not an edit")
         }
+    }
+
+    // MARK: - Undo/Redo permissions
+
+    func testUndoRefusesToRemoveALockedAnnotationUntilUnlocked() throws {
+        let url = try makeFixture(pageCount: 1, linesPerPage: 3)
+        let model = makeModel()
+        XCTAssertTrue(model.open(url: url))
+        let document = try XCTUnwrap(model.document)
+        try addMarkup(
+            .highlight,
+            to: model,
+            selection: try selection(in: document, pageIndex: 0, from: 0, to: 10)
+        )
+        let annotation = try firstMarkup(on: 0, in: model)
+        try selectMarkup(annotation, in: model)
+        setFlags(MarkupPermissions.lockedFlag, on: annotation)
+        let revision = model.editRevision
+
+        XCTAssertTrue(model.selectedMarkupIsProtected)
+        XCTAssertFalse(model.undoMarkup())
+        XCTAssertEqual(
+            model.document?.page(at: 0)?.annotations.filter(\.isMarkup).count,
+            1,
+            "a locked mark must not be removed by Undo"
+        )
+        XCTAssertEqual(model.editRevision, revision, "a refused Undo is not an edit")
+        XCTAssertTrue(model.hasUnsavedChanges)
+        XCTAssertTrue(model.canUndoMarkup, "the history must survive the refusal")
+        XCTAssertFalse(model.canRedoMarkup)
+        XCTAssertNotNil(model.selectedMarkup, "the protected mark stays selectable")
+
+        setFlags(0, on: annotation)
+        XCTAssertTrue(model.undoMarkup())
+        XCTAssertTrue(model.document?.page(at: 0)?.annotations.filter(\.isMarkup).isEmpty ?? false)
+        XCTAssertGreaterThan(model.editRevision, revision)
+        XCTAssertTrue(model.canRedoMarkup)
+
+        XCTAssertTrue(model.redoMarkup())
+        XCTAssertEqual(model.document?.page(at: 0)?.annotations.filter(\.isMarkup).count, 1)
+        XCTAssertFalse(model.canRedoMarkup)
+    }
+
+    func testUndoRefusesToRecolourAReadOnlyAnnotationUntilUnlocked() throws {
+        let url = try makeFixture(pageCount: 1, linesPerPage: 3)
+        let model = makeModel()
+        XCTAssertTrue(model.open(url: url))
+        let document = try XCTUnwrap(model.document)
+        try addMarkup(
+            .highlight,
+            to: model,
+            selection: try selection(in: document, pageIndex: 0, from: 0, to: 10)
+        )
+        let annotation = try firstMarkup(on: 0, in: model)
+        try selectMarkup(annotation, in: model)
+        XCTAssertTrue(model.recolorSelectedMarkup(to: MarkupColorPalette.color(fromHex: "FF2D55")))
+        setFlags(MarkupPermissions.readOnlyFlag, on: annotation)
+        let revision = model.editRevision
+
+        XCTAssertFalse(model.undoMarkup())
+        XCTAssertEqual(
+            hex(annotation.color),
+            "FF2D55",
+            "Undo must not change the colour of a ReadOnly annotation"
+        )
+        XCTAssertEqual(model.editRevision, revision)
+        XCTAssertTrue(model.hasUnsavedChanges)
+        XCTAssertTrue(model.canUndoMarkup)
+        XCTAssertNotNil(model.selectedMarkup)
+
+        setFlags(0, on: annotation)
+        XCTAssertTrue(model.undoMarkup())
+        XCTAssertEqual(hex(annotation.color), "FFD60A")
+        XCTAssertTrue(model.canUndoMarkup, "the add is still the next undo entry")
+        XCTAssertTrue(model.undoMarkup())
+        XCTAssertTrue(model.document?.page(at: 0)?.annotations.filter(\.isMarkup).isEmpty ?? false)
+    }
+
+    func testRedoRefusesToDeleteAnAnnotationLockedAfterUndo() throws {
+        let url = try makeFixture(pageCount: 1, linesPerPage: 3)
+        let model = makeModel()
+        XCTAssertTrue(model.open(url: url))
+        let document = try XCTUnwrap(model.document)
+        try addMarkup(
+            .highlight,
+            to: model,
+            selection: try selection(in: document, pageIndex: 0, from: 0, to: 10)
+        )
+        let annotation = try firstMarkup(on: 0, in: model)
+        try selectMarkup(annotation, in: model)
+        XCTAssertTrue(model.deleteSelectedMarkup())
+        XCTAssertTrue(model.undoMarkup())
+        let restored = try firstMarkup(on: 0, in: model)
+        XCTAssertTrue(restored === annotation)
+        setFlags(MarkupPermissions.lockedFlag, on: restored)
+        let revision = model.editRevision
+
+        XCTAssertFalse(model.redoMarkup())
+        XCTAssertEqual(
+            model.document?.page(at: 0)?.annotations.filter(\.isMarkup).count,
+            1,
+            "a locked restored mark must not be deleted by Redo"
+        )
+        XCTAssertEqual(model.editRevision, revision)
+        XCTAssertTrue(model.canRedoMarkup)
+        XCTAssertTrue(model.hasUnsavedChanges)
+
+        setFlags(0, on: restored)
+        XCTAssertTrue(model.redoMarkup())
+        XCTAssertTrue(model.document?.page(at: 0)?.annotations.filter(\.isMarkup).isEmpty ?? false)
+    }
+
+    func testCrossPageUndoIsAtomicWhenOnePageIsLocked() throws {
+        let url = try makeFixture(pageCount: 2, linesPerPage: 3)
+        let model = makeModel()
+        XCTAssertTrue(model.open(url: url))
+        let document = try XCTUnwrap(model.document)
+
+        let selection = try crossPageSelection(in: document, fromPage: 0, toPage: 1)
+        try addMarkup(.highlight, to: model, selection: selection)
+        let pageOneAnnotation = try firstMarkup(on: 1, in: model)
+        setFlags(MarkupPermissions.lockedFlag, on: pageOneAnnotation)
+        let revision = model.editRevision
+
+        XCTAssertFalse(model.undoMarkup())
+        XCTAssertEqual(
+            model.document?.page(at: 0)?.annotations.filter(\.isMarkup).count,
+            1,
+            "Undo must not remove the editable page of a blocked cross-page edit"
+        )
+        XCTAssertEqual(
+            model.document?.page(at: 1)?.annotations.filter(\.isMarkup).count,
+            1
+        )
+        XCTAssertEqual(model.editRevision, revision)
+        XCTAssertTrue(model.canUndoMarkup)
+        XCTAssertFalse(model.canRedoMarkup)
+
+        setFlags(0, on: pageOneAnnotation)
+        XCTAssertTrue(model.undoMarkup())
+        XCTAssertTrue(model.document?.page(at: 0)?.annotations.filter(\.isMarkup).isEmpty ?? false)
+        XCTAssertTrue(model.document?.page(at: 1)?.annotations.filter(\.isMarkup).isEmpty ?? false)
+        XCTAssertFalse(model.canUndoMarkup)
+
+        XCTAssertTrue(model.redoMarkup())
+        XCTAssertEqual(model.document?.page(at: 0)?.annotations.filter(\.isMarkup).count, 1)
+        XCTAssertEqual(model.document?.page(at: 1)?.annotations.filter(\.isMarkup).count, 1)
+    }
+
+    func testConversionUndoRefusesALockedReplacement() throws {
+        let url = try makeFixture(pageCount: 1, linesPerPage: 3)
+        let model = makeModel()
+        XCTAssertTrue(model.open(url: url))
+        let document = try XCTUnwrap(model.document)
+        try addMarkup(
+            .highlight,
+            to: model,
+            selection: try selection(in: document, pageIndex: 0, from: 0, to: 10)
+        )
+        try selectMarkup(try firstMarkup(on: 0, in: model), in: model)
+        XCTAssertTrue(model.convertSelectedMarkup())
+        let replacement = try firstMarkup(on: 0, in: model)
+        XCTAssertTrue(replacement.isMarkupType("Underline"))
+        setFlags(MarkupPermissions.lockedFlag, on: replacement)
+        let revision = model.editRevision
+
+        XCTAssertFalse(model.undoMarkup())
+        XCTAssertEqual(
+            model.document?.page(at: 0)?.annotations.filter(\.isMarkup).count,
+            1
+        )
+        XCTAssertTrue(try firstMarkup(on: 0, in: model).isMarkupType("Underline"))
+        XCTAssertEqual(model.editRevision, revision)
+        XCTAssertTrue(model.canUndoMarkup)
+
+        setFlags(0, on: replacement)
+        XCTAssertTrue(model.undoMarkup())
+        let restored = try firstMarkup(on: 0, in: model)
+        XCTAssertTrue(restored.isMarkupType("Highlight"))
+        XCTAssertTrue(model.canRedoMarkup)
+
+        XCTAssertTrue(model.redoMarkup())
+        XCTAssertTrue(try firstMarkup(on: 0, in: model).isMarkupType("Underline"))
+    }
+
+    func testHistoryReplayRefusesWhenTheDocumentDisallowsCommenting() throws {
+        let source = try makeFixture(pageCount: 1, linesPerPage: 3, named: "restricted-source")
+        let sourceDocument = try XCTUnwrap(PDFDocument(url: source))
+        let sourceSelection = try selection(in: sourceDocument, pageIndex: 0, from: 0, to: 10)
+        _ = try HighlightService.addMarkup(
+            .highlight,
+            from: sourceSelection,
+            to: sourceDocument
+        )
+        let url = try makeCommentingRestrictedCopy(of: sourceDocument)
+
+        let model = makeModel()
+        XCTAssertTrue(model.open(url: url))
+        let document = try XCTUnwrap(model.document)
+        let page = try XCTUnwrap(document.page(at: 0))
+        XCTAssertFalse(document.allowsCommenting)
+        let annotation = try firstMarkup(on: 0, in: model)
+
+        // The annotation predates the encryption, but the model must still
+        // refuse every operation that would change it.
+        let selection = try selection(in: document, pageIndex: 0, from: 0, to: 10)
+        model.updateSelection(selection)
+        XCTAssertFalse(model.canAddMarkup(.highlight))
+        XCTAssertNil(model.addMarkup(.highlight))
+        XCTAssertEqual(page.annotations.filter(\.isMarkup).count, 1)
+        try selectMarkup(annotation, in: model)
+        XCTAssertFalse(model.recolorSelectedMarkup(to: MarkupColorPalette.color(fromHex: "34C759")))
+        XCTAssertFalse(model.deleteSelectedMarkup())
+        XCTAssertFalse(model.convertSelectedMarkup())
+
+        model.markupUndoStack.append(MarkupEdit(changes: [
+            .insert(annotation: annotation, pageIndex: 0)
+        ]))
+        model.canUndoMarkup = true
+        let revision = model.editRevision
+
+        XCTAssertFalse(model.undoMarkup())
+        XCTAssertEqual(
+            page.annotations.filter(\.isMarkup).count,
+            1,
+            "a document that forbids commenting must not lose an annotation to Undo"
+        )
+        XCTAssertEqual(model.editRevision, revision)
+        XCTAssertFalse(model.hasUnsavedChanges)
+        XCTAssertTrue(model.canUndoMarkup, "a permission refusal must preserve the history")
+        XCTAssertNotNil(model.selectedMarkup)
     }
 
     // MARK: - Saving
