@@ -611,6 +611,75 @@ final class NoteStickerStyleTests: XCTestCase {
         XCTAssertTrue(model.noteMarkers.isEmpty)
     }
 
+    func testOpeningAnotherDocumentKeepsTheStyleDraft() throws {
+        let first = openModel(at: try makeFixture(named: "style-first"))
+        let secondURL = try makeFixture(named: "style-second")
+        let store = NoteComposerStore()
+        let page = try XCTUnwrap(first.document?.page(at: 0))
+        let draft = try XCTUnwrap(first.pageNoteDraft(at: CGPoint(x: 300, y: 400), on: page))
+        XCTAssertTrue(store.begin(
+            mode: .create(draft),
+            anchorRect: .zero,
+            pageLabel: draft.pageLabel,
+            excerpt: nil,
+            contents: "Style draft",
+            style: NoteStickerStyle(motif: .bunny, palette: .mint)
+        ))
+        let session = try XCTUnwrap(store.session)
+        session.style = NoteStickerStyle(motif: .panda, palette: .sand)
+
+        XCTAssertTrue(first.open(url: secondURL), "a clean document may be replaced under a draft")
+
+        store.reconcile(with: first)
+        XCTAssertNotNil(store.session, "a dirty style draft survives a document replacement")
+        XCTAssertEqual(
+            store.session?.style,
+            NoteStickerStyle(motif: .panda, palette: .sand)
+        )
+        XCTAssertEqual(store.session?.status(in: first), .documentReplaced)
+
+        guard case .failure(.documentChanged) = store.commit(using: first) else {
+            return XCTFail("committing into the replacement document must be refused")
+        }
+        XCTAssertEqual(
+            store.session?.style,
+            NoteStickerStyle(motif: .panda, palette: .sand),
+            "the failed commit must keep the style selection"
+        )
+    }
+
+    func testFailedSaveKeepsTheStyleSelection() throws {
+        let url = try makeFixture()
+        let model = openModel(at: url)
+        let note = try addPageNote(
+            to: model,
+            contents: "Original",
+            style: NoteStickerStyle(motif: .star, palette: .honey)
+        )
+        let store = NoteComposerStore()
+        XCTAssertTrue(store.begin(
+            mode: .edit(note),
+            anchorRect: .zero,
+            pageLabel: note.pageLabel,
+            excerpt: note.excerpt,
+            contents: note.contents,
+            style: note.style
+        ))
+        let session = try XCTUnwrap(store.session)
+        session.style = NoteStickerStyle(motif: .washi, palette: .lavender)
+
+        XCTAssertTrue(model.deleteNote(note))
+        guard case .failure = store.commit(using: model) else {
+            return XCTFail("the note is gone, so the commit must fail")
+        }
+        XCTAssertNotNil(store.session)
+        XCTAssertEqual(
+            store.session?.style,
+            NoteStickerStyle(motif: .washi, palette: .lavender),
+            "a failed save keeps the motif and palette"
+        )
+    }
+
     // MARK: - Highlight coexistence
 
     func testStickerNoteDoesNotDisturbHighlightsOrUnderlines() throws {
