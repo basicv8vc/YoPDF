@@ -4,10 +4,10 @@ import YoPDFCore
 
 /// The compact note composer.
 ///
-/// Nothing here writes to the PDF. The body and the paper colour live in the
+/// Nothing here writes to the PDF. The body and the sticker style live in the
 /// `NoteComposerSession`, not in this view's state, so Save is still the only
 /// thing that mutates the document — which is what makes Cancel a true no-op —
-/// while rebuilding the popover cannot throw the text away.
+/// while rebuilding the popover cannot throw the draft away.
 struct NoteComposerView: View {
 
     @ObservedObject var session: NoteComposerSession
@@ -58,6 +58,7 @@ struct NoteComposerView: View {
                     .foregroundStyle(Color(red: 0.62, green: 0.16, blue: 0.12))
                     .fixedSize(horizontal: false, vertical: true)
             }
+            sticker
             palette
             buttons
         }
@@ -101,7 +102,7 @@ struct NoteComposerView: View {
                 if permissions.isContentsLocked {
                     Image(systemName: "lock.doc")
                         .font(.caption)
-                        .help("This note’s text is locked. Its colour can still be changed.")
+                        .help("This note’s text is locked. Its sticker and colour can still be changed.")
                 } else if permissions.isReadOnly {
                     Image(systemName: "lock.fill")
                         .font(.caption)
@@ -179,6 +180,77 @@ struct NoteComposerView: View {
         case .commentingDisabled:
             return "This document no longer accepts notes. Your text is still here — copy it, or cancel."
         }
+    }
+
+    /// The smallest useful motif picker: the current sticker, a menu grouped by
+    /// collection, and the existing paper row below. The full ShuaMac style
+    /// surface belongs to the next PR; this is only the entry point that proves
+    /// all 21 identities can be chosen and persisted.
+    private var sticker: some View {
+        HStack(spacing: 10) {
+            stickerPreview
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Sticker")
+                    .font(.system(size: 10))
+                    .foregroundStyle(ink.opacity(0.55))
+                Picker("Sticker", selection: motifBinding) {
+                    ForEach(NoteStickerCollection.allCases, id: \.self) { collection in
+                        Section(header: Text(collection.title)) {
+                            ForEach(collection.motifs, id: \.self) { motif in
+                                Text(motif.title).tag(motif)
+                            }
+                        }
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .controlSize(.small)
+                .disabled(!permissions.canChangeStyle)
+                .accessibilityLabel("Sticker motif")
+                .accessibilityIdentifier("note-composer-motif")
+            }
+            Spacer(minLength: 4)
+            Text(session.style.motif.title)
+                .font(.caption)
+                .foregroundStyle(ink.opacity(0.6))
+                .lineLimit(1)
+        }
+    }
+
+    private var stickerPreview: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color(nsColor: session.style.palette.color).opacity(0.45))
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(ink.opacity(0.16), lineWidth: 1)
+            if let name = session.style.motif.assetName,
+               let image = NSImage(named: NSImage.Name(name)) {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+                    .padding(4)
+            } else {
+                Image(systemName: "note.text")
+                    .font(.system(size: 13))
+                    .foregroundStyle(ink.opacity(0.55))
+            }
+        }
+        .frame(width: 34, height: 34)
+        .accessibilityHidden(true)
+    }
+
+    /// Writes the whole style value so the session's `didSet` and revision bump
+    /// see one change even when only one field moved.
+    private var motifBinding: Binding<NoteMotif> {
+        Binding(
+            get: { session.style.motif },
+            set: { motif in
+                var updated = session.style
+                updated.motif = motif
+                session.style = updated
+            }
+        )
     }
 
     private var palette: some View {

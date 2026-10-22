@@ -710,7 +710,7 @@ struct PDFReaderView: View {
                 pageLabel: draft.pageLabel,
                 excerpt: draft.excerpt,
                 contents: "",
-                paper: .honey
+                style: .plain
             )
         case let .note(note, anchor):
             composerStore.begin(
@@ -719,7 +719,7 @@ struct PDFReaderView: View {
                 pageLabel: note.pageLabel,
                 excerpt: note.excerpt,
                 contents: note.contents,
-                paper: note.paperColor
+                style: note.style
             )
         }
     }

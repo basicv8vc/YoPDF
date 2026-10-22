@@ -318,7 +318,7 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
             let pagePoint = convert(location, to: page)
             let marker = NoteService.markerBounds(
                 center: pagePoint,
-                in: page.bounds(for: displayBox)
+                in: page.bounds(for: .cropBox)
             )
             onPlaceNote?(pagePoint, page, containerRect(forPageRect: marker, on: page))
             return
@@ -386,7 +386,7 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
             ?? containerRect(
                 forPageRect: NoteService.markerBounds(
                     center: pagePoint,
-                    in: page.bounds(for: displayBox)
+                    in: page.bounds(for: .cropBox)
                 ),
                 on: page
             )
@@ -497,40 +497,79 @@ private final class MarkupSelectionOverlayView: NSView {
         }
     }
 
-    /// A small paper-coloured marker with two ruled lines.
+    /// Draws one original sticker card per note.
     ///
-    /// It is drawn slightly larger than the annotation's rectangle and filled
-    /// opaquely on purpose: PDFKit renders its own icon for a `/Text`
-    /// annotation, and this covers it so the page shows one marker rather than
-    /// two. The marker is presentation only — nothing about it is written to the
-    /// file, so another reader still sees a standard note icon.
+    /// The card is opaque and larger than PDFKit's 24×24 native note icon on
+    /// purpose: PDFKit still renders that icon underneath, and this is what
+    /// makes the page show one sticker instead of two. Nothing about the card
+    /// is written to the file, so another reader still sees a standard note.
     private func drawNoteMarkers() {
         for marker in markers where marker.pageIndex == pageIndex {
             let rect = marker.bounds.offsetBy(dx: -pageBounds.minX, dy: -pageBounds.minY)
             guard rect.width > 1, rect.height > 1 else { continue }
+            drawSticker(marker.style, in: rect)
+        }
+    }
 
-            let outer = rect.insetBy(dx: -2, dy: -2)
-            let paper = marker.paperColor.color
+    private func drawSticker(_ style: NoteStickerStyle, in frame: CGRect) {
+        let collection = style.motif.collection
+        let radius: CGFloat = collection == .vintage ? 5 : 9
+        let paper = style.palette.color
+        let ink = NSColor(srgbRed: 0.25, green: 0.20, blue: 0.17, alpha: 1)
+        let base = collection == .vintage
+            ? NSColor(srgbRed: 0.98, green: 0.95, blue: 0.88, alpha: 1)
+            : NSColor.white
+        let card = NSBezierPath(roundedRect: frame, xRadius: radius, yRadius: radius)
 
-            let body = NSBezierPath(roundedRect: outer, xRadius: 6, yRadius: 6)
-            paper.setFill()
-            body.fill()
-            // Stroking in the fill colour closes the rounded corners so the
-            // annotation icon underneath cannot peek through them.
-            paper.setStroke()
-            body.lineWidth = 2
-            body.stroke()
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.14)
+        shadow.shadowBlurRadius = 2
+        shadow.shadowOffset = NSSize(width: 0, height: -1)
+        shadow.set()
+        base.setFill()
+        card.fill()
+        NSGraphicsContext.restoreGraphicsState()
 
-            let border = NSBezierPath(
-                roundedRect: outer.insetBy(dx: 0.5, dy: 0.5),
-                xRadius: 5.5,
-                yRadius: 5.5
+        // The palette tint is translucent over an opaque card, so the card still
+        // covers the native icon completely.
+        paper.withAlphaComponent(0.30).setFill()
+        card.fill()
+
+        // Die-cut white edge, then a thin warm border.
+        NSColor.white.setStroke()
+        card.lineWidth = 2.5
+        card.stroke()
+
+        let inset = frame.insetBy(dx: 1.5, dy: 1.5)
+        let border = NSBezierPath(
+            roundedRect: inset,
+            xRadius: max(2, radius - 1.5),
+            yRadius: max(2, radius - 1.5)
+        )
+        ink.withAlphaComponent(0.20).setStroke()
+        border.lineWidth = 0.8
+        border.stroke()
+
+        if collection == .doodle || collection == .vintage {
+            let dashed = NSBezierPath(
+                roundedRect: frame.insetBy(dx: 4.5, dy: 4.5),
+                xRadius: max(2, radius - 3),
+                yRadius: max(2, radius - 3)
             )
-            NSColor.black.withAlphaComponent(0.18).setStroke()
-            border.lineWidth = 1
-            border.stroke()
+            ink.withAlphaComponent(0.16).setStroke()
+            dashed.lineWidth = 0.7
+            dashed.setLineDash([2, 3], count: 2, phase: 0)
+            dashed.stroke()
+        }
 
-            drawRuledLines(in: outer)
+        if let name = style.motif.assetName,
+           let image = NSImage(named: NSImage.Name(name)) {
+            let art = frame.insetBy(dx: 5, dy: 5)
+            NSGraphicsContext.current?.imageInterpolation = .high
+            image.draw(in: art, from: .zero, operation: .sourceOver, fraction: 1)
+        } else {
+            drawRuledLines(in: frame.insetBy(dx: 9, dy: 9))
         }
     }
 
