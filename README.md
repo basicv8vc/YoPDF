@@ -5,16 +5,17 @@ built natively for each platform. **Your PDF. Your way.**
 
 YoPDF is in early development. The repository currently contains the macOS
 reader: opening a local PDF, continuous scrolling, page navigation, zoom, and
-standard PDF Highlight/Underline/Note annotations with manual save. Search and
-AI-assisted reading are not implemented yet.
+standard PDF Highlight/Underline/Note annotations, including illustrated
+sticker notes, with manual save. Search and AI-assisted reading are not
+implemented yet.
 
 ## Status
 
 | Area | State |
 | --- | --- |
 | macOS app (SwiftUI + AppKit + PDFKit) | Reader with editable Highlight/Underline and standard `/Text` notes |
-| Unit tests | 209 logic tests |
-| Annotations | Standard `/Highlight`, `/Underline` and `/Text`: selection, colours, recolour, delete, convert, notes, Undo/Redo |
+| Unit tests | 232 logic tests |
+| Annotations | Standard `/Highlight`, `/Underline` and `/Text`: selection, colours, recolour, delete, convert, notes, 20 sticker motifs, six paper tints, Undo/Redo |
 | Windows (WinUI 3 + PDFium) | Feasibility work, not in this repository yet |
 | AI / agent integration | Not started |
 
@@ -54,7 +55,7 @@ beyond installing XcodeGen. Build products stay in `macos/build/` (git-ignored).
 macos/
 ├── project.yml        # XcodeGen spec (the .xcodeproj is generated)
 ├── YoPDFCore/         # reader logic, no UI, unit-tested
-├── YoPDF/             # SwiftUI app
+├── YoPDF/             # SwiftUI app + sticker Asset Catalog
 ├── YoPDFTests/        # logic tests
 └── scripts/           # generate / build / test
 ```
@@ -65,4 +66,6 @@ Apache-2.0. See [LICENSE](LICENSE).
 
 Third-party dependencies, fonts, and sample documents require their own
 provenance review before redistribution. The YoPDF name and logo are not
-covered by the source license.
+covered by the source license. The sticker illustration provenance and runtime
+hashes are recorded in [STICKER_ASSETS_MANIFEST.md](STICKER_ASSETS_MANIFEST.md);
+that file is a technical inventory, not a separate license.
