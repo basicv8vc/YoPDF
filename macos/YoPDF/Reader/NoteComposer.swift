@@ -48,25 +48,9 @@ struct NoteComposerView: View {
         status.isReady && !trimmedText.isEmpty && !permissions.isReadOnly
     }
 
-    private var headerTitle: String {
-        if session.isEditing {
-            return session.style.displayTitle.isEmpty ? "Note" : session.style.displayTitle
-        }
-        return session.excerpt == nil ? "Page note" : "New Note"
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
-
-            if let excerpt = session.excerpt, !excerpt.isEmpty {
-                Text(excerpt)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
 
             if !status.isReady {
                 detachedNotice
@@ -127,30 +111,23 @@ struct NoteComposerView: View {
     // MARK: - Sections
 
     private var header: some View {
-        HStack(spacing: 8) {
-            Text(headerTitle)
+        HStack(alignment: .top, spacing: 12) {
+            Text(session.excerpt.flatMap { $0.isEmpty ? nil : $0 } ?? "Page note")
                 .font(.callout)
-                .lineLimit(1)
+                .lineLimit(2)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text(session.pageLabel)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .fixedSize()
 
             if permissions.isContentsLocked {
                 Image(systemName: "lock.doc")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .help("This note’s text is locked. Its sticker and colour can still be changed.")
-            }
-
-            Spacer()
-
-            if !permissions.isReadOnly {
-                Button {
-                    showsExpandedEditor = true
-                } label: {
-                    Image(systemName: "arrow.up.left.and.arrow.down.right")
-                        .frame(width: 22, height: 20)
-                }
-                .buttonStyle(.borderless)
-                .help("Open a larger editor")
-                .accessibilityLabel("Expand note editor")
             }
 
             if !session.isEditing || permissions.isReadOnly {

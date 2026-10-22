@@ -1,6 +1,13 @@
 import SwiftUI
 import YoPDFCore
 
+private struct NoteTemplateSymbolChoice: Identifiable {
+    let title: String
+    let symbol: String
+
+    var id: String { symbol }
+}
+
 /// The 760×590 template library: browse built-ins and personal templates,
 /// edit their appearance and outline, and apply one to the draft.
 struct NoteTemplateLibrary: View {
@@ -39,6 +46,19 @@ struct NoteTemplateLibrary: View {
             ),
             body: bodyText
         )
+    }
+
+    private var symbolChoices: [NoteTemplateSymbolChoice] {
+        var choices: [NoteTemplateSymbolChoice] = []
+        for template in NoteTemplate.builtIns() + library.templates {
+            let candidate = template.style.resolvedSymbol
+            guard !choices.contains(where: { $0.symbol == candidate }) else { continue }
+            choices.append(.init(title: template.style.displayTitle, symbol: candidate))
+        }
+        if !choices.contains(where: { $0.symbol == symbol }) {
+            choices.append(.init(title: symbol, symbol: symbol))
+        }
+        return choices
     }
 
     var body: some View {
@@ -114,9 +134,18 @@ struct NoteTemplateLibrary: View {
 
                     NoteStickerMotifPicker(selection: $motif)
 
-                    Picker("Paper color", selection: $palette) {
-                        ForEach(NotePaperColor.allCases, id: \.self) { color in
-                            Text(color.title).tag(color)
+                    HStack(spacing: 14) {
+                        Picker("Paper color", selection: $palette) {
+                            ForEach(NotePaperColor.allCases, id: \.self) { color in
+                                Text(color.title).tag(color)
+                            }
+                        }
+
+                        Picker("Symbol", selection: $symbol) {
+                            ForEach(symbolChoices) { choice in
+                                Label(choice.title, systemImage: choice.symbol)
+                                    .tag(choice.symbol)
+                            }
                         }
                     }
 
