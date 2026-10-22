@@ -382,9 +382,10 @@ database — the saved PDF is the whole document.
   annotation, so a future template cannot change a saved note.
 - **`/YoPDFNoteAnchorX` and `/YoPDFNoteAnchorY` are numbers normalized to the
   page's CropBox** (0…1). The marker centre is
-  `crop.minX + x * crop.width`, `crop.minY + y * crop.height`. Rendering, hit
-  testing and the popover all use `NoteService.markerCenter` and
-  `NoteService.displayBounds`, so they cannot disagree.
+  `crop.minX + x * crop.width`, `crop.minY + y * crop.height`. For owned
+  notes, rendering, hit testing and the popover all use
+  `NoteService.markerCenter` and `NoteService.displayBounds`, so they cannot
+  disagree. Third-party notes use their native annotation bounds instead.
 - **`/YoPDFNoteIdentity` is the ownership marker**, currently
   `yopdf-note-1`. New notes write it. A note is recognised as YoPDF only when
   that key is present, or when the legacy PR #6 keys (`/YoPDFNotePaper`,
