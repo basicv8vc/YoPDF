@@ -37,7 +37,7 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (181)
+./scripts/test.sh                     # unit tests (208)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
@@ -109,6 +109,7 @@ macos/
 │   ├── NoteAnnotationTests.swift        # real PDFKit /Text notes end to end
 │   ├── DocumentEditingTests.swift       # dirty state, save outcomes, re-sync
 │   ├── QuitCoordinatorTests.swift       # multi-window quit decisions
+│   ├── QuitDraftDeferralTests.swift     # deferred draft discard across a quit
 │   └── ReaderViewSyncTests.swift
 └── scripts/{generate,build,test}.sh
 ```
@@ -215,6 +216,14 @@ Editing is manual-save only:
   returns `.terminateNow`. Cancelling any prompt clears the whole attempt, so a
   later ⌘Q asks every still-dirty window again; an edit made after a "Don't Save"
   also invalidates that answer instead of being discarded with it.
+- A note draft is part of that sequence, not an exception that is resolved
+  eagerly. "Discard Draft" records a draft-only intent and leaves the composer
+  session alive; `QuitCoordinator.commit` ends it only once the whole quit is
+  allowed. A Cancel at the following document prompt — in this window or in any
+  other — clears the intents without touching a draft. Draft and document
+  approvals are separate and each is bound to both the draft and document
+  revisions, so typing after answering asks again instead of inheriting the old
+  answer.
 - Save As is available as the escape hatch for read-only files, hard links and
   conflicts; after it succeeds the reader continues editing the copy. Its
   failures use the same three-way split as a save: a copy that was written but
@@ -480,6 +489,15 @@ System Events / Preview and `qlmanage -t` are all blocked here):
 20. Right-click a marker: Edit Note and Delete Note appear above PDFKit's items;
     right-click empty page space: Add Note Here appears. Neither replaces the
     PDFKit zoom/display items.
+21. With both an unsaved note draft and unsaved document edits, ⌘Q → Discard
+    Draft → Cancel: the window stays open, the note text is still in the
+    composer, and the document is still marked edited.
+22. Window A has an unsaved note draft; window B has unsaved document edits.
+    ⌘Q → A "Discard Draft" → B "Cancel": A's note text must still be there and a
+    second ⌘Q must ask A about the draft again.
+23. Repeat the two-window case with both windows approving exit: the app quits.
+    The deferred discard has only been exercised through logic tests here, not
+    through a real window or a real termination.
 
 `YoPDFCore` is a framework so tests are pure logic tests: they link the module
 and never launch the app, so no window server or accessibility permission is

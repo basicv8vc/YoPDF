@@ -31,9 +31,16 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
     }
 
     private(set) weak var window: NSWindow?
-    private var isDirty: () -> Bool = { false }
-    private var revision: () -> Int = { 0 }
-    private var onDiscardUnsavedChanges: () -> Void = {}
+    private var work: () -> UnsavedWork = {
+        UnsavedWork(
+            documentRevision: 0,
+            draftRevision: 0,
+            documentHasChanges: false,
+            draftHasChanges: false
+        )
+    }
+    private var onDiscardDraft: () -> Void = {}
+    private var onDiscardDocumentChanges: () -> Void = {}
     private var onUnsavedChanges: (Intent) -> Void = { _ in }
     /// Set just before the guard closes the window itself, so the close it asked
     /// for is not refused by the same check.
@@ -57,8 +64,12 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
     /// `windowWillClose` and in `deinit`.
     nonisolated(unsafe) private var observers: [NSObjectProtocol] = []
 
-    public var hasUnsavedChanges: Bool { isDirty() }
-    public var editRevision: Int { revision() }
+    public var hasUnsavedChanges: Bool { work().hasChanges }
+    public var editRevision: Int { work().revision }
+    public var hasUnsavedDraft: Bool { work().draftHasChanges }
+    public var draftRevision: Int { work().draftRevision }
+    public var hasUnsavedDocumentChanges: Bool { work().documentHasChanges }
+    public var documentRevision: Int { work().documentRevision }
 
     deinit {
         for observer in observers {
@@ -68,15 +79,15 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
 
     func install(
         on window: NSWindow,
-        isDirty: @escaping () -> Bool,
-        editRevision: @escaping () -> Int,
-        discardUnsavedChanges: @escaping () -> Void,
+        unsavedWork: @escaping () -> UnsavedWork,
+        discardDraft: @escaping () -> Void,
+        discardDocumentChanges: @escaping () -> Void,
         onUnsavedChanges: @escaping (Intent) -> Void
     ) {
         // The closures read live state, so they are refreshed on every update.
-        self.isDirty = isDirty
-        self.revision = editRevision
-        self.onDiscardUnsavedChanges = discardUnsavedChanges
+        self.work = unsavedWork
+        self.onDiscardDraft = discardDraft
+        self.onDiscardDocumentChanges = discardDocumentChanges
         self.onUnsavedChanges = onUnsavedChanges
 
         if self.window !== window {
@@ -112,7 +123,7 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
             allowsNextClose = false
             return true
         }
-        if isDirty() {
+        if hasUnsavedChanges {
             onUnsavedChanges(.windowClose)
             return false
         }
@@ -237,8 +248,17 @@ extension WindowCloseGuard: QuitConfirmingWindow {
         onUnsavedChanges(.quit)
     }
 
+    public func discardDraftForQuit() {
+        onDiscardDraft()
+    }
+
+    public func discardDocumentChangesForQuit() {
+        onDiscardDocumentChanges()
+    }
+
     public func discardUnsavedChangesForQuit() {
-        onDiscardUnsavedChanges()
+        onDiscardDraft()
+        onDiscardDocumentChanges()
     }
 }
 
@@ -249,9 +269,9 @@ extension WindowCloseGuard: QuitConfirmingWindow {
 struct WindowCloseGuardInstaller: NSViewRepresentable {
 
     let guardObject: WindowCloseGuard
-    let isDirty: () -> Bool
-    let editRevision: () -> Int
-    let discardUnsavedChanges: () -> Void
+    let unsavedWork: () -> UnsavedWork
+    let discardDraft: () -> Void
+    let discardDocumentChanges: () -> Void
     let onUnsavedChanges: (WindowCloseGuard.Intent) -> Void
 
     func makeNSView(context: Context) -> NSView {
@@ -269,9 +289,9 @@ struct WindowCloseGuardInstaller: NSViewRepresentable {
         view.onWindowAvailable = { window in
             guardObject.install(
                 on: window,
-                isDirty: isDirty,
-                editRevision: editRevision,
-                discardUnsavedChanges: discardUnsavedChanges,
+                unsavedWork: unsavedWork,
+                discardDraft: discardDraft,
+                discardDocumentChanges: discardDocumentChanges,
                 onUnsavedChanges: onUnsavedChanges
             )
         }

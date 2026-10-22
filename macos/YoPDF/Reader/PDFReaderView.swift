@@ -145,13 +145,14 @@ struct PDFReaderView: View {
         .background(
             WindowCloseGuardInstaller(
                 guardObject: closeGuard,
-                isDirty: { unsavedWork.hasChanges },
-                editRevision: { unsavedWork.revision },
-                discardUnsavedChanges: {
+                unsavedWork: { unsavedWork },
+                discardDraft: {
                     // Termination is committed, so the draft goes with the
-                    // document's edits. Until this point a "Don't Save" is only
-                    // an answer about the quit attempt.
+                    // document's edits. Until this point a "Discard Draft" is
+                    // only an intent for the quit attempt.
                     composerStore.end()
+                },
+                discardDocumentChanges: {
                     model.abandonUnsavedChanges()
                 },
                 onUnsavedChanges: handleCloseIntent
@@ -831,16 +832,40 @@ struct PDFReaderView: View {
     }
 
     private func handleCloseIntent(_ intent: WindowCloseGuard.Intent) {
-        let action: PendingAction = intent == .windowClose ? .closeWindow : .quit
-        switch promptKind(for: action) {
+        switch intent {
+        case .windowClose:
+            switch promptKind(for: .closeWindow) {
+            case .draft:
+                prompt = .draftChanges(.closeWindow)
+            case .document:
+                prompt = .unsavedChanges(.closeWindow)
+            case .none:
+                // The guard only asks when something is unsaved, so this is only
+                // reachable if the draft was resolved between the two reads.
+                perform(.closeWindow)
+            }
+        case .quit:
+            // The coordinator knows which half of the window is still
+            // unanswered. A draft that was already approved for this attempt is
+            // not asked about again.
+            showQuitPrompt(for: QuitSession.coordinator.confirmationNeed(for: closeGuard))
+        }
+    }
+
+    /// Continues the current quit attempt from whatever the coordinator says is
+    /// still unanswered, or asks AppKit to terminate once nothing is left.
+    private func continueQuit() {
+        showQuitPrompt(for: QuitSession.coordinator.confirmationNeed(for: closeGuard))
+    }
+
+    private func showQuitPrompt(for need: QuitConfirmationNeed) {
+        switch need {
         case .draft:
-            prompt = .draftChanges(action)
+            prompt = .draftChanges(.quit)
         case .document:
-            prompt = .unsavedChanges(action)
+            prompt = .unsavedChanges(.quit)
         case .none:
-            // The guard only asks when something is unsaved, so this is only
-            // reachable if the draft was resolved between the two reads.
-            perform(action)
+            perform(.quit)
         }
     }
 
@@ -863,16 +888,34 @@ struct PDFReaderView: View {
                 offersSaveAs: false
             )
         case .success:
-            proceed(afterDraft: action)
+            if action == .quit {
+                continueQuit()
+            } else {
+                proceed(afterDraft: action)
+            }
         }
     }
 
     /// "Discard Draft": the typed text is dropped by an explicit choice, and the
     /// interrupted action continues.
+    ///
+    /// Quit is the exception. The window stays open while the other windows are
+    /// asked, so ending the draft here would lose text the user only agreed to
+    /// discard for an attempt that may still be cancelled. The coordinator
+    /// records the intent and ends the draft in `commit`, after termination is
+    /// actually allowed.
     private func discardDraftThen(_ action: PendingAction) {
         prompt = nil
-        composerStore.end()
-        proceed(afterDraft: action)
+        switch QuitSession.coordinator.resolveDraftDiscard(
+            for: action.readerAction,
+            of: closeGuard
+        ) {
+        case .endedNow:
+            composerStore.end()
+            proceed(afterDraft: action)
+        case let .deferredUntilQuitCommit(need):
+            showQuitPrompt(for: need)
+        }
     }
 
     private func cancel(_ action: PendingAction) {
@@ -906,12 +949,20 @@ struct PDFReaderView: View {
 
     private func saveThen(_ action: PendingAction) {
         prompt = nil
+        // A deferred draft is still on screen because the user answered the
+        // draft prompt with "Discard Draft". Saving the document changes the
+        // document's revision, not the draft, so the same decision has to be
+        // rebound to the new revisions before termination is retried.
+        let keptDeferredDraft = action == .quit && composerStore.hasUncommittedChanges
         guard performSave() else {
             // A failed save stops the quit before termination is requested.
             // Any "Don't Save" answers collected from other windows belong to
             // an attempt that is no longer running, so they must not survive.
             if action == .quit { QuitSession.coordinator.cancel() }
             return
+        }
+        if keptDeferredDraft {
+            QuitSession.coordinator.approveDraftDiscard(of: closeGuard)
         }
         perform(action)
     }
@@ -932,9 +983,11 @@ struct PDFReaderView: View {
             closeGuard.closeNow()
         case .quit:
             // The window stays open and keeps its dirty state: this records the
-            // answer for the quit that is still in progress. The edits are only
-            // abandoned once every dirty window has answered, in `commit`.
-            QuitSession.coordinator.approveDiscard(of: closeGuard)
+            // document answer for the quit that is still in progress. The edits
+            // are only abandoned once every dirty window has answered, in
+            // `commit`. The draft approval, if any, is kept separately and
+            // remains bound to its own revision.
+            QuitSession.coordinator.approveDocumentDiscard(of: closeGuard)
             perform(action)
         case .save, .saveAs, .compose:
             // These never reach the document prompt: saving resolves it, and
