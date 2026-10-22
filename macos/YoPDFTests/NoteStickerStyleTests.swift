@@ -197,6 +197,68 @@ final class NoteStickerStyleTests: XCTestCase {
         }
     }
 
+    // MARK: - New note default
+
+    /// ShuaMac's default style stores no motif and resolves it to the bunny, so a
+    /// new note must open as Little Bunny rather than as a blank square.
+    func testNewNoteDefaultIsShuaMacsDefaultSticker() {
+        XCTAssertEqual(NoteStickerStyle.newNote, NoteStickerStyle(motif: .bunny, palette: .honey))
+        XCTAssertEqual(NoteStickerStyle.newNote.motif.collection, .cream)
+        XCTAssertEqual(NoteStickerStyle.newNote.title, "")
+        XCTAssertEqual(NoteStickerStyle.newNote.symbol, NoteStickerStyle.defaultSymbol)
+    }
+
+    /// The default has to be written, not implied: a reader that has no fallback
+    /// rule of its own must still see the bunny.
+    func testNewNoteDefaultIsPersistedAsAnExplicitMotif() throws {
+        let url = try makeFixture()
+        let model = openModel(at: url)
+        try addPageNote(to: model, contents: "Default sticker", style: .newNote)
+
+        XCTAssertEqual(model.noteMarkers.first?.style, .newNote)
+        XCTAssertEqual(model.save(), .saved)
+
+        let reopened = try XCTUnwrap(PDFDocument(url: url))
+        let note = try textNote(on: 0, in: reopened)
+        XCTAssertEqual(NoteService.style(of: note), NoteStickerStyle(motif: .bunny, palette: .honey))
+        XCTAssertEqual(
+            note.value(forAnnotationKey: NoteService.styleKey) as? String,
+            "{\"v\":2,\"title\":\"\",\"symbol\":\"note.text\",\"motif\":\"bunny\",\"palette\":\"honey\"}"
+        )
+    }
+
+    /// The paper-only compatibility path supplies a tint, not an appearance, so
+    /// it must not resurrect Simple Paper as the create default.
+    func testPaperOnlyComposerCreateKeepsTheNewNoteMotif() throws {
+        let url = try makeFixture()
+        let model = openModel(at: url)
+        let page = try XCTUnwrap(model.document?.page(at: 0))
+        let draft = try XCTUnwrap(model.pageNoteDraft(at: CGPoint(x: 300, y: 400), on: page))
+        let store = NoteComposerStore()
+
+        XCTAssertTrue(store.begin(
+            mode: .create(draft),
+            anchorRect: .zero,
+            pageLabel: draft.pageLabel,
+            excerpt: draft.excerpt,
+            contents: "",
+            paper: .sky
+        ))
+        XCTAssertEqual(store.session?.style, NoteStickerStyle(motif: .bunny, palette: .sky))
+        XCTAssertEqual(store.session?.initialPaper, .sky)
+    }
+
+    /// A note with no style key keeps the PR #6 appearance. Reading a document
+    /// must never restyle what an older build wrote.
+    func testMissingStyleKeyStillReadsAsSimplePaper() throws {
+        let url = try makeHandBuiltNoteFixture(paper: .rose)
+        let model = openModel(at: url)
+        let note = try textNote(on: 0, in: model.document ?? PDFDocument())
+
+        XCTAssertEqual(NoteService.style(of: note), NoteStickerStyle(motif: .plain, palette: .rose))
+        XCTAssertNotEqual(NoteService.style(of: note).motif, NoteStickerStyle.newNote.motif)
+    }
+
     // MARK: - Style serialization
 
     func testStyleRoundTripsThroughPDFKitSerialization() throws {
@@ -222,11 +284,156 @@ final class NoteStickerStyleTests: XCTestCase {
 
     func testStyleValueHasTheDocumentedVersionedShape() {
         let style = NoteStickerStyle(motif: .bunny, palette: .honey)
-        XCTAssertEqual(style.serialized, "{\"v\":1,\"motif\":\"bunny\",\"palette\":\"honey\"}")
+        XCTAssertEqual(
+            style.serialized,
+            "{\"v\":2,\"title\":\"\",\"symbol\":\"note.text\",\"motif\":\"bunny\",\"palette\":\"honey\"}"
+        )
         XCTAssertEqual(
             NoteStickerStyle(serialized: style.serialized)?.serialized,
             style.serialized
         )
+    }
+
+    func testVersionOneStyleStillReadsWithEmptyTitleAndDefaultSymbol() {
+        let style = NoteStickerStyle(
+            serialized: "{\"v\":1,\"motif\":\"washi\",\"palette\":\"rose\"}"
+        )
+        XCTAssertEqual(style?.motif, .washi)
+        XCTAssertEqual(style?.palette, .rose)
+        XCTAssertEqual(style?.title, "")
+        XCTAssertEqual(style?.symbol, NoteStickerStyle.defaultSymbol)
+        XCTAssertEqual(
+            style?.serialized,
+            "{\"v\":2,\"title\":\"\",\"symbol\":\"note.text\",\"motif\":\"washi\",\"palette\":\"rose\"}"
+        )
+    }
+
+    func testTitleAndSymbolRoundTripThroughPDFKitSerialization() throws {
+        let url = try makeFixture()
+        let model = openModel(at: url)
+        let style = NoteStickerStyle(
+            motif: .flower,
+            palette: .mint,
+            title: "Connection",
+            symbol: "link"
+        )
+        try addPageNote(to: model, contents: "Templated note", style: style)
+        XCTAssertEqual(model.save(), .saved)
+
+        let reopened = try XCTUnwrap(PDFDocument(url: url))
+        let note = try textNote(on: 0, in: reopened)
+        XCTAssertEqual(NoteService.style(of: note), style)
+        XCTAssertEqual(note.contents, "Templated note")
+    }
+
+    func testMalformedTitleAndSymbolDegradeWithoutLosingTheStyle() {
+        let style = NoteStickerStyle(
+            serialized: "{\"v\":2,\"title\":42,\"symbol\":\"   \",\"motif\":\"cat\",\"palette\":\"sky\"}"
+        )
+        XCTAssertEqual(style?.title, "")
+        XCTAssertEqual(style?.symbol, NoteStickerStyle.defaultSymbol)
+        XCTAssertEqual(style?.motif, .cat)
+        XCTAssertEqual(style?.palette, .sky)
+    }
+
+    func testStyleSerializationEscapesQuotesAndNewlines() {
+        let title = "He said \"look\"\nsecond line"
+        let style = NoteStickerStyle(motif: .plain, palette: .sand, title: title, symbol: "quote.opening")
+        XCTAssertEqual(NoteStickerStyle(serialized: style.serialized)?.title, title)
+        XCTAssertEqual(NoteStickerStyle(serialized: style.serialized)?.symbol, "quote.opening")
+    }
+
+    func testAppearanceOnlyDropsTemplateIdentity() {
+        let template = NoteStickerStyle(
+            motif: .cat,
+            palette: .lavender,
+            title: "Review",
+            symbol: "text.badge.checkmark"
+        )
+        XCTAssertEqual(
+            template.appearanceOnly,
+            NoteStickerStyle(motif: .cat, palette: .lavender)
+        )
+    }
+
+    func testMarkerUsesTheShuaArtworkFaceAndThreePointHitInset() throws {
+        let model = openModel(at: try makeFixture())
+        let added = try addPageNote(
+            to: model,
+            point: CGPoint(x: 300, y: 400),
+            style: NoteStickerStyle(motif: .cherry, palette: .rose)
+        )
+        let page = try XCTUnwrap(model.document?.page(at: 0))
+        let marker = try marker(in: model)
+
+        XCTAssertEqual(marker.bounds.width, 32, accuracy: 0.01)
+        XCTAssertEqual(marker.bounds.height, 32, accuracy: 0.01)
+        XCTAssertEqual(NoteService.markerDisplaySize, 32)
+        XCTAssertEqual(NoteService.hitRect(for: added.annotation, on: page).width, 38, accuracy: 0.01)
+
+        let center = CGPoint(x: marker.bounds.midX, y: marker.bounds.midY)
+        XCTAssertNotNil(model.noteSelection(at: CGPoint(x: center.x + 18, y: center.y), on: page))
+        XCTAssertNil(model.noteSelection(at: CGPoint(x: center.x + 21, y: center.y), on: page))
+    }
+
+    func testTitleOrSymbolChangeIsAnUndoableDraftAndDocumentEdit() throws {
+        let url = try makeFixture()
+        let model = openModel(at: url)
+        let added = try addPageNote(
+            to: model,
+            contents: "Body",
+            style: NoteStickerStyle(motif: .star, palette: .honey)
+        )
+        let store = NoteComposerStore()
+        XCTAssertTrue(store.begin(
+            mode: .edit(added),
+            anchorRect: .zero,
+            pageLabel: added.pageLabel,
+            excerpt: added.excerpt,
+            contents: added.contents,
+            style: added.style
+        ))
+        let session = try XCTUnwrap(store.session)
+        let revision = store.revision
+        session.style.title = "Insight"
+        session.style.symbol = "lightbulb"
+        XCTAssertTrue(session.hasUncommittedChanges)
+        XCTAssertGreaterThan(store.revision, revision)
+
+        guard case .success = store.commit(using: model) else {
+            return XCTFail("the template identity must be savable")
+        }
+        let saved = try textNote(on: 0, in: try XCTUnwrap(model.document))
+        XCTAssertEqual(NoteService.style(of: saved).title, "Insight")
+        XCTAssertEqual(NoteService.style(of: saved).symbol, "lightbulb")
+
+        XCTAssertTrue(model.undoMarkup())
+        let restored = try textNote(on: 0, in: try XCTUnwrap(model.document))
+        XCTAssertEqual(NoteService.style(of: restored).title, "")
+        XCTAssertEqual(NoteService.style(of: restored).symbol, NoteStickerStyle.defaultSymbol)
+    }
+
+    func testTemplateSeedResetsWhenTheComposerTextBecomesEmpty() throws {
+        let model = openModel(at: try makeFixture())
+        let store = NoteComposerStore()
+        let page = try XCTUnwrap(model.document?.page(at: 0))
+        let draft = try XCTUnwrap(model.pageNoteDraft(at: CGPoint(x: 300, y: 400), on: page))
+        XCTAssertTrue(store.begin(
+            mode: .create(draft),
+            anchorRect: .zero,
+            pageLabel: draft.pageLabel,
+            excerpt: nil,
+            contents: "Key insight:\n\nWhy it matters:\n",
+            style: .plain
+        ))
+        let session = try XCTUnwrap(store.session)
+        var selection = NoteTemplateSelection()
+        selection.restoreIfNeeded(text: session.contents, templates: NoteTemplate.builtIns())
+        session.templateSelection = selection
+        XCTAssertNotNil(session.templateSelection.seed)
+
+        session.contents = ""
+        XCTAssertNil(session.templateSelection.seed)
     }
 
     func testMissingStyleFallsBackToTheLegacyPaperAndReadsTheBody() throws {

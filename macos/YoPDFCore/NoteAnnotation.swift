@@ -228,9 +228,11 @@ public enum NoteService {
 
     /// The minimum `/Text` rectangle PDFKit keeps after serialization.
     public static let markerSize: CGFloat = 24
-    /// The visible sticker card. It is larger than `/Rect` on purpose: it covers
-    /// PDFKit's native note icon and gives the artwork room to breathe.
-    public static let markerDisplaySize: CGFloat = 40
+    /// The visible sticker artwork, matching ShuaMac's 32pt marker face.
+    ///
+    /// It is larger than the 24pt `/Rect` because the artwork is the visible
+    /// hit target; the annotation rectangle is PDFKit's storage detail.
+    public static let markerDisplaySize: CGFloat = 32
     /// The custom keys are deliberately namespaced and optional.
     ///
     /// PDF annotation keys are written with their leading slash, exactly like
@@ -468,7 +470,7 @@ public enum NoteService {
         _ = annotation.setValue(NSNumber(value: Double(y)), forAnnotationKey: anchorYKey)
     }
 
-    /// The sticker card in page space, clamped into the page.
+    /// The sticker artwork in page space, clamped into the page.
     public static func displayBounds(center: CGPoint, in pageBounds: CGRect) -> CGRect {
         let half = markerDisplaySize / 2
         let minX = pageBounds.minX + half + 2
@@ -486,10 +488,10 @@ public enum NoteService {
         )
     }
 
-    /// The marker card in page space.
+    /// The marker artwork in page space.
     ///
     /// A malformed third-party note with an empty rectangle still gets a
-    /// visible card at the page centre rather than disappearing entirely.
+    /// visible marker at the page centre rather than disappearing entirely.
     public static func resolvedBounds(
         for annotation: PDFAnnotation,
         on page: PDFPage
@@ -566,13 +568,14 @@ public enum NoteService {
 
     /// The click target for one note.
     ///
-    /// A YoPDF note uses its drawn card. An untouched third-party note uses its
-    /// native annotation bounds; it must not gain an invisible 44×44 target just
-    /// because YoPDF knows how to attach stickers.
+    /// A YoPDF note uses its drawn sticker face, inset by 3pt like ShuaMac's
+    /// marker hit target. An untouched third-party note uses its native
+    /// annotation bounds; it must not gain an invisible sticker-sized target
+    /// just because YoPDF knows how to attach stickers.
     public static func hitRect(for annotation: PDFAnnotation, on page: PDFPage) -> CGRect {
         guard isYoPDFNote(annotation) else { return annotation.bounds }
         return resolvedBounds(for: annotation, on: page)
-            .insetBy(dx: -2, dy: -2)
+            .insetBy(dx: -3, dy: -3)
     }
 
     public static func hitTest(

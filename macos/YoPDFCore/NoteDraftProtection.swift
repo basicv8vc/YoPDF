@@ -97,14 +97,24 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
     public var initialPaper: NotePaperColor { initialStyle.palette }
 
     @Published public var contents: String {
-        didSet { noteChanged() }
+        didSet {
+            if contents.isEmpty { templateSelection.reset() }
+            noteChanged()
+        }
     }
 
-    /// The complete appearance being edited. Motif and palette are one value so
-    /// a single revision bump covers either change.
+    /// The complete appearance being edited. Motif, palette, title and symbol
+    /// are one value so a single revision bump covers any change.
     @Published public var style: NoteStickerStyle {
         didSet { noteChanged() }
     }
+
+    /// Which template outline the editor currently owns.
+    ///
+    /// Held outside the appearance popover so closing and reopening the popover
+    /// cannot forget that an untouched outline came from a template. Changes to
+    /// the seed alone are not document edits and do not bump the draft revision.
+    public var templateSelection = NoteTemplateSelection()
 
     /// Paper-only accessor used by the existing palette row and tests.
     public var paper: NotePaperColor {
@@ -169,12 +179,12 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
 
     /// Resolves a paper-only request without discarding an existing motif.
     ///
-    /// A new note starts on Simple Paper; editing a sticker note through an old
-    /// paper-only call keeps the sticker it already has.
+    /// A new note starts on ShuaMac's default sticker; editing a sticker note
+    /// through an old paper-only call keeps the sticker it already has.
     static func resolvedStyle(for mode: Mode, paper: NotePaperColor) -> NoteStickerStyle {
         switch mode {
         case .create:
-            return NoteStickerStyle(motif: .plain, palette: paper)
+            return NoteStickerStyle(motif: NoteStickerStyle.newNote.motif, palette: paper)
         case let .edit(note):
             return NoteStickerStyle(
                 motif: NoteService.style(of: note.annotation).motif,
