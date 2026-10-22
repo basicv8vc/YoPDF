@@ -15,6 +15,7 @@ struct PDFReaderCommands: Commands {
     @FocusedValue(\.saveDocumentAs) private var saveDocumentAs
     @FocusedValue(\.highlightSelection) private var highlightSelection
     @FocusedValue(\.underlineSelection) private var underlineSelection
+    @FocusedValue(\.addNote) private var addNote
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
@@ -81,6 +82,12 @@ struct PDFReaderCommands: Commands {
             }
             .keyboardShortcut("u", modifiers: [.command, .shift])
             .disabled(model?.canAddMarkup(.underline) != true)
+
+            Button("Add Note") {
+                addNote?()
+            }
+            .keyboardShortcut("n", modifiers: [.command, .shift])
+            .disabled(model?.canCreateNote != true)
 
             Divider()
 

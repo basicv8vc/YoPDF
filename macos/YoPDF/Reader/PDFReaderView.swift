@@ -1,4 +1,5 @@
 import AppKit
+import PDFKit
 import SwiftUI
 import UniformTypeIdentifiers
 import YoPDFCore
@@ -12,20 +13,54 @@ struct PDFReaderView: View {
     @State private var prompt: Prompt?
     /// Installed on the window so closing it cannot drop unsaved edits.
     @State private var closeGuard = WindowCloseGuard()
+    /// The window's one note composer, and the draft that outlives its popover.
+    ///
+    /// The text is not `@State` here or in the popover: both are rebuilt often
+    /// enough — a save, another annotation edit, a click outside — that either
+    /// would throw typed text away.
+    @StateObject private var composerStore = NoteComposerStore()
+    /// True while the next page click places a page note.
+    @State private var isPlacingNote = false
+    /// Converts page rectangles into popover anchors through the live PDFView.
+    @State private var anchorResolver = PageAnchorResolver()
 
-    /// Something the reader was asked to do that would discard edits.
+    /// Something the reader was asked to do that could discard work.
     private enum PendingAction: Equatable {
         case open(URL)
+        case save
+        case saveAs
         case closeWindow
         case quit
+        /// Replacing the open composer with another note.
+        case compose(ComposerTarget)
+
+        enum ComposerTarget: Equatable {
+            case draft(NoteDraft, CGRect)
+            case note(NoteSelection, CGRect)
+        }
+
+        var readerAction: ReaderAction {
+            switch self {
+            case let .open(url): return .open(url)
+            case .save: return .save
+            case .saveAs: return .saveAs
+            case .closeWindow: return .closeWindow
+            case .quit: return .quit
+            case .compose: return .compose
+            }
+        }
     }
 
     private enum Prompt: Identifiable {
+        /// The note has text that is not in the document yet.
+        case draftChanges(PendingAction)
         case unsavedChanges(PendingAction)
         case saveProblem(title: String, message: String, offersSaveAs: Bool)
 
         var id: String {
             switch self {
+            case let .draftChanges(action):
+                return "draft-\(String(describing: action))"
             case let .unsavedChanges(action):
                 return "unsaved-\(String(describing: action))"
             case let .saveProblem(title, _, _):
@@ -35,6 +70,8 @@ struct PDFReaderView: View {
 
         var title: String {
             switch self {
+            case .draftChanges:
+                return "Save this note first?"
             case .unsavedChanges:
                 return "Save changes before continuing?"
             case let .saveProblem(title, _, _):
@@ -44,15 +81,37 @@ struct PDFReaderView: View {
 
         var message: String {
             switch self {
+            case let .draftChanges(action):
+                return Self.draftMessage(for: action)
             case let .unsavedChanges(action):
                 switch action {
                 case let .open(url):
                     return "“\(url.lastPathComponent)” cannot be opened while this document has unsaved changes."
                 case .closeWindow, .quit:
                     return "This document has changes that are not in the file yet."
+                case .save, .saveAs, .compose:
+                    return "This document has changes that are not in the file yet."
                 }
             case let .saveProblem(_, message, _):
                 return message
+            }
+        }
+
+        /// Saving the note is not saving the file, and the wording has to say so
+        /// — otherwise "Save Note" reads as "my text is on disk now".
+        private static func draftMessage(for action: PendingAction) -> String {
+            let base = "The note you are writing is not in the document yet."
+            switch action {
+            case .save:
+                return base + " Saving it adds the note to the document, and the file is written straight after."
+            case .saveAs:
+                return base + " Save the note, or discard it, before saving a copy of the file."
+            case let .open(url):
+                return base + " “\(url.lastPathComponent)” cannot be opened until you save or discard it."
+            case .closeWindow, .quit:
+                return base + " Saving it puts the note in the document; the file itself still has to be saved."
+            case .compose:
+                return base + " Save it or discard it before opening another note."
             }
         }
     }
@@ -78,16 +137,24 @@ struct PDFReaderView: View {
         }
         .focusedSceneValue(\.documentModel, model)
         .focusedSceneValue(\.openDocument, { isImporterPresented = true })
-        .focusedSceneValue(\.saveDocument, { _ = performSave() })
-        .focusedSceneValue(\.saveDocumentAs, { presentSaveAsPanel() })
+        .focusedSceneValue(\.saveDocument, { requestSave() })
+        .focusedSceneValue(\.saveDocumentAs, { requestSaveAs() })
         .focusedSceneValue(\.highlightSelection, { _ = model.addMarkup(.highlight) })
         .focusedSceneValue(\.underlineSelection, { _ = model.addMarkup(.underline) })
+        .focusedSceneValue(\.addNote, { beginNote() })
         .background(
             WindowCloseGuardInstaller(
                 guardObject: closeGuard,
-                isDirty: { model.hasUnsavedChanges },
-                editRevision: { model.editRevision },
-                discardUnsavedChanges: { model.abandonUnsavedChanges() },
+                unsavedWork: { unsavedWork },
+                discardDraft: {
+                    // Termination is committed, so the draft goes with the
+                    // document's edits. Until this point a "Discard Draft" is
+                    // only an intent for the quit attempt.
+                    composerStore.end()
+                },
+                discardDocumentChanges: {
+                    model.abandonUnsavedChanges()
+                },
                 onUnsavedChanges: handleCloseIntent
             )
         )
@@ -100,15 +167,14 @@ struct PDFReaderView: View {
             presenting: prompt
         ) { prompt in
             switch prompt {
+            case let .draftChanges(action):
+                Button("Save Note") { saveDraftThen(action) }
+                Button("Discard Draft", role: .destructive) { discardDraftThen(action) }
+                Button("Cancel", role: .cancel) { cancel(action) }
             case let .unsavedChanges(action):
                 Button("Save") { saveThen(action) }
                 Button("Don’t Save", role: .destructive) { discardThen(action) }
-                Button("Cancel", role: .cancel) {
-                    self.prompt = nil
-                    if action == .quit {
-                        QuitSession.coordinator.cancel()
-                    }
-                }
+                Button("Cancel", role: .cancel) { cancel(action) }
             case let .saveProblem(_, _, offersSaveAs):
                 if offersSaveAs {
                     Button("Save As…") {
@@ -216,6 +282,27 @@ struct PDFReaderView: View {
                 model.setDefaultMarkupColor(color, for: .underline)
             }
 
+            Divider().frame(height: 18)
+
+            Button {
+                if isPlacingNote {
+                    isPlacingNote = false
+                } else {
+                    beginNote()
+                }
+            } label: {
+                Label(
+                    isPlacingNote ? "Cancel Note" : "Add Note",
+                    systemImage: isPlacingNote ? "xmark.circle" : "note.text.badge.plus"
+                )
+            }
+            .disabled(!model.canCreateNote)
+            .help(
+                isPlacingNote
+                    ? "Click a page to place the note, or press Esc to cancel"
+                    : "Note the selected text, or click a page to place a note (⇧⌘N)"
+            )
+
             if let selected = model.selectedMarkup {
                 Divider().frame(height: 18)
 
@@ -252,7 +339,7 @@ struct PDFReaderView: View {
             }
 
             Button {
-                performSave()
+                requestSave()
             } label: {
                 Label("Save", systemImage: "square.and.arrow.down")
             }
@@ -260,6 +347,19 @@ struct PDFReaderView: View {
             .help("Save changes (⌘S)")
 
             Spacer(minLength: 8)
+
+            // A popover is dismissed by any click outside it. The draft survives
+            // that, so there has to be a way back to it.
+            if composerStore.hasUncommittedChanges && !composerStore.isPresented {
+                Button {
+                    composerStore.isPresented = true
+                } label: {
+                    Label("Note Draft", systemImage: "square.and.pencil")
+                        .font(.caption)
+                }
+                .help("A note you have not saved yet is still here. Click to reopen it.")
+                .accessibilityLabel("Reopen the unsaved note draft")
+            }
 
             if model.hasUnsavedChanges {
                 Label("Edited", systemImage: "circle.fill")
@@ -327,14 +427,57 @@ struct PDFReaderView: View {
                 zoomScale: model.zoomScale,
                 onScaleChange: { model.updateEffectiveScale($0) },
                 selectedMarkup: model.selectedMarkup,
+                noteMarkers: model.noteMarkers,
+                isPlacingNote: isPlacingNote,
                 annotationRevision: model.annotationRevision,
                 changedAnnotationPageIndices: model.changedAnnotationPageIndices,
                 onMarkupClick: { point, page in
                     model.selectMarkup(at: point, on: page)
                 },
-                makeMarkupMenuItems: { markupMenuItems() }
+                onNoteHit: { point, page in
+                    model.noteSelection(at: point, on: page)
+                },
+                onNoteActivated: { note, anchor in
+                    isPlacingNote = false
+                    requestCompose(.note(note, anchor))
+                },
+                onPlaceNote: { point, page, anchor in
+                    placePageNote(at: point, on: page, anchor: anchor)
+                },
+                onCancelPlacement: { isPlacingNote = false },
+                makeMenuItems: { context in
+                    pageMenuItems(for: context)
+                },
+                anchorResolver: anchorResolver
             )
             .id(model.loadGeneration)
+            .popover(
+                isPresented: $composerStore.isPresented,
+                attachmentAnchor: .rect(.rect(composerStore.session?.anchorRect ?? Self.fallbackAnchor)),
+                arrowEdge: .top
+            ) {
+                if let session = composerStore.session {
+                    NoteComposerView(session: session, model: model) {
+                        composerStore.end()
+                    }
+                    .id(session.id)
+                }
+            }
+            // A composer describes one anchor in one document, so a new document
+            // or a changed annotation set can invalidate it. It is never closed
+            // on those changes alone: closing a composer that holds text is how
+            // the text gets lost. A composer with nothing to lose is closed when
+            // its target is gone; one with text stays open and explains itself.
+            .onChange(of: model.loadGeneration) { _, _ in
+                isPlacingNote = false
+                composerStore.reconcile(with: model)
+            }
+            .onChange(of: model.annotationRevision) { _, _ in
+                composerStore.reconcile(with: model)
+            }
+            .onChange(of: composerStore.isPresented) { _, presented in
+                if !presented { composerStore.discardIfClean() }
+            }
             .alert(
                 "Couldn’t open this document",
                 isPresented: Binding(
@@ -350,6 +493,10 @@ struct PDFReaderView: View {
             emptyState
         }
     }
+
+    /// Used only if the PDFView is not in the hierarchy yet, which cannot happen
+    /// while a document is loaded. A visible popover beats no popover.
+    private static let fallbackAnchor = CGRect(x: 180, y: 180, width: 1, height: 1)
 
     private var emptyState: some View {
         VStack(spacing: 16) {
@@ -389,19 +536,50 @@ struct PDFReaderView: View {
 
     /// The single entry point for opening a document.
     ///
-    /// Everything that can open a file goes through here so that a document with
-    /// unsaved edits is never replaced without the user choosing what happens to
-    /// them. The model enforces the same rule; this is where the choice is
-    /// offered.
+    /// Everything that can open a file goes through here so that neither a
+    /// document with unsaved edits nor a note that is still only in the composer
+    /// is replaced without the user choosing what happens to it.
     private func requestOpen(_ url: URL) {
-        guard !model.hasUnsavedChanges else {
+        switch promptKind(for: .open(url)) {
+        case .none:
+            model.open(url: url)
+        case .draft:
+            prompt = .draftChanges(.open(url))
+        case .document:
             prompt = .unsavedChanges(.open(url))
-            return
         }
-        model.open(url: url)
     }
 
     // MARK: - Saving
+
+    /// ⌘S. The note is resolved first: a document save writes the PDF as it is,
+    /// so saving the file with a pending note would put the note's text nowhere.
+    private func requestSave() {
+        switch promptKind(for: .save) {
+        case .draft:
+            prompt = .draftChanges(.save)
+        case .none, .document:
+            performSave()
+        }
+    }
+
+    private func requestSaveAs() {
+        guard model.isLoaded else { return }
+        switch promptKind(for: .saveAs) {
+        case .draft:
+            prompt = .draftChanges(.saveAs)
+        case .none, .document:
+            presentSaveAsPanel()
+        }
+    }
+
+    private func promptKind(for action: PendingAction) -> ReaderPrompt {
+        ReaderPromptPolicy.prompt(
+            for: action.readerAction,
+            draftHasChanges: composerStore.hasUncommittedChanges,
+            documentHasChanges: model.hasUnsavedChanges
+        )
+    }
 
     /// Saves and, on failure, turns the outcome into a prompt. Returns whether
     /// the edits are known to be on disk.
@@ -480,7 +658,108 @@ struct PDFReaderView: View {
         }
     }
 
+    // MARK: - Notes
+
+    /// Starts the Add Note action: a selection becomes a note about that text,
+    /// otherwise the reader switches to placing a page note.
+    private func beginNote() {
+        guard model.canCreateNote else { return }
+
+        guard let draft = model.selectionNoteDraft() else {
+            isPlacingNote = true
+            return
+        }
+
+        isPlacingNote = false
+        let anchor = anchorResolver.containerRect(
+            forPageBounds: draft.bounds,
+            pageIndex: draft.pageIndex
+        )
+        requestCompose(.draft(draft, anchor ?? Self.fallbackAnchor))
+    }
+
+    /// Captures a page note at a click point.
+    ///
+    /// The draft comes from the model, which never looks at the text selection:
+    /// a page note created while text is still selected must not inherit it.
+    private func placePageNote(at point: CGPoint, on page: PDFPage, anchor: CGRect) {
+        guard let draft = model.pageNoteDraft(at: point, on: page) else { return }
+        isPlacingNote = false
+        requestCompose(.draft(draft, anchor))
+    }
+
+    /// Opens a composer, unless doing so would replace a draft that has text.
+    ///
+    /// Clicking another marker while a composer is open dismisses the popover
+    /// first, so this is a real path to losing typed text — the same one a save
+    /// takes, and it gets the same question.
+    private func requestCompose(_ target: PendingAction.ComposerTarget) {
+        if promptKind(for: .compose(target)) == .draft {
+            prompt = .draftChanges(.compose(target))
+            return
+        }
+        startComposer(target)
+    }
+
+    private func startComposer(_ target: PendingAction.ComposerTarget) {
+        switch target {
+        case let .draft(draft, anchor):
+            composerStore.begin(
+                mode: .create(draft),
+                anchorRect: anchor,
+                pageLabel: draft.pageLabel,
+                excerpt: draft.excerpt,
+                contents: "",
+                paper: .honey
+            )
+        case let .note(note, anchor):
+            composerStore.begin(
+                mode: .edit(note),
+                anchorRect: anchor,
+                pageLabel: note.pageLabel,
+                excerpt: note.excerpt,
+                contents: note.contents,
+                paper: note.paperColor
+            )
+        }
+    }
+
     // MARK: - Annotation menu
+
+    /// Right-click actions for the click that opened the menu.
+    ///
+    /// Note items come first because a marker is a small target on top of the
+    /// page; the markup items keep their existing order and behaviour.
+    private func pageMenuItems(for context: PageMenuContext) -> [NSMenuItem] {
+        var items: [NSMenuItem] = []
+
+        if let note = context.note {
+            let anchor = context.anchorRect
+            items.append(MarkupActionMenuItem(title: "Edit Note") { [note] in
+                isPlacingNote = false
+                requestCompose(.note(note, anchor))
+            })
+            if model.notePermissions(for: note).canDelete {
+                items.append(MarkupActionMenuItem(title: "Delete Note") { [note] in
+                    _ = model.deleteNote(note)
+                })
+            }
+        } else if model.canCreateNote {
+            let point = context.pagePoint
+            let page = context.page
+            let anchor = context.anchorRect
+            items.append(MarkupActionMenuItem(title: "Add Note Here") {
+                placePageNote(at: point, on: page, anchor: anchor)
+            })
+        }
+
+        let markup = markupMenuItems()
+        if !items.isEmpty, !markup.isEmpty {
+            items.append(.separator())
+        }
+        items.append(contentsOf: markup)
+        return items
+    }
 
     /// Right-click actions for the selected markup.
     ///
@@ -539,23 +818,156 @@ struct PDFReaderView: View {
 
     // MARK: - Unsaved changes
 
+    /// Everything this window would lose if it closed without asking.
+    ///
+    /// Read live by the close guard, so a draft edit is visible to the quit
+    /// coordinator without the model knowing that a composer exists.
+    private var unsavedWork: UnsavedWork {
+        UnsavedWork(
+            documentRevision: model.editRevision,
+            draftRevision: composerStore.revision,
+            documentHasChanges: model.hasUnsavedChanges,
+            draftHasChanges: composerStore.hasUncommittedChanges
+        )
+    }
+
     private func handleCloseIntent(_ intent: WindowCloseGuard.Intent) {
         switch intent {
         case .windowClose:
-            prompt = .unsavedChanges(.closeWindow)
+            switch promptKind(for: .closeWindow) {
+            case .draft:
+                prompt = .draftChanges(.closeWindow)
+            case .document:
+                prompt = .unsavedChanges(.closeWindow)
+            case .none:
+                // The guard only asks when something is unsaved, so this is only
+                // reachable if the draft was resolved between the two reads.
+                perform(.closeWindow)
+            }
         case .quit:
-            prompt = .unsavedChanges(.quit)
+            // The coordinator knows which half of the window is still
+            // unanswered. A draft that was already approved for this attempt is
+            // not asked about again.
+            showQuitPrompt(for: QuitSession.coordinator.confirmationNeed(for: closeGuard))
         }
     }
 
+    /// Continues the current quit attempt from whatever the coordinator says is
+    /// still unanswered, or asks AppKit to terminate once nothing is left.
+    private func continueQuit() {
+        showQuitPrompt(for: QuitSession.coordinator.confirmationNeed(for: closeGuard))
+    }
+
+    private func showQuitPrompt(for need: QuitConfirmationNeed) {
+        switch need {
+        case .draft:
+            prompt = .draftChanges(.quit)
+        case .document:
+            prompt = .unsavedChanges(.quit)
+        case .none:
+            perform(.quit)
+        }
+    }
+
+    // MARK: - The draft prompt
+
+    /// "Save Note": the note goes into the in-memory document, and only then
+    /// does the interrupted action continue.
+    ///
+    /// A failed note save stops here. Continuing would let the next step save or
+    /// reload the document, and the text that could not be written would be the
+    /// only copy left.
+    private func saveDraftThen(_ action: PendingAction) {
+        prompt = nil
+        switch composerStore.commit(using: model) {
+        case let .failure(error):
+            // A failed note save stops the quit before termination is
+            // requested. Approvals collected from other windows belong to an
+            // attempt that is no longer running, so they must not survive into
+            // the next ⌘Q.
+            if action == .quit { QuitSession.coordinator.cancel() }
+            prompt = .saveProblem(
+                title: "Couldn’t save the note",
+                message: (error.errorDescription ?? "The note was not saved.")
+                    + " Your text is still here.",
+                offersSaveAs: false
+            )
+        case .success:
+            if action == .quit {
+                continueQuit()
+            } else {
+                proceed(afterDraft: action)
+            }
+        }
+    }
+
+    /// "Discard Draft": the typed text is dropped by an explicit choice, and the
+    /// interrupted action continues.
+    ///
+    /// Quit is the exception. The window stays open while the other windows are
+    /// asked, so ending the draft here would lose text the user only agreed to
+    /// discard for an attempt that may still be cancelled. The coordinator
+    /// records the intent and ends the draft in `commit`, after termination is
+    /// actually allowed.
+    private func discardDraftThen(_ action: PendingAction) {
+        prompt = nil
+        switch QuitSession.coordinator.resolveDraftDiscard(
+            for: action.readerAction,
+            of: closeGuard
+        ) {
+        case .endedNow:
+            composerStore.end()
+            proceed(afterDraft: action)
+        case let .deferredUntilQuitCommit(need):
+            showQuitPrompt(for: need)
+        }
+    }
+
+    private func cancel(_ action: PendingAction) {
+        prompt = nil
+        if action == .quit { QuitSession.coordinator.cancel() }
+        // The prompt never closed the composer, but the alert may have dismissed
+        // the popover on its way in. Put it back: the draft is still there.
+        if composerStore.hasSession { composerStore.isPresented = true }
+    }
+
+    /// Continues an action once the draft is out of the way.
+    ///
+    /// Saving the note makes the document dirty, so the action that was
+    /// interrupted still has to go through the ordinary unsaved-changes prompt —
+    /// "Save Note" is not "the file is saved".
+    private func proceed(afterDraft action: PendingAction) {
+        switch ReaderPromptPolicy.promptAfterDraft(
+            for: action.readerAction,
+            documentHasChanges: model.hasUnsavedChanges
+        ) {
+        case .document:
+            prompt = .unsavedChanges(action)
+        case .draft:
+            break
+        case .none:
+            perform(action)
+        }
+    }
+
+    // MARK: - The document prompt
+
     private func saveThen(_ action: PendingAction) {
         prompt = nil
+        // A deferred draft is still on screen because the user answered the
+        // draft prompt with "Discard Draft". Saving the document changes the
+        // document's revision, not the draft, so the same decision has to be
+        // rebound to the new revisions before termination is retried.
+        let keptDeferredDraft = action == .quit && composerStore.hasUncommittedChanges
         guard performSave() else {
             // A failed save stops the quit before termination is requested.
             // Any "Don't Save" answers collected from other windows belong to
             // an attempt that is no longer running, so they must not survive.
             if action == .quit { QuitSession.coordinator.cancel() }
             return
+        }
+        if keptDeferredDraft {
+            QuitSession.coordinator.approveDraftDiscard(of: closeGuard)
         }
         perform(action)
     }
@@ -576,10 +988,16 @@ struct PDFReaderView: View {
             closeGuard.closeNow()
         case .quit:
             // The window stays open and keeps its dirty state: this records the
-            // answer for the quit that is still in progress. The edits are only
-            // abandoned once every dirty window has answered, in `commit`.
-            QuitSession.coordinator.approveDiscard(of: closeGuard)
+            // document answer for the quit that is still in progress. The edits
+            // are only abandoned once every dirty window has answered, in
+            // `commit`. The draft approval, if any, is kept separately and
+            // remains bound to its own revision.
+            QuitSession.coordinator.approveDocumentDiscard(of: closeGuard)
             perform(action)
+        case .save, .saveAs, .compose:
+            // These never reach the document prompt: saving resolves it, and
+            // composing is not a document-level action.
+            break
         }
     }
 
@@ -587,10 +1005,16 @@ struct PDFReaderView: View {
         switch action {
         case let .open(url):
             model.open(url: url)
+        case .save:
+            performSave()
+        case .saveAs:
+            presentSaveAsPanel()
         case .closeWindow:
             closeGuard.closeNow()
         case .quit:
             NSApp.terminate(nil)
+        case let .compose(target):
+            startComposer(target)
         }
     }
 }

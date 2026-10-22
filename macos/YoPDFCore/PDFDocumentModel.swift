@@ -70,6 +70,13 @@ public final class PDFDocumentModel: ObservableObject {
     @Published public internal(set) var annotationRevision = 0
     /// Pages affected by the latest `annotationRevision`, sorted.
     public internal(set) var changedAnnotationPageIndices: [Int] = []
+    /// The note markers the page overlays draw.
+    ///
+    /// Derived from the document rather than stored separately: a marker exists
+    /// exactly when a visible standard `/Text` annotation exists. Recomputed
+    /// after every annotation edit and after the document is replaced, so a
+    /// marker cannot outlive its annotation.
+    @Published public internal(set) var noteMarkers: [NoteMarker] = []
     /// Whether the current document has an undoable markup edit.
     @Published public internal(set) var canUndoMarkup = false
     @Published public internal(set) var canRedoMarkup = false
@@ -211,6 +218,7 @@ public final class PDFDocumentModel: ObservableObject {
         editRevision &+= 1
         currentSelection = nil
         resetMarkupState()
+        noteMarkers = []
         loadGeneration &+= 1
     }
 
@@ -231,6 +239,7 @@ public final class PDFDocumentModel: ObservableObject {
         editRevision &+= 1
         currentSelection = nil
         resetMarkupState()
+        refreshNoteMarkers()
         title = Self.resolvedTitle(for: document, fileURL: fileURL)
         loadGeneration &+= 1
     }
@@ -273,6 +282,7 @@ public final class PDFDocumentModel: ObservableObject {
         resetMarkupState()
         changedAnnotationPageIndices = Array(0..<newDocument.pageCount)
         annotationRevision &+= 1
+        refreshNoteMarkers()
         title = Self.resolvedTitle(for: newDocument, fileURL: fileURL)
     }
 

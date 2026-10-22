@@ -5,16 +5,16 @@ built natively for each platform. **Your PDF. Your way.**
 
 YoPDF is in early development. The repository currently contains the macOS
 reader: opening a local PDF, continuous scrolling, page navigation, zoom, and
-standard PDF Highlight/Underline annotations with manual save. Search and
+standard PDF Highlight/Underline/Note annotations with manual save. Search and
 AI-assisted reading are not implemented yet.
 
 ## Status
 
 | Area | State |
 | --- | --- |
-| macOS app (SwiftUI + AppKit + PDFKit) | Reader with editable Highlight/Underline annotations |
-| Unit tests | 158 logic tests |
-| Annotations | Standard `/Highlight` and `/Underline`: selection, colours, recolour, delete, convert, Undo/Redo |
+| macOS app (SwiftUI + AppKit + PDFKit) | Reader with editable Highlight/Underline and standard `/Text` notes |
+| Unit tests | 209 logic tests |
+| Annotations | Standard `/Highlight`, `/Underline` and `/Text`: selection, colours, recolour, delete, convert, notes, Undo/Redo |
 | Windows (WinUI 3 + PDFium) | Feasibility work, not in this repository yet |
 | AI / agent integration | Not started |
 
