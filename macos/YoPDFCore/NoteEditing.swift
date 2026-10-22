@@ -235,11 +235,15 @@ extension PDFDocumentModel {
             ))
         }
         if oldStyle != style {
+            // An explicit style change is the documented adoption point for a
+            // third-party note; a body-only edit leaves it native. The snapshot
+            // also records the original `/C` and which keys did not exist, so
+            // Undo removes the identity and restores the native presentation.
             changes.append(.setNoteStyle(
                 annotation: note.annotation,
                 pageIndex: note.pageIndex,
-                from: oldStyle,
-                to: style
+                from: NoteService.styleSnapshot(of: note.annotation),
+                to: NoteService.styledSnapshot(for: style, on: note.annotation)
             ))
         }
 

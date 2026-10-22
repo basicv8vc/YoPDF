@@ -44,7 +44,7 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (234)
+./scripts/test.sh                     # unit tests (238)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
@@ -368,6 +368,8 @@ database — the saved PDF is the whole document.
   `PDFDocument` with its body, tint and rectangle, and a `/Text` annotation
   created by another application (no YoPDF keys at all) can be read, edited and
   deleted here; its highlight and square neighbours survive the round trip.
+  An untouched third-party note keeps PDFKit's native icon and native hit
+  target. Restyling it through YoPDF adopts it explicitly (see P2d below).
   Apple Preview reads the body from `/Contents`. That was checked by inspecting
   the written annotation dictionary and by reopening the file in a separate
   PDFKit process, not by watching Preview's window.
@@ -383,16 +385,33 @@ database — the saved PDF is the whole document.
   `crop.minX + x * crop.width`, `crop.minY + y * crop.height`. Rendering, hit
   testing and the popover all use `NoteService.markerCenter` and
   `NoteService.displayBounds`, so they cannot disagree.
+- **`/YoPDFNoteIdentity` is the ownership marker**, currently
+  `yopdf-note-1`. New notes write it. A note is recognised as YoPDF only when
+  that key is present, or when the legacy PR #6 keys (`/YoPDFNotePaper`,
+  `/YoPDFNotePageLevel`) are present. `/NM` is dropped by PDFKit, and
+  `userName`, `/C` and the body are never used to infer ownership. Recognition
+  is read-only: opening a PR #6 file does not add the identity key.
+- **Third-party `/Text` notes keep their native icon.** Only recognised YoPDF
+  notes enter `noteMarkers` and get the custom sticker card. An untouched
+  third-party note uses its own annotation rectangle for hit testing, not an
+  invisible 44×44 card, and its popover points at the native icon.
+- **Restyling a third-party note is the adoption point.** A body-only edit
+  leaves it native. An explicit motif or palette change writes
+  `/YoPDFNoteIdentity` and `/YoPDFNoteStyle` in the same `MarkupEdit`, so the
+  note becomes YoPDF-styled. That edit carries an exact before/after snapshot
+  (including the original `/C` and which keys were absent), so Undo removes the
+  new keys and returns the note to its native icon and hit target.
 - **`/Contents` remains the body.** `/YoPDFNotePaper` and `/C` stay in sync with
   the palette, so a PR #6 build or another reader still sees the right tint.
   Losing the style key costs the motif and tint, never the text.
 - **Fallbacks are deliberate.** A missing or malformed style key becomes
   `plain` + the legacy paper. An unknown motif ID becomes `plain`; an unknown
   palette uses the legacy paper. None of these rewrites the file on open.
-- **Existing notes are not migrated.** A PR #6 or third-party note keeps its
-  `/Rect` centre and gains no anchor; only a note created by this build writes
-  the 24×24 `/Rect` + normalized anchor. PDFKit may still rewrite an old
-  `/Rect` on save, which is the pre-existing one-point drift, not a migration.
+- **Existing notes are not migrated on open.** A PR #6 note keeps its `/Rect`
+  centre and gains no anchor or identity key; only a note created by this build
+  writes the 24×24 `/Rect` + normalized anchor. A third-party note is not
+  touched at all. PDFKit may still rewrite an old `/Rect` on save, which is the
+  pre-existing one-point drift, not a migration.
 - **One Save is one Undo entry.** Body, motif and palette changes are packaged
   in one `MarkupEdit`; Undo restores the whole prior style. LockedContents
   permits a style change and refuses the body; ReadOnly and Locked refuse both.
@@ -570,6 +589,12 @@ System Events / Preview and `qlmanage -t` are all blocked here):
 29. With a LockedContents note, change the motif: Save succeeds and the body is
     unchanged; try to change the body: it is refused. With ReadOnly/Locked, the
     motif and palette controls are disabled.
+30. Open a PDF with a third-party `/Text` note that has no YoPDF keys: it must
+    show PDFKit's native icon, not a sticker card. Clicking the icon opens the
+    composer; clicking just outside the native rectangle must not hit it.
+31. In that third-party note, change only the body and Save: the native icon
+    must remain. Reopen it, change the motif or palette and Save: it becomes a
+    sticker note; ⌘Z must return it to the native icon and original colour.
 
 `YoPDFCore` is a framework so tests are pure logic tests: they link the module
 and never launch the app, so no window server or accessibility permission is

@@ -307,26 +307,33 @@ final class NoteStickerStyleTests: XCTestCase {
 
     // MARK: - Third-party metadata
 
-    func testThirdPartyMetadataIsPreservedAndNoAnchorIsInvented() throws {
+    func testThirdPartyMetadataIsPreservedWhenExplicitStyleAdoptsIt() throws {
         let url = try makeHandBuiltNoteFixture(
             contents: "Vendor note",
             paper: nil,
             vendorMetadata: "keep-me"
         )
         let model = openModel(at: url)
-        let note = try textNote(on: 0, in: model.document ?? PDFDocument())
+        let page = try XCTUnwrap(model.document?.page(at: 0))
+        let note = try textNote(on: 0, in: try XCTUnwrap(model.document))
+        XCTAssertFalse(NoteService.isYoPDFNote(note))
+        XCTAssertTrue(model.noteMarkers.isEmpty)
+
         let selection = try XCTUnwrap(model.noteSelection(
             at: CGPoint(x: note.bounds.midX, y: note.bounds.midY),
-            on: try XCTUnwrap(model.document?.page(at: 0))
+            on: page
         ))
+        XCTAssertEqual(selection.bounds, note.bounds, "the native icon is the hit target")
 
-        guard case .success = model.updateNote(
+        guard case let .success(adopted) = model.updateNote(
             selection,
             contents: "Vendor note edited",
             style: NoteStickerStyle(motif: .cherry, palette: .honey)
         ) else {
             return XCTFail("a standard third-party note must be editable")
         }
+        XCTAssertTrue(adopted.isYoPDFNote, "an explicit style change adopts the note")
+        XCTAssertEqual(model.noteMarkers.count, 1)
         XCTAssertEqual(model.save(), .saved)
 
         let reopened = try XCTUnwrap(PDFDocument(url: url))
@@ -340,8 +347,137 @@ final class NoteStickerStyleTests: XCTestCase {
             reopenedNote.value(forAnnotationKey: NoteService.anchorXKey),
             "an existing note must not be silently migrated to an anchor"
         )
+        XCTAssertEqual(
+            reopenedNote.value(forAnnotationKey: NoteService.identityKey) as? String,
+            NoteService.identityValue
+        )
         XCTAssertEqual(reopenedNote.contents, "Vendor note edited")
         XCTAssertEqual(NoteService.style(of: reopenedNote), NoteStickerStyle(motif: .cherry, palette: .honey))
+    }
+
+    func testNewNoteIdentityMarkerSurvivesSaveAndReopen() throws {
+        let url = try makeFixture()
+        let model = openModel(at: url)
+        try addPageNote(
+            to: model,
+            contents: "Owned note",
+            style: NoteStickerStyle(motif: .cat, palette: .sky)
+        )
+        let note = try textNote(on: 0, in: try XCTUnwrap(model.document))
+        XCTAssertTrue(NoteService.isYoPDFNote(note))
+        XCTAssertEqual(
+            note.value(forAnnotationKey: NoteService.identityKey) as? String,
+            NoteService.identityValue
+        )
+        XCTAssertEqual(model.noteMarkers.count, 1)
+
+        XCTAssertEqual(model.save(), .saved)
+        let reopened = try XCTUnwrap(PDFDocument(url: url))
+        let reopenedNote = try textNote(on: 0, in: reopened)
+        XCTAssertTrue(NoteService.isYoPDFNote(reopenedNote))
+        XCTAssertEqual(
+            reopenedNote.value(forAnnotationKey: NoteService.identityKey) as? String,
+            NoteService.identityValue
+        )
+    }
+
+    func testPR6NoteIsRecognizedWithoutBeingRewrittenOnOpen() throws {
+        let url = try makeHandBuiltNoteFixture(contents: "PR #6 note", paper: .mint)
+        let model = openModel(at: url)
+        let note = try textNote(on: 0, in: try XCTUnwrap(model.document))
+
+        XCTAssertTrue(NoteService.isYoPDFNote(note), "PR #6 paper/page-level keys identify the note")
+        XCTAssertNil(note.value(forAnnotationKey: NoteService.identityKey))
+        XCTAssertEqual(model.noteMarkers.count, 1, "a PR #6 note keeps its custom marker")
+
+        XCTAssertEqual(model.save(), .saved)
+        let reopened = try XCTUnwrap(PDFDocument(url: url))
+        let reopenedNote = try textNote(on: 0, in: reopened)
+        XCTAssertNil(
+            reopenedNote.value(forAnnotationKey: NoteService.identityKey),
+            "opening must not migrate the note"
+        )
+        XCTAssertTrue(NoteService.isYoPDFNote(reopenedNote))
+    }
+
+    func testUntouchedThirdPartyNoteKeepsNativeIconAndNativeHitTarget() throws {
+        let bounds = CGRect(x: 300, y: 400, width: 24, height: 24)
+        let url = try makeHandBuiltNoteFixture(
+            bounds: bounds,
+            contents: "Vendor note",
+            vendorMetadata: "keep-me"
+        )
+        let model = openModel(at: url)
+        let page = try XCTUnwrap(model.document?.page(at: 0))
+        let note = try textNote(on: 0, in: try XCTUnwrap(model.document))
+
+        XCTAssertFalse(NoteService.isYoPDFNote(note))
+        XCTAssertTrue(model.noteMarkers.isEmpty, "no custom sticker overlay for a third-party note")
+
+        let center = CGPoint(x: note.bounds.midX, y: note.bounds.midY)
+        let selection = try XCTUnwrap(model.noteSelection(at: center, on: page))
+        XCTAssertFalse(selection.isYoPDFNote)
+        XCTAssertEqual(selection.bounds, note.bounds)
+        XCTAssertNotNil(
+            model.noteSelection(at: CGPoint(x: center.x + 10, y: center.y), on: page),
+            "a point inside the native bounds must still open the note"
+        )
+        XCTAssertNil(
+            model.noteSelection(at: CGPoint(x: center.x + 18, y: center.y), on: page),
+            "the invisible 44×44 YoPDF card must not extend the hit target"
+        )
+    }
+
+    func testExplicitRestyleAdoptsThirdPartyAndUndoRestoresNativePresentation() throws {
+        let url = try makeHandBuiltNoteFixture(
+            bounds: CGRect(x: 300, y: 400, width: 24, height: 24),
+            contents: "Vendor note"
+        )
+        let model = openModel(at: url)
+        let page = try XCTUnwrap(model.document?.page(at: 0))
+        let note = try textNote(on: 0, in: try XCTUnwrap(model.document))
+        let originalColor = NSColor(srgbRed: 0.9, green: 0.2, blue: 0.1, alpha: 1)
+        note.color = originalColor
+
+        let selection = try XCTUnwrap(model.noteSelection(
+            at: CGPoint(x: note.bounds.midX, y: note.bounds.midY),
+            on: page
+        ))
+        XCTAssertFalse(selection.isYoPDFNote)
+
+        guard case let .success(adopted) = model.updateNote(
+            selection,
+            contents: "Vendor note",
+            style: NoteStickerStyle(motif: .bunny, palette: .rose)
+        ) else {
+            return XCTFail("the explicit style change must succeed")
+        }
+        XCTAssertTrue(adopted.isYoPDFNote)
+        XCTAssertEqual(adopted.bounds.width, NoteService.markerDisplaySize, accuracy: 0.01)
+        XCTAssertEqual(model.noteMarkers.count, 1)
+        XCTAssertEqual(
+            note.value(forAnnotationKey: NoteService.identityKey) as? String,
+            NoteService.identityValue
+        )
+
+        XCTAssertTrue(model.undoMarkup())
+        let restored = try textNote(on: 0, in: try XCTUnwrap(model.document))
+        XCTAssertFalse(NoteService.isYoPDFNote(restored), "Undo returns the note to third-party ownership")
+        XCTAssertNil(restored.value(forAnnotationKey: NoteService.identityKey))
+        XCTAssertNil(restored.value(forAnnotationKey: NoteService.styleKey))
+        XCTAssertNil(restored.value(forAnnotationKey: NoteService.paperColorKey))
+        XCTAssertTrue(restored.color.isEqual(originalColor), "the original /C colour is restored")
+        XCTAssertTrue(model.noteMarkers.isEmpty)
+        let center = CGPoint(x: restored.bounds.midX, y: restored.bounds.midY)
+        XCTAssertNil(
+            model.noteSelection(at: CGPoint(x: center.x + 18, y: center.y), on: page),
+            "the native hit target is back after Undo"
+        )
+
+        XCTAssertTrue(model.redoMarkup())
+        let redone = try textNote(on: 0, in: try XCTUnwrap(model.document))
+        XCTAssertTrue(NoteService.isYoPDFNote(redone))
+        XCTAssertEqual(model.noteMarkers.count, 1)
     }
 
     // MARK: - Marker position

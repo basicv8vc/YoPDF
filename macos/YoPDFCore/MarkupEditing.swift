@@ -26,16 +26,19 @@ enum MarkupEditChange {
         from: String?,
         to: String?
     )
-    /// A note appearance change: motif and paper palette as one value.
+    /// A note appearance change, including ownership of the presentation.
     ///
-    /// It writes `/C`, `/YoPDFNotePaper` and `/YoPDFNoteStyle`, none of which is
-    /// `/Contents`. LockedContents therefore permits it and Locked/ReadOnly do
-    /// not. Undo restores the complete prior style, not just the tint.
+    /// The snapshots record which YoPDF keys existed and the exact `/C` colour,
+    /// so Undo can remove keys the edit introduced. That makes adopting a
+    /// third-party note reversible: its native icon and native hit target come
+    /// back instead of becoming a YoPDF Simple Paper note. None of these keys is
+    /// `/Contents`, so LockedContents permits the edit and Locked/ReadOnly do
+    /// not.
     case setNoteStyle(
         annotation: PDFAnnotation,
         pageIndex: Int,
-        from: NoteStickerStyle,
-        to: NoteStickerStyle
+        from: NoteStyleSnapshot,
+        to: NoteStyleSnapshot
     )
 
     var pageIndex: Int {
@@ -484,7 +487,7 @@ extension PDFDocumentModel {
             case let .setContents(annotation, _, from, to):
                 NoteService.setContents(forward ? to : from, on: annotation)
             case let .setNoteStyle(annotation, _, from, to):
-                NoteService.setStyle(forward ? to : from, on: annotation)
+                NoteService.applyStyleSnapshot(forward ? to : from, to: annotation)
             }
         }
 
