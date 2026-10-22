@@ -81,17 +81,33 @@ public struct NoteDraft: Equatable, Identifiable {
 }
 
 /// What the page overlay needs to draw one marker.
+///
+/// `center` is the persisted anchor in page space; `bounds` is the fixed-size
+/// card the overlay draws around it. The annotation's own `/Rect` is not used
+/// once an anchor exists, because PDFKit may rewrite it on the first save.
 public struct NoteMarker: Identifiable, Equatable {
     public let id: ObjectIdentifier
     public let pageIndex: Int
+    /// The sticker centre in page space.
+    public let center: CGPoint
+    /// The sticker card in page space, clamped into the CropBox.
     public let bounds: CGRect
-    public let paperColor: NotePaperColor
+    public let style: NoteStickerStyle
 
-    init(annotation: PDFAnnotation, pageIndex: Int, bounds: CGRect, paperColor: NotePaperColor) {
+    public var paperColor: NotePaperColor { style.palette }
+
+    init(
+        annotation: PDFAnnotation,
+        pageIndex: Int,
+        center: CGPoint,
+        bounds: CGRect,
+        style: NoteStickerStyle
+    ) {
         self.id = ObjectIdentifier(annotation)
         self.pageIndex = pageIndex
+        self.center = center
         self.bounds = bounds
-        self.paperColor = paperColor
+        self.style = style
     }
 }
 
@@ -101,11 +117,16 @@ public struct NoteMarker: Identifiable, Equatable {
 /// behind the model's back; every edit goes through `PDFDocumentModel`.
 public struct NoteSelection: Identifiable, Equatable {
     public let pageIndex: Int
+    /// The sticker card in page space, used to anchor the popover.
     public let bounds: CGRect
+    /// The sticker centre in page space.
+    public let center: CGPoint
     public let contents: String
-    public let paperColor: NotePaperColor
+    public let style: NoteStickerStyle
     public let excerpt: String?
     public let isPageLevel: Bool
+
+    public var paperColor: NotePaperColor { style.palette }
 
     let annotation: PDFAnnotation
 
@@ -118,16 +139,18 @@ public struct NoteSelection: Identifiable, Equatable {
         annotation: PDFAnnotation,
         pageIndex: Int,
         bounds: CGRect,
+        center: CGPoint,
         contents: String,
-        paperColor: NotePaperColor,
+        style: NoteStickerStyle,
         excerpt: String?,
         isPageLevel: Bool
     ) {
         self.annotation = annotation
         self.pageIndex = pageIndex
         self.bounds = bounds
+        self.center = center
         self.contents = contents
-        self.paperColor = paperColor
+        self.style = style
         self.excerpt = excerpt
         self.isPageLevel = isPageLevel
     }
@@ -136,8 +159,9 @@ public struct NoteSelection: Identifiable, Equatable {
         lhs.annotation === rhs.annotation
             && lhs.pageIndex == rhs.pageIndex
             && lhs.bounds == rhs.bounds
+            && lhs.center == rhs.center
             && lhs.contents == rhs.contents
-            && lhs.paperColor == rhs.paperColor
+            && lhs.style == rhs.style
             && lhs.excerpt == rhs.excerpt
             && lhs.isPageLevel == rhs.isPageLevel
     }
@@ -181,7 +205,11 @@ public struct NotePermissions: Equatable, Sendable {
 @MainActor
 public enum NoteService {
 
-    public static let markerSize: CGFloat = 22
+    /// The minimum `/Text` rectangle PDFKit keeps after serialization.
+    public static let markerSize: CGFloat = 24
+    /// The visible sticker card. It is larger than `/Rect` on purpose: it covers
+    /// PDFKit's native note icon and gives the artwork room to breathe.
+    public static let markerDisplaySize: CGFloat = 40
     /// The custom keys are deliberately namespaced and optional.
     ///
     /// PDF annotation keys are written with their leading slash, exactly like
@@ -190,6 +218,11 @@ public enum NoteService {
     static let paperColorKey = PDFAnnotationKey(rawValue: "/YoPDFNotePaper")
     static let excerptKey = PDFAnnotationKey(rawValue: "/YoPDFNoteExcerpt")
     static let pageLevelKey = PDFAnnotationKey(rawValue: "/YoPDFNotePageLevel")
+    /// Versioned sticker style. `/Contents` remains the only body storage.
+    static let styleKey = PDFAnnotationKey(rawValue: "/YoPDFNoteStyle")
+    /// Anchor normalized to the page's CropBox, in 0...1.
+    static let anchorXKey = PDFAnnotationKey(rawValue: "/YoPDFNoteAnchorX")
+    static let anchorYKey = PDFAnnotationKey(rawValue: "/YoPDFNoteAnchorY")
 
     public static func isTextAnnotation(_ annotation: PDFAnnotation) -> Bool {
         guard let type = annotation.type else { return false }
@@ -230,27 +263,126 @@ public enum NoteService {
         return excerpt(of: annotation) == nil
     }
 
-    /// Marker geometry in page space.
+    /// The note's appearance, with PR #6 compatibility.
+    ///
+    /// A note written before this build has no `/YoPDFNoteStyle`; it is shown as
+    /// Simple Paper on its existing paper tint. A value that is not a JSON
+    /// object is treated the same way. An unknown motif becomes `plain` without
+    /// rewriting the file, so merely opening a document cannot change it.
+    public static func style(of annotation: PDFAnnotation) -> NoteStickerStyle {
+        let legacyPaper = paperColor(of: annotation)
+        guard let raw = annotation.value(forAnnotationKey: styleKey) as? String,
+              let style = NoteStickerStyle(serialized: raw, paletteFallback: legacyPaper)
+        else {
+            return NoteStickerStyle(motif: .plain, palette: legacyPaper)
+        }
+        return style
+    }
+
+    /// Writes the full appearance in one place.
+    ///
+    /// `/YoPDFNotePaper` and `/C` are kept in sync so older YoPDF builds and
+    /// standard readers still show the right tint if they ignore the new key.
+    public static func setStyle(_ style: NoteStickerStyle, on annotation: PDFAnnotation) {
+        annotation.color = style.palette.color
+        _ = annotation.setValue(style.serialized, forAnnotationKey: styleKey)
+        _ = annotation.setValue(style.palette.rawValue, forAnnotationKey: paperColorKey)
+        annotation.modificationDate = Date()
+    }
+
+    private static func normalizedAnchor(
+        of annotation: PDFAnnotation,
+        key: PDFAnnotationKey
+    ) -> CGFloat? {
+        guard let number = annotation.value(forAnnotationKey: key) as? NSNumber else {
+            return nil
+        }
+        let value = number.doubleValue
+        guard value.isFinite else { return nil }
+        return CGFloat(min(max(value, 0), 1))
+    }
+
+    /// The sticker centre in page space.
+    ///
+    /// The normalized anchor wins when present. Otherwise the annotation's
+    /// current `/Rect` centre is used, which is the only geometry a PR #6 or
+    /// third-party note has. That fallback may move by a point after PDFKit
+    /// rewrites `/Rect` on the first save; a note created by this build has an
+    /// anchor and does not drift at all.
+    public static func markerCenter(
+        of annotation: PDFAnnotation,
+        on page: PDFPage
+    ) -> CGPoint {
+        let crop = page.bounds(for: .cropBox)
+        if crop.width > 0, crop.height > 0,
+           let x = normalizedAnchor(of: annotation, key: anchorXKey),
+           let y = normalizedAnchor(of: annotation, key: anchorYKey) {
+            return CGPoint(
+                x: crop.minX + x * crop.width,
+                y: crop.minY + y * crop.height
+            )
+        }
+
+        let rect = annotation.bounds
+        if rect.width.isFinite, rect.height.isFinite,
+           rect.origin.x.isFinite, rect.origin.y.isFinite,
+           rect.width > 1, rect.height > 1 {
+            return CGPoint(x: rect.midX, y: rect.midY)
+        }
+        return CGPoint(x: crop.midX, y: crop.midY)
+    }
+
+    /// Persists the marker centre as a CropBox-relative point.
+    ///
+    /// Called only when a note is created (and later, by the dragging PR). An
+    /// existing note is never backfilled: doing so during load or save would
+    /// freeze a position the user never chose.
+    public static func setAnchor(
+        _ point: CGPoint,
+        on annotation: PDFAnnotation,
+        page: PDFPage
+    ) {
+        let crop = page.bounds(for: .cropBox)
+        guard crop.width > 0, crop.height > 0,
+              point.x.isFinite, point.y.isFinite
+        else { return }
+
+        let x = min(max((point.x - crop.minX) / crop.width, 0), 1)
+        let y = min(max((point.y - crop.minY) / crop.height, 0), 1)
+        _ = annotation.setValue(NSNumber(value: Double(x)), forAnnotationKey: anchorXKey)
+        _ = annotation.setValue(NSNumber(value: Double(y)), forAnnotationKey: anchorYKey)
+    }
+
+    /// The sticker card in page space, clamped into the page.
+    public static func displayBounds(center: CGPoint, in pageBounds: CGRect) -> CGRect {
+        let half = markerDisplaySize / 2
+        let minX = pageBounds.minX + half + 2
+        let maxX = pageBounds.maxX - half - 2
+        let minY = pageBounds.minY + half + 2
+        let maxY = pageBounds.maxY - half - 2
+
+        let centerX = minX <= maxX ? min(max(center.x, minX), maxX) : pageBounds.midX
+        let centerY = minY <= maxY ? min(max(center.y, minY), maxY) : pageBounds.midY
+        return CGRect(
+            x: centerX - half,
+            y: centerY - half,
+            width: markerDisplaySize,
+            height: markerDisplaySize
+        )
+    }
+
+    /// The marker card in page space.
     ///
     /// A malformed third-party note with an empty rectangle still gets a
-    /// visible marker at the page centre rather than disappearing entirely.
+    /// visible card at the page centre rather than disappearing entirely.
     public static func resolvedBounds(
         for annotation: PDFAnnotation,
         on page: PDFPage
     ) -> CGRect {
-        let bounds = annotation.bounds
-        guard bounds.width.isFinite, bounds.height.isFinite,
-              bounds.width > 1, bounds.height > 1
-        else {
-            return markerBounds(
-                center: CGPoint(
-                    x: page.bounds(for: .cropBox).midX,
-                    y: page.bounds(for: .cropBox).midY
-                ),
-                in: page.bounds(for: .cropBox)
-            )
-        }
-        return bounds
+        displayBounds(
+            center: markerCenter(of: annotation, on: page),
+            in: page.bounds(for: .cropBox)
+        )
     }
 
     public static func selection(
@@ -263,12 +395,14 @@ public enum NoteService {
               page.document != nil
         else { return nil }
 
+        let center = markerCenter(of: annotation, on: page)
         return NoteSelection(
             annotation: annotation,
             pageIndex: pageIndex,
-            bounds: resolvedBounds(for: annotation, on: page),
+            bounds: displayBounds(center: center, in: page.bounds(for: .cropBox)),
+            center: center,
             contents: annotation.contents ?? "",
-            paperColor: paperColor(of: annotation),
+            style: style(of: annotation),
             excerpt: excerpt(of: annotation),
             isPageLevel: isPageLevel(annotation)
         )
@@ -284,22 +418,26 @@ public enum NoteService {
             guard let page = document.page(at: pageIndex) else { continue }
             for annotation in page.annotations where isTextAnnotation(annotation) {
                 guard annotation.shouldDisplay else { continue }
+                let center = markerCenter(of: annotation, on: page)
                 markers.append(NoteMarker(
                     annotation: annotation,
                     pageIndex: pageIndex,
-                    bounds: resolvedBounds(for: annotation, on: page),
-                    paperColor: paperColor(of: annotation)
+                    center: center,
+                    bounds: displayBounds(
+                        center: center,
+                        in: page.bounds(for: .cropBox)
+                    ),
+                    style: style(of: annotation)
                 ))
             }
         }
         return markers
     }
 
-    /// The click target is slightly larger than the drawn marker so a small
-    /// third-party note is still comfortable to hit.
+    /// The click target is the drawn card, slightly enlarged for comfort.
     public static func hitRect(for annotation: PDFAnnotation, on page: PDFPage) -> CGRect {
         resolvedBounds(for: annotation, on: page)
-            .insetBy(dx: -4, dy: -4)
+            .insetBy(dx: -2, dy: -2)
     }
 
     public static func hitTest(
@@ -389,13 +527,19 @@ public enum NoteService {
 
     // MARK: - Creating
 
+    /// Creates the standard `/Text` annotation for a draft.
+    ///
+    /// The `/Rect` is already at PDFKit's 24×24 minimum, and the real position
+    /// is written as a CropBox-relative anchor in the same step. A page is
+    /// required because the anchor is normalized against its CropBox.
     public static func annotation(
         for draft: NoteDraft,
         contents: String,
-        paperColor: NotePaperColor
+        style: NoteStickerStyle,
+        on page: PDFPage
     ) -> PDFAnnotation? {
         let text = contents.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return nil }
+        guard !text.isEmpty, page.document != nil else { return nil }
 
         let annotation = PDFAnnotation(
             bounds: draft.bounds,
@@ -409,7 +553,12 @@ public enum NoteService {
         // No `/NM` (annotation name) is written: PDFKit accepts one in memory
         // but drops it on serialisation, so a note is identified by the object
         // that owns it rather than by a name the file would not keep.
-        setPaperColor(paperColor, on: annotation)
+        setStyle(style, on: annotation)
+        setAnchor(
+            CGPoint(x: draft.bounds.midX, y: draft.bounds.midY),
+            on: annotation,
+            page: page
+        )
         setExcerpt(draft.excerpt, on: annotation)
         setPageLevel(draft.isPageLevel, on: annotation)
         return annotation

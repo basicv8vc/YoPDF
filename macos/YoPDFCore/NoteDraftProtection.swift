@@ -91,14 +91,29 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
     /// What the draft looked like when the composer opened. `hasUncommittedChanges`
     /// is measured against these, not against the document.
     public let initialContents: String
-    public let initialPaper: NotePaperColor
+    public let initialStyle: NoteStickerStyle
+
+    /// Kept for PR #6 callers/tests: the paper is part of the style now.
+    public var initialPaper: NotePaperColor { initialStyle.palette }
 
     @Published public var contents: String {
         didSet { noteChanged() }
     }
 
-    @Published public var paper: NotePaperColor {
+    /// The complete appearance being edited. Motif and palette are one value so
+    /// a single revision bump covers either change.
+    @Published public var style: NoteStickerStyle {
         didSet { noteChanged() }
+    }
+
+    /// Paper-only accessor used by the existing palette row and tests.
+    public var paper: NotePaperColor {
+        get { style.palette }
+        set {
+            var updated = style
+            updated.palette = newValue
+            style = updated
+        }
     }
 
     /// Kept here so expanding the editor survives a popover rebuild.
@@ -112,7 +127,7 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
     /// a later one.
     public internal(set) var revision: Int = 0
 
-    /// Called after `contents` or `paper` changed.
+    /// Called after `contents` or `style` changed.
     var onChange: (() -> Void)?
 
     init(
@@ -121,16 +136,51 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
         pageLabel: String,
         excerpt: String?,
         contents: String,
-        paper: NotePaperColor
+        style: NoteStickerStyle
     ) {
         self.mode = mode
         self.anchorRect = anchorRect
         self.pageLabel = pageLabel
         self.excerpt = excerpt
         self.initialContents = contents
-        self.initialPaper = paper
+        self.initialStyle = style
         self.contents = contents
-        self.paper = paper
+        self.style = style
+    }
+
+    /// Compatibility initializer for paper-only callers.
+    convenience init(
+        mode: Mode,
+        anchorRect: CGRect,
+        pageLabel: String,
+        excerpt: String?,
+        contents: String,
+        paper: NotePaperColor
+    ) {
+        self.init(
+            mode: mode,
+            anchorRect: anchorRect,
+            pageLabel: pageLabel,
+            excerpt: excerpt,
+            contents: contents,
+            style: Self.resolvedStyle(for: mode, paper: paper)
+        )
+    }
+
+    /// Resolves a paper-only request without discarding an existing motif.
+    ///
+    /// A new note starts on Simple Paper; editing a sticker note through an old
+    /// paper-only call keeps the sticker it already has.
+    static func resolvedStyle(for mode: Mode, paper: NotePaperColor) -> NoteStickerStyle {
+        switch mode {
+        case .create:
+            return NoteStickerStyle(motif: .plain, palette: paper)
+        case let .edit(note):
+            return NoteStickerStyle(
+                motif: NoteService.style(of: note.annotation).motif,
+                palette: paper
+            )
+        }
     }
 
     public var isEditing: Bool {
@@ -138,12 +188,14 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
         return false
     }
 
-    /// Whether the user has typed or recoloured anything worth protecting.
+    /// Whether the user has typed or restyled anything worth protecting.
     ///
-    /// Whitespace-only edits do not count: discarding them loses nothing, and
-    /// asking about them would train the user to dismiss the prompt.
+    /// Whitespace-only body edits do not count: discarding them loses nothing,
+    /// and asking about them would train the user to dismiss the prompt. A
+    /// motif or palette change always counts.
     public var hasUncommittedChanges: Bool {
-        Self.normalized(contents) != Self.normalized(initialContents) || paper != initialPaper
+        Self.normalized(contents) != Self.normalized(initialContents)
+            || style != initialStyle
     }
 
     // MARK: - Committing
@@ -157,9 +209,9 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
     public func commit(to model: PDFDocumentModel) -> Result<NoteSelection, NoteEditError> {
         switch mode {
         case let .create(draft):
-            return model.addNote(draft, contents: contents, paperColor: paper)
+            return model.addNote(draft, contents: contents, style: style)
         case let .edit(note):
-            return model.updateNote(note, contents: contents, paperColor: paper)
+            return model.updateNote(note, contents: contents, style: style)
         }
     }
 
@@ -222,7 +274,7 @@ public final class NoteComposerStore: ObservableObject {
         pageLabel: String,
         excerpt: String?,
         contents: String,
-        paper: NotePaperColor
+        style: NoteStickerStyle
     ) -> Bool {
         if let session, session.hasUncommittedChanges { return false }
 
@@ -232,13 +284,33 @@ public final class NoteComposerStore: ObservableObject {
             pageLabel: pageLabel,
             excerpt: excerpt,
             contents: contents,
-            paper: paper
+            style: style
         )
         session.onChange = { [weak self] in self?.draftChanged() }
         self.session = session
         isPresented = true
         bumpRevision(on: session)
         return true
+    }
+
+    /// Compatibility entry point for paper-only callers.
+    @discardableResult
+    public func begin(
+        mode: NoteComposerSession.Mode,
+        anchorRect: CGRect,
+        pageLabel: String,
+        excerpt: String?,
+        contents: String,
+        paper: NotePaperColor
+    ) -> Bool {
+        begin(
+            mode: mode,
+            anchorRect: anchorRect,
+            pageLabel: pageLabel,
+            excerpt: excerpt,
+            contents: contents,
+            style: NoteComposerSession.resolvedStyle(for: mode, paper: paper)
+        )
     }
 
     /// Drops the draft without writing anything.

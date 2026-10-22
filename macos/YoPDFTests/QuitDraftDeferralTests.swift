@@ -350,6 +350,41 @@ final class QuitDraftDeferralTests: XCTestCase {
         XCTAssertEqual(b.documentDiscardCount, 0)
     }
 
+    /// Case B, style half: a motif/palette change is draft state too. Cancelling
+    /// the quit in another window must keep both windows' style selections.
+    func testCancelInAnotherWindowKeepsStyleSelections() throws {
+        let a = try makeWindow(named: "style-a")
+        let b = try makeWindow(named: "style-b")
+        let sessionA = try typeNewNote("A's styled note", into: a)
+        sessionA.style = NoteStickerStyle(motif: .cherry, palette: .rose)
+        let sessionB = try typeNewNote("B's styled note", into: b)
+        sessionB.style = NoteStickerStyle(motif: .shiba, palette: .mint)
+        let harness = QuitHarness([a, b])
+
+        harness.quit()
+        XCTAssertEqual(harness.prompt, .draft)
+        XCTAssertTrue(harness.pendingWindow === a)
+
+        harness.discardDraft()
+        XCTAssertEqual(harness.prompt, .draft, "B still has to answer its own draft")
+        XCTAssertTrue(harness.pendingWindow === b)
+
+        harness.cancel()
+        XCTAssertFalse(harness.terminationAllowed)
+        XCTAssertEqual(
+            a.store.session?.style,
+            NoteStickerStyle(motif: .cherry, palette: .rose)
+        )
+        XCTAssertEqual(
+            b.store.session?.style,
+            NoteStickerStyle(motif: .shiba, palette: .mint)
+        )
+        XCTAssertTrue(a.store.hasUncommittedChanges)
+        XCTAssertTrue(b.store.hasUncommittedChanges)
+        XCTAssertEqual(a.draftDiscardCount, 0)
+        XCTAssertEqual(b.draftDiscardCount, 0)
+    }
+
     // MARK: - C. Both approve, commit is the only discard point
 
     /// Case C: once every window agrees, the approved draft is dropped by the
