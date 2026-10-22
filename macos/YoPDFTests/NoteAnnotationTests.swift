@@ -668,10 +668,16 @@ final class NoteAnnotationTests: XCTestCase {
         XCTAssertEqual(model.save(), .saved)
         let reopened = try XCTUnwrap(PDFDocument(url: url))
         let reopenedPage = try XCTUnwrap(reopened.page(at: 0))
-        XCTAssertEqual(
-            reopenedPage.annotations.filter { $0.type == "Text" }.first?.contents,
-            "Edited third party note"
+        let reopenedNote = try XCTUnwrap(
+            reopenedPage.annotations.first { $0.type == "Text" }
         )
+        XCTAssertEqual(reopenedNote.contents, "Edited third party note")
+        XCTAssertNil(
+            reopenedNote.value(forAnnotationKey: NoteService.identityKey),
+            "a body-only edit must not write the YoPDF identity marker"
+        )
+        XCTAssertNil(reopenedNote.value(forAnnotationKey: NoteService.styleKey))
+        XCTAssertNil(reopenedNote.value(forAnnotationKey: NoteService.paperColorKey))
         XCTAssertEqual(reopenedPage.annotations.filter { $0.type == "Highlight" }.count, 1)
         XCTAssertEqual(reopenedPage.annotations.filter { $0.type == "Square" }.count, 1)
     }
