@@ -881,6 +881,11 @@ struct PDFReaderView: View {
         prompt = nil
         switch composerStore.commit(using: model) {
         case let .failure(error):
+            // A failed note save stops the quit before termination is
+            // requested. Approvals collected from other windows belong to an
+            // attempt that is no longer running, so they must not survive into
+            // the next ⌘Q.
+            if action == .quit { QuitSession.coordinator.cancel() }
             prompt = .saveProblem(
                 title: "Couldn’t save the note",
                 message: (error.errorDescription ?? "The note was not saved.")

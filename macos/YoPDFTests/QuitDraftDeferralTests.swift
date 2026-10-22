@@ -210,6 +210,9 @@ final class QuitDraftDeferralTests: XCTestCase {
             prompt = nil
             switch window.store.commit(using: window.model) {
             case .failure:
+                // The quit stopped here, so the approvals other windows gave
+                // belong to an attempt that is over.
+                coordinator.cancel()
                 prompt = .saveProblem
             case .success:
                 show(coordinator.confirmationNeed(for: window))
@@ -455,6 +458,43 @@ final class QuitDraftDeferralTests: XCTestCase {
         XCTAssertEqual(b.quitConfirmationRequests, 0, "the quit stopped before B")
         XCTAssertEqual(a.draftDiscardCount, 0)
         XCTAssertEqual(a.documentDiscardCount, 0)
+    }
+
+    /// A failed Save Note in one window ends the whole quit attempt, so an
+    /// earlier window's Don't Save must not survive into the next ⌘Q.
+    func testFailedNoteSaveClearsAnotherWindowsApproval() throws {
+        let a = try makeWindow(named: "a")
+        let b = try makeWindow(named: "b")
+        a.model.markEdited()
+        let session = try typeUnsaveableEdit(into: b)
+        // B's deleted note is not the point of this test: leave B with only the
+        // failing draft, so the document prompt belongs to A.
+        b.model.abandonUnsavedChanges()
+        let harness = QuitHarness([a, b])
+
+        harness.quit()
+        XCTAssertEqual(harness.prompt, .document)
+        XCTAssertTrue(harness.pendingWindow === a)
+        harness.discardDocument()
+        XCTAssertEqual(harness.prompt, .draft)
+        XCTAssertTrue(harness.pendingWindow === b)
+
+        harness.saveDraft()
+        XCTAssertEqual(harness.prompt, .saveProblem)
+        XCTAssertFalse(harness.terminationAllowed)
+        XCTAssertTrue(b.store.session === session, "the text that failed to save is still here")
+        XCTAssertEqual(b.store.session?.contents, "Text that cannot be saved")
+        XCTAssertEqual(harness.coordinator.confirmationNeed(for: b), .draft)
+
+        harness.quit()
+        XCTAssertEqual(
+            harness.prompt,
+            .document,
+            "A must be asked again: its Don't Save belonged to the failed attempt"
+        )
+        XCTAssertTrue(harness.pendingWindow === a)
+        XCTAssertEqual(a.quitConfirmationRequests, 2)
+        XCTAssertEqual(b.quitConfirmationRequests, 1)
     }
 
     // MARK: - G. A later ⌘Q asks the approved draft again
