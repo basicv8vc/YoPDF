@@ -147,6 +147,95 @@ final class NoteDraftProtectionTests: XCTestCase {
         XCTAssertEqual(store.session?.id, session.id, "the same session, not a new empty one")
     }
 
+    /// The expanded editor binds to the session rather than keeping a private
+    /// copy. Those writes must advance the same revision the window close and
+    /// quit guards inspect, and a dismissed popover must retain the draft.
+    func testExpandedEditorChangesAdvanceTheProtectedDraftRevision() throws {
+        let model = openModel(at: try makeFixture())
+        let store = NoteComposerStore()
+        let session = try beginPageNoteDraft(in: model, store: store)
+        let revisionBeforeExpand = store.revision
+
+        // These are the writes made through the expanded TextEditor and style
+        // controls, which now bind directly to NoteComposerSession.
+        session.contents = "Expanded editor text"
+        var expandedStyle = session.style
+        expandedStyle.palette = .mint
+        session.style = expandedStyle
+
+        XCTAssertGreaterThan(store.revision, revisionBeforeExpand)
+        XCTAssertTrue(store.hasUncommittedChanges)
+        XCTAssertEqual(
+            ReaderPromptPolicy.prompt(for: .closeWindow, draftHasChanges: store.hasUncommittedChanges, documentHasChanges: false),
+            .draft
+        )
+        XCTAssertEqual(
+            ReaderPromptPolicy.prompt(for: .quit, draftHasChanges: store.hasUncommittedChanges, documentHasChanges: false),
+            .draft
+        )
+
+        store.closePopover()
+        XCTAssertEqual(store.session?.contents, "Expanded editor text")
+        XCTAssertEqual(store.session?.style.palette, .mint)
+        XCTAssertTrue(store.hasUncommittedChanges)
+    }
+
+    /// Cancel in the expanded sheet restores only the values captured when the
+    /// sheet opened. Earlier compact-composer work remains dirty and protected.
+    func testExpandedEditorCancelRestoresItsSnapshotAndKeepsEarlierDraftWork() throws {
+        let model = openModel(at: try makeFixture())
+        let store = NoteComposerStore()
+        let session = try beginPageNoteDraft(in: model, store: store)
+
+        session.contents = "Draft before expand"
+        var compactStyle = session.style
+        compactStyle.palette = .rose
+        session.style = compactStyle
+        let snapshot = session.snapshot()
+        let revisionBeforeExpandedEdits = store.revision
+
+        session.contents = "Discard this expanded edit"
+        var expandedStyle = session.style
+        expandedStyle.palette = .mint
+        session.style = expandedStyle
+        session.templateSelection.apply(NoteTemplate.builtIns()[1], to: session.contents)
+
+        session.restore(from: snapshot)
+
+        XCTAssertGreaterThan(store.revision, revisionBeforeExpandedEdits)
+        XCTAssertEqual(session.contents, "Draft before expand")
+        XCTAssertEqual(session.style, compactStyle)
+        XCTAssertEqual(session.templateSelection, snapshot.templateSelection)
+        XCTAssertTrue(store.hasUncommittedChanges, "the earlier compact draft is still protected")
+        XCTAssertFalse(model.hasUnsavedChanges, "Cancel must not write anything to the PDF")
+        XCTAssertTrue(try notes(on: 0, in: model).isEmpty)
+    }
+
+    /// Save from the expanded editor commits the live session values as one
+    /// annotation, then drops the draft from the close/quit protection state.
+    func testExpandedEditorSaveCommitsTheLiveSessionDraft() throws {
+        let model = openModel(at: try makeFixture())
+        let store = NoteComposerStore()
+        let session = try beginPageNoteDraft(in: model, store: store)
+
+        session.contents = "Saved from expanded editor"
+        var expandedStyle = session.style
+        expandedStyle.palette = .lavender
+        expandedStyle.motif = .cat
+        session.style = expandedStyle
+
+        guard case .success = store.commit(using: model) else {
+            return XCTFail("the expanded session must save")
+        }
+
+        XCTAssertNil(store.session)
+        let annotation = try XCTUnwrap(try notes(on: 0, in: model).first)
+        XCTAssertEqual(annotation.contents, "Saved from expanded editor")
+        XCTAssertEqual(NoteService.style(of: annotation), expandedStyle)
+        XCTAssertFalse(store.hasUncommittedChanges)
+        XCTAssertTrue(model.hasUnsavedChanges, "the PDF still requires its normal document save")
+    }
+
     /// Case 7: a composer nobody typed into is dropped silently. A confirmation
     /// for an empty draft would train the user to dismiss the real one.
     func testCleanDraftIsDroppedWithoutAsking() throws {

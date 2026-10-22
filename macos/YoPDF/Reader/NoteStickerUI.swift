@@ -304,6 +304,8 @@ struct NoteStickerComposer: View {
     @Binding var style: NoteStickerStyle
     var expanded = false
     @Binding var templateSelection: NoteTemplateSelection
+    var canEditContents = true
+    var canChangeStyle = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var isTextFocused: Bool
 
@@ -314,25 +316,44 @@ struct NoteStickerComposer: View {
                 style: $style,
                 templateSelection: $templateSelection
             )
+            .disabled(!canChangeStyle)
 
             VStack(alignment: .leading, spacing: 9) {
                 NoteStickerHeading(style: style)
-                TextEditor(text: $text)
-                    .font(.system(size: 14))
-                    .foregroundStyle(Color(red: 0.20, green: 0.18, blue: 0.14))
-                    .scrollContentBackground(.hidden)
+                if canEditContents {
+                    TextEditor(text: $text)
+                        .font(.system(size: 14))
+                        .foregroundStyle(Color(red: 0.20, green: 0.18, blue: 0.14))
+                        .scrollContentBackground(.hidden)
+                        .frame(
+                            minHeight: expanded ? 220 : 90,
+                            maxHeight: expanded ? .infinity : 150
+                        )
+                        .accessibilityLabel("Note contents")
+                        .accessibilityIdentifier("pdf-sticker-text")
+                        .focused($isTextFocused)
+                } else {
+                    ScrollView(.vertical) {
+                        Text(text)
+                            .font(.system(size: 14))
+                            .foregroundStyle(Color(red: 0.20, green: 0.18, blue: 0.14))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                            .accessibilityLabel("Note contents")
+                            .accessibilityIdentifier("pdf-sticker-text")
+                    }
                     .frame(
                         minHeight: expanded ? 220 : 90,
                         maxHeight: expanded ? .infinity : 150
                     )
-                    .accessibilityLabel("Note contents")
-                    .accessibilityIdentifier("pdf-sticker-text")
-                    .focused($isTextFocused)
+                }
             }
             .noteStickerPaper(style)
             .padding(.top, 10)
             .animation(reduceMotion ? nil : .easeInOut(duration: 0.15), value: style.palette)
         }
-        .onAppear { isTextFocused = true }
+        .onAppear {
+            if canEditContents { isTextFocused = true }
+        }
     }
 }

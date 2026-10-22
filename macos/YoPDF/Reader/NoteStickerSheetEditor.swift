@@ -6,25 +6,34 @@ struct NoteStickerSheetEditor: View {
     @Environment(\.dismiss) private var dismiss
 
     let title: String
-    let onSave: (String, NoteStickerStyle, NoteTemplateSelection) -> String?
+    let canEditContents: Bool
+    let canChangeStyle: Bool
+    let onCancel: () -> Void
+    let onSave: () -> String?
 
-    @State private var text: String
-    @State private var style: NoteStickerStyle
-    @State private var templateSelection: NoteTemplateSelection
+    @Binding private var text: String
+    @Binding private var style: NoteStickerStyle
+    @Binding private var templateSelection: NoteTemplateSelection
     @State private var errorMessage: String?
 
     init(
         title: String,
-        text: String,
-        style: NoteStickerStyle,
-        templateSelection: NoteTemplateSelection = .init(),
-        onSave: @escaping (String, NoteStickerStyle, NoteTemplateSelection) -> String?
+        text: Binding<String>,
+        style: Binding<NoteStickerStyle>,
+        templateSelection: Binding<NoteTemplateSelection>,
+        canEditContents: Bool,
+        canChangeStyle: Bool,
+        onCancel: @escaping () -> Void,
+        onSave: @escaping () -> String?
     ) {
         self.title = title
+        self.canEditContents = canEditContents
+        self.canChangeStyle = canChangeStyle
+        self.onCancel = onCancel
         self.onSave = onSave
-        _text = State(initialValue: text)
-        _style = State(initialValue: style)
-        _templateSelection = State(initialValue: templateSelection)
+        _text = text
+        _style = style
+        _templateSelection = templateSelection
     }
 
     private var trimmedText: String {
@@ -40,7 +49,9 @@ struct NoteStickerSheetEditor: View {
                 text: $text,
                 style: $style,
                 expanded: true,
-                templateSelection: $templateSelection
+                templateSelection: $templateSelection,
+                canEditContents: canEditContents,
+                canChangeStyle: canChangeStyle
             )
 
             if let errorMessage {
@@ -52,7 +63,7 @@ struct NoteStickerSheetEditor: View {
 
             HStack {
                 Spacer()
-                Button("Cancel") { dismiss() }
+                Button("Cancel", action: onCancel)
                     .keyboardShortcut(.cancelAction)
                 Button("Save") { save() }
                     .buttonStyle(.borderedProminent)
@@ -66,7 +77,7 @@ struct NoteStickerSheetEditor: View {
 
     private func save() {
         errorMessage = nil
-        if let message = onSave(text, style, templateSelection) {
+        if let message = onSave() {
             errorMessage = message
             return
         }

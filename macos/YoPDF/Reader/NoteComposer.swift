@@ -17,6 +17,7 @@ struct NoteComposerView: View {
     /// attempt, and the text it failed to save is not local state.
     @State private var errorMessage: String?
     @State private var showsExpandedEditor = false
+    @State private var expandedEditorSnapshot: NoteComposerSession.Snapshot?
     @State private var focusRequest = 0
     #if DEBUG
     @State private var didAutoPresentScreenshotSurface = false
@@ -78,7 +79,7 @@ struct NoteComposerView: View {
                     submitTitle: session.isEditing ? "Save" : "Add",
                     focusRequest: focusRequest,
                     onCancel: session.isEditing ? onDismiss : nil,
-                    onExpand: { showsExpandedEditor = true },
+                    onExpand: { beginExpandedEditor() },
                     onDelete: deleteAction,
                     onSubmit: { save() }
                 )
@@ -97,12 +98,18 @@ struct NoteComposerView: View {
             }
             #endif
         }
-        .sheet(isPresented: $showsExpandedEditor, onDismiss: { focusRequest += 1 }) {
+        .sheet(isPresented: $showsExpandedEditor, onDismiss: {
+            expandedEditorSnapshot = nil
+            focusRequest += 1
+        }) {
             NoteStickerSheetEditor(
                 title: session.isEditing ? "Edit Note" : "New Note",
-                text: session.contents,
-                style: session.style,
-                templateSelection: session.templateSelection,
+                text: $session.contents,
+                style: $session.style,
+                templateSelection: templateSelectionBinding,
+                canEditContents: permissions.canEditContents,
+                canChangeStyle: permissions.canChangeStyle,
+                onCancel: cancelExpandedEditor,
                 onSave: saveExpanded
             )
         }
@@ -219,20 +226,30 @@ struct NoteComposerView: View {
         }
     }
 
-    /// Saves the sheet's local text/style as one edit. Returning a message keeps
-    /// the sheet open with every character intact on failure.
-    private func saveExpanded(
-        _ text: String,
-        _ style: NoteStickerStyle,
-        _ templateSelection: NoteTemplateSelection
-    ) -> String? {
-        session.contents = text
-        session.style = style
-        session.templateSelection = templateSelection
+    private func beginExpandedEditor() {
+        expandedEditorSnapshot = session.snapshot()
+        showsExpandedEditor = true
+    }
+
+    /// Cancel returns to the compact draft as it stood when the sheet opened.
+    /// The session has already tracked every expanded edit for close and quit
+    /// protection, so restoring through it also invalidates stale approvals.
+    private func cancelExpandedEditor() {
+        if let expandedEditorSnapshot {
+            session.restore(from: expandedEditorSnapshot)
+        }
+        expandedEditorSnapshot = nil
+        showsExpandedEditor = false
+    }
+
+    /// The sheet edits the session live; Save commits that same protected draft.
+    /// Returning a message keeps the sheet open with every edit intact on failure.
+    private func saveExpanded() -> String? {
         errorMessage = nil
 
         switch session.commit(to: model) {
         case .success:
+            expandedEditorSnapshot = nil
             onDismiss()
             return nil
         case let .failure(error):

@@ -75,6 +75,27 @@ public enum NoteDraftStatus: Equatable, Sendable {
 @MainActor
 public final class NoteComposerSession: ObservableObject, Identifiable {
 
+    /// A point-in-time draft used when the user opens the expanded editor.
+    ///
+    /// The expanded editor writes through to this session so every edit is
+    /// revisioned and protected. Cancel restores this snapshot, including the
+    /// template seed, without committing anything to the PDF.
+    public struct Snapshot: Equatable, Sendable {
+        public let contents: String
+        public let style: NoteStickerStyle
+        public let templateSelection: NoteTemplateSelection
+
+        public init(
+            contents: String,
+            style: NoteStickerStyle,
+            templateSelection: NoteTemplateSelection
+        ) {
+            self.contents = contents
+            self.style = style
+            self.templateSelection = templateSelection
+        }
+    }
+
     /// What Save means: adding a note at a captured anchor, or changing one that
     /// is already in the document.
     public enum Mode {
@@ -206,6 +227,24 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
     public var hasUncommittedChanges: Bool {
         Self.normalized(contents) != Self.normalized(initialContents)
             || style != initialStyle
+    }
+
+    /// Captures the current values before entering the expanded editor.
+    public func snapshot() -> Snapshot {
+        Snapshot(
+            contents: contents,
+            style: style,
+            templateSelection: templateSelection
+        )
+    }
+
+    /// Restores the values that were present when the expanded editor opened.
+    /// The published properties still advance the draft revision, ensuring any
+    /// close or quit approval made during editing cannot apply to a later state.
+    public func restore(from snapshot: Snapshot) {
+        contents = snapshot.contents
+        style = snapshot.style
+        templateSelection = snapshot.templateSelection
     }
 
     // MARK: - Committing

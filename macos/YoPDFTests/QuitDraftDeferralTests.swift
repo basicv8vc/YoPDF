@@ -445,6 +445,47 @@ final class QuitDraftDeferralTests: XCTestCase {
         XCTAssertEqual(a.draftDiscardCount, 0)
     }
 
+    /// The expanded editor binds into the same session that the window's quit
+    /// guard observes. Cancelling keeps the live edits; choosing Save Note then
+    /// saves the annotation and document before the quit is allowed to finish.
+    func testExpandedEditorDraftIsProtectedAcrossQuitCancelAndSave() throws {
+        let window = try makeWindow(named: "expanded-editor-quit")
+        let session = try typeNewNote("Compact draft", into: window)
+        let revisionBeforeExpand = window.store.revision
+        session.contents = "Expanded editor draft"
+        var style = session.style
+        style.palette = .mint
+        style.motif = .cat
+        session.style = style
+
+        let harness = QuitHarness([window])
+        harness.quit()
+        XCTAssertEqual(harness.prompt, .draft)
+        XCTAssertTrue(harness.pendingWindow === window)
+        XCTAssertGreaterThan(window.store.revision, revisionBeforeExpand)
+
+        harness.cancel()
+        XCTAssertFalse(harness.terminationAllowed)
+        XCTAssertEqual(window.store.session?.contents, "Expanded editor draft")
+        XCTAssertEqual(window.store.session?.style, style)
+        XCTAssertTrue(window.store.hasUncommittedChanges)
+
+        harness.quit()
+        XCTAssertEqual(harness.prompt, .draft)
+        harness.saveDraft()
+        XCTAssertEqual(harness.prompt, .document, "the saved note still needs the normal PDF save")
+        XCTAssertNil(window.store.session, "saving the note commits and ends the composer session")
+        let pendingNote = try XCTUnwrap(window.model.document?.page(at: 0)?.annotations.first)
+        XCTAssertEqual(pendingNote.contents, "Expanded editor draft")
+
+        harness.saveDocument()
+        XCTAssertTrue(harness.terminationAllowed)
+        XCTAssertNil(window.store.session)
+        XCTAssertFalse(window.model.hasUnsavedChanges)
+        let savedNote = try XCTUnwrap(window.model.document?.page(at: 0)?.annotations.first)
+        XCTAssertEqual(savedNote.contents, "Expanded editor draft")
+    }
+
     // MARK: - E. Both halves dirty, both approved
 
     /// Case E: a window with a dirty draft and a dirty document resolves both
