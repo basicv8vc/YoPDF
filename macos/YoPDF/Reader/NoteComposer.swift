@@ -2,12 +2,11 @@ import AppKit
 import SwiftUI
 import YoPDFCore
 
-/// The compact note composer.
+/// The note popover.
 ///
-/// Nothing here writes to the PDF. The body and the paper colour live in the
-/// `NoteComposerSession`, not in this view's state, so Save is still the only
-/// thing that mutates the document — which is what makes Cancel a true no-op —
-/// while rebuilding the popover cannot throw the text away.
+/// Nothing here writes to the PDF until Save. The body and the complete sticker
+/// style live in `NoteComposerSession`, not in this view's state, so closing and
+/// rebuilding the popover cannot throw the draft away.
 struct NoteComposerView: View {
 
     @ObservedObject var session: NoteComposerSession
@@ -17,7 +16,12 @@ struct NoteComposerView: View {
     /// A failure reported by the last Save. Local on purpose: it describes one
     /// attempt, and the text it failed to save is not local state.
     @State private var errorMessage: String?
-    @FocusState private var isFocused: Bool
+    @State private var showsExpandedEditor = false
+    @State private var expandedEditorSnapshot: NoteComposerSession.Snapshot?
+    @State private var focusRequest = 0
+    #if DEBUG
+    @State private var didAutoPresentScreenshotSurface = false
+    #endif
 
     /// Read from the model on every render: another application can change `/F`
     /// while the composer is open, and the Save button must follow.
@@ -48,102 +52,115 @@ struct NoteComposerView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
-            editor
+
             if !status.isReady {
                 detachedNotice
             }
+
             if let errorMessage {
                 Text(errorMessage)
                     .font(.caption)
                     .foregroundStyle(Color(red: 0.62, green: 0.16, blue: 0.12))
                     .fixedSize(horizontal: false, vertical: true)
             }
-            palette
-            buttons
-        }
-        .padding(14)
-        .frame(width: session.isExpanded ? 420 : 344)
-        .background(paperBackground)
-        .onAppear {
-            Task { @MainActor in
-                await Task.yield()
-                isFocused = true
+
+            if permissions.isReadOnly {
+                readOnlyCard
+            } else {
+                NoteCompactComposer(
+                    text: $session.contents,
+                    style: styleBinding,
+                    templateSelection: templateSelectionBinding,
+                    canEditContents: permissions.canEditContents,
+                    canChangeStyle: permissions.canChangeStyle,
+                    canSubmit: canSave,
+                    showsCancel: session.isEditing,
+                    submitSymbol: session.isEditing ? "checkmark" : "arrow.up",
+                    submitTitle: session.isEditing ? "Save" : "Add",
+                    focusRequest: focusRequest,
+                    onCancel: session.isEditing ? onDismiss : nil,
+                    onExpand: { beginExpandedEditor() },
+                    onDelete: deleteAction,
+                    onSubmit: { save() }
+                )
             }
         }
-        .onChange(of: session.isExpanded) { _, _ in
-            isFocused = true
+        .padding(14)
+        .frame(width: 380)
+        .fixedSize(horizontal: false, vertical: true)
+        .accessibilityIdentifier("pdf-thought-capture-popover")
+        .onAppear {
+            #if DEBUG
+            guard !didAutoPresentScreenshotSurface else { return }
+            didAutoPresentScreenshotSurface = true
+            if UserDefaults.standard.bool(forKey: "YOPDF_SCREENSHOT_EXPANDED") {
+                showsExpandedEditor = true
+            }
+            #endif
+        }
+        .sheet(isPresented: $showsExpandedEditor, onDismiss: {
+            expandedEditorSnapshot = nil
+            focusRequest += 1
+        }) {
+            NoteStickerSheetEditor(
+                title: session.isEditing ? "Edit Note" : "New Note",
+                text: $session.contents,
+                style: $session.style,
+                templateSelection: templateSelectionBinding,
+                canEditContents: permissions.canEditContents,
+                canChangeStyle: permissions.canChangeStyle,
+                onCancel: cancelExpandedEditor,
+                onSave: saveExpanded
+            )
         }
     }
 
     // MARK: - Sections
 
     private var header: some View {
-        HStack(alignment: .top, spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(session.isEditing ? "Note" : "New Note")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(ink.opacity(0.65))
-                if let excerpt = session.excerpt, !excerpt.isEmpty {
-                    Text(excerpt)
-                        .font(.callout)
-                        .foregroundStyle(ink.opacity(0.85))
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } else {
-                    Text("Page note")
-                        .font(.callout)
-                        .foregroundStyle(ink.opacity(0.6))
-                }
+        HStack(alignment: .top, spacing: 12) {
+            Text(session.excerpt.flatMap { $0.isEmpty ? nil : $0 } ?? "Page note")
+                .font(.callout)
+                .lineLimit(2)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text(session.pageLabel)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .fixedSize()
+
+            if permissions.isContentsLocked {
+                Image(systemName: "lock.doc")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help("This note’s text is locked. Its sticker and colour can still be changed.")
             }
-            Spacer(minLength: 4)
-            HStack(spacing: 4) {
-                if permissions.isContentsLocked {
-                    Image(systemName: "lock.doc")
-                        .font(.caption)
-                        .help("This note’s text is locked. Its colour can still be changed.")
-                } else if permissions.isReadOnly {
-                    Image(systemName: "lock.fill")
-                        .font(.caption)
-                        .help("This note is protected and cannot be changed.")
+
+            if !session.isEditing || permissions.isReadOnly {
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .frame(width: 22, height: 20)
                 }
-                Text(session.pageLabel)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(ink.opacity(0.55))
+                .buttonStyle(.borderless)
+                .help(permissions.isReadOnly ? "Close this note" : "Cancel")
+                .accessibilityLabel(permissions.isReadOnly ? "Close" : "Cancel")
             }
         }
     }
 
-    @ViewBuilder
-    private var editor: some View {
-        if session.isExpanded {
-            TextEditor(text: $session.contents)
+    /// A read-only note is still readable in the same paper treatment. There is
+    /// no disabled submit button pretending that a write is possible.
+    private var readOnlyCard: some View {
+        HStack(alignment: .top, spacing: 9) {
+            NoteStickerArtwork(motif: session.style.motif)
+                .frame(width: 29, height: 29)
+            Text(session.contents)
                 .font(.system(size: 13))
-                .foregroundStyle(ink)
-                .scrollContentBackground(.hidden)
-                .focused($isFocused)
-                .disabled(!permissions.canEditContents)
-                .frame(minHeight: 190, maxHeight: 190)
-                .padding(6)
-                .background(fieldBackground)
-                .accessibilityLabel("Note contents")
-                .accessibilityIdentifier("note-composer-input")
-        } else {
-            // A vertical TextField grows with its content and scrolls internally
-            // after the limit, which is exactly the four-line behaviour the
-            // compact composer wants. Return inserts a newline; ⌘Return submits.
-            TextField("Write a note…", text: $session.contents, axis: .vertical)
-                .textFieldStyle(.plain)
-                .font(.system(size: 13))
-                .foregroundStyle(ink)
-                .lineLimit(1...4)
-                .focused($isFocused)
-                .disabled(!permissions.canEditContents)
-                .padding(6)
-                .background(fieldBackground)
-                .accessibilityLabel("Note contents")
-                .accessibilityIdentifier("note-composer-input")
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .noteStickerPaper(session.style, compact: true)
     }
 
     /// Shown when the note has gone away — deleted, undone, or left behind by a
@@ -181,101 +198,20 @@ struct NoteComposerView: View {
         }
     }
 
-    private var palette: some View {
-        HStack(spacing: 6) {
-            ForEach(NotePaperColor.allCases, id: \.self) { candidate in
-                Button {
-                    session.paper = candidate
-                } label: {
-                    Circle()
-                        .fill(Color(nsColor: candidate.color))
-                        .frame(width: 17, height: 17)
-                        .overlay {
-                            Circle()
-                                .strokeBorder(
-                                    ink.opacity(session.paper == candidate ? 0.75 : 0.18),
-                                    lineWidth: session.paper == candidate ? 2 : 1
-                                )
-                        }
-                        .padding(2)
-                }
-                .buttonStyle(.plain)
-                .disabled(!permissions.canChangeStyle)
-                .help(candidate.title)
-                .accessibilityLabel(candidate.title)
-                .accessibilityAddTraits(session.paper == candidate ? .isSelected : [])
-            }
+    // MARK: - Bindings
 
-            Spacer(minLength: 4)
-
-            Button {
-                session.isExpanded.toggle()
-            } label: {
-                Image(systemName: session.isExpanded
-                      ? "arrow.down.right.and.arrow.up.left"
-                      : "arrow.up.left.and.arrow.down.right")
-                    .font(.system(size: 11))
-                    .foregroundStyle(ink.opacity(0.65))
-                    .frame(width: 22, height: 20)
-            }
-            .buttonStyle(.plain)
-            .help(session.isExpanded ? "Collapse the note" : "Expand to edit a long note")
-            .accessibilityLabel(session.isExpanded ? "Collapse note editor" : "Expand note editor")
-        }
+    private var styleBinding: Binding<NoteStickerStyle> {
+        Binding(
+            get: { session.style },
+            set: { session.style = $0 }
+        )
     }
 
-    private var buttons: some View {
-        HStack(spacing: 8) {
-            if case let .edit(note) = session.mode, permissions.canDelete, status.isReady {
-                Button("Delete") {
-                    if model.deleteNote(note) {
-                        onDismiss()
-                    } else {
-                        errorMessage = NoteEditError.permissionDenied.errorDescription
-                    }
-                }
-                .buttonStyle(.plain)
-                .font(.callout)
-                .foregroundStyle(Color(red: 0.62, green: 0.16, blue: 0.12))
-                .help("Delete this note (⌘Z brings it back)")
-            }
-
-            Spacer(minLength: 4)
-
-            Button(dismissTitle) {
-                onDismiss()
-            }
-            .keyboardShortcut(.cancelAction)
-            .buttonStyle(.plain)
-            .font(.callout)
-            .foregroundStyle(ink.opacity(0.7))
-            .help(dismissHelp)
-
-            if !permissions.isReadOnly && status.isReady {
-                Button("Save") {
-                    save()
-                }
-                .keyboardShortcut(.return, modifiers: .command)
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .disabled(!canSave)
-                .help("Save the note (⌘↩)")
-            }
-        }
-    }
-
-    /// A draft with text that can no longer be saved is discarded by an explicit
-    /// choice, not by a button that looks like "Close".
-    private var dismissTitle: String {
-        if !status.isReady, !trimmedText.isEmpty { return "Discard Draft" }
-        return permissions.isReadOnly ? "Close" : "Cancel"
-    }
-
-    private var dismissHelp: String {
-        if !status.isReady, !trimmedText.isEmpty {
-            return "Discard this draft. Use Copy Text first to keep the text."
-        }
-        return permissions.isReadOnly ? "Close this note" : "Close without saving"
+    private var templateSelectionBinding: Binding<NoteTemplateSelection> {
+        Binding(
+            get: { session.templateSelection },
+            set: { session.templateSelection = $0 }
+        )
     }
 
     // MARK: - Actions
@@ -290,34 +226,56 @@ struct NoteComposerView: View {
         }
     }
 
+    private func beginExpandedEditor() {
+        expandedEditorSnapshot = session.snapshot()
+        showsExpandedEditor = true
+    }
+
+    /// Cancel returns to the compact draft as it stood when the sheet opened.
+    /// The session has already tracked every expanded edit for close and quit
+    /// protection, so restoring through it also invalidates stale approvals.
+    private func cancelExpandedEditor() {
+        if let expandedEditorSnapshot {
+            session.restore(from: expandedEditorSnapshot)
+        }
+        expandedEditorSnapshot = nil
+        showsExpandedEditor = false
+    }
+
+    /// The sheet edits the session live; Save commits that same protected draft.
+    /// Returning a message keeps the sheet open with every edit intact on failure.
+    private func saveExpanded() -> String? {
+        errorMessage = nil
+
+        switch session.commit(to: model) {
+        case .success:
+            expandedEditorSnapshot = nil
+            onDismiss()
+            return nil
+        case let .failure(error):
+            let message = error.errorDescription ?? "The note was not saved."
+            errorMessage = message
+            return message
+        }
+    }
+
+    private var deleteAction: (() -> Void)? {
+        guard case let .edit(note) = session.mode,
+              permissions.canDelete,
+              status.isReady
+        else { return nil }
+        return {
+            if model.deleteNote(note) {
+                onDismiss()
+            } else {
+                errorMessage = NoteEditError.permissionDenied.errorDescription
+            }
+        }
+    }
+
     private func copyContents() {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(session.contents, forType: .string)
-    }
-
-    // MARK: - Paper
-
-    /// The sticky-note ink. Fixed rather than semantic because the paper is a
-    /// light pastel in both appearances, so a dark-mode label colour would be
-    /// unreadable on it.
-    private var ink: Color { Color(red: 0.20, green: 0.18, blue: 0.14) }
-
-    private var paperBackground: some View {
-        RoundedRectangle(cornerRadius: 12, style: .continuous)
-            .fill(Color(nsColor: session.paper.color))
-            .overlay {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .strokeBorder(ink.opacity(0.14), lineWidth: 1)
-            }
-    }
-
-    private var fieldBackground: some View {
-        RoundedRectangle(cornerRadius: 7, style: .continuous)
-            .fill(Color.white.opacity(0.55))
-            .overlay {
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .strokeBorder(ink.opacity(0.10), lineWidth: 1)
-            }
     }
 }

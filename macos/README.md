@@ -21,7 +21,16 @@ P2c adds **notes**: a compact SwiftUI composer writes a standard PDF `/Text`
 annotation, either about the selected text or at a point the user clicks on the
 page. Six paper tints, a marker drawn over the page, editing, deletion and
 Undo/Redo all go through the same model pipeline as Highlight and Underline.
-There is still no autosave, annotation sidebar or template library.
+There is still no autosave and no annotation sidebar.
+
+P2d adds the first **sticker** stage: the 20 original ShuaMac illustrations are
+packaged in an Asset Catalog, and a note's motif, paper palette, template title
+and SF Symbol persist in a versioned `/YoPDFNoteStyle` value (v2; a v1 value
+still reads). The marker position is a CropBox-relative anchor because PDFKit
+rewrites a `/Text` annotation's `/Rect` on the first save. The composer follows
+ShuaMac's compact layout: a 32pt sticker face, a template menu with the twelve
+built-in outlines plus a personal template library, and an expandable sheet
+editor. Note threads, count badges and marker dragging remain later stages.
 
 ## Requirements
 
@@ -37,7 +46,7 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (209)
+./scripts/test.sh                     # unit tests (267)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
@@ -70,7 +79,8 @@ macos/
 │   ├── HighlightService.swift  # selection → /Highlight or /Underline
 │   ├── MarkupAnnotation.swift  # kinds, palette, preferences, permissions, quads
 │   ├── MarkupEditing.swift     # model-owned add/edit/delete/convert/undo
-│   ├── NoteAnnotation.swift    # /Text notes, paper tints, drafts, markers
+│   ├── NoteAnnotation.swift    # /Text notes, style keys, anchors, markers
+│   ├── NoteStickerStyle.swift  # 21 motif IDs, collections, versioned style
 │   ├── NoteEditing.swift       # model-owned add/edit/delete notes
 │   ├── PDFDocumentModel.swift
 │   ├── PDFDocumentModel+Editing.swift # dirty state, save, Save As, re-sync
@@ -78,6 +88,7 @@ macos/
 │   ├── ReaderViewSync.swift    # pure page/zoom decisions used by the bridge
 │   └── SecurityScopeAccess.swift
 ├── YoPDF/
+│   ├── Resources/Assets.xcassets # 20 sticker imagesets + catalog metadata
 │   ├── App/YoPDFApp.swift      # @main, one model per window
 │   ├── App/AppDelegate.swift   # quitting with unsaved edits
 │   ├── App/QuitSession.swift   # the app-wide quit attempt
@@ -107,11 +118,12 @@ macos/
 │   ├── HighlightAnnotationTests.swift   # real PDFKit highlight geometry
 │   ├── MarkupEditingTests.swift         # select, edit, undo, save integration
 │   ├── NoteAnnotationTests.swift        # real PDFKit /Text notes end to end
+│   ├── NoteStickerStyleTests.swift      # sticker style, anchors, assets, drafts
 │   ├── DocumentEditingTests.swift       # dirty state, save outcomes, re-sync
 │   ├── QuitCoordinatorTests.swift       # multi-window quit decisions
 │   ├── QuitDraftDeferralTests.swift     # deferred draft discard across a quit
 │   └── ReaderViewSyncTests.swift
-└── scripts/{generate,build,test}.sh
+└── scripts/{generate,build,test,verify-sticker-assets}.sh
 ```
 
 Each `WindowGroup` window owns its own `PDFDocumentModel`. Menu commands read the
@@ -322,20 +334,38 @@ database — the saved PDF is the whole document.
   the model as well as disabled in the UI.
 - **The input grows to four lines and then scrolls.** A vertical `TextField`
   with `lineLimit(1...4)` gives that behaviour; Return inserts a newline and
-  `⌘Return` submits. "Expand" turns the same popover into a larger `TextEditor`
-  for long notes, with the same Save and Cancel, so there is only one commit
-  path. An existing note reopens from its marker with its body and tint.
-- **Six paper tints, drawn natively.** Honey, Rose, Mint, Sky, Lavender and Sand
-  are opaque sRGB values used for `/C`, for the composer card and for the page
-  marker. No artwork, fonts or third-party assets are involved, and none of
-  ShuaMac's sticker illustrations are copied.
-- **The page marker is a page overlay, not a written appearance.** PDFKit draws
-  its own icon for a `/Text` annotation; the overlay paints an opaque paper
-  marker over the same rectangle, so the page shows one marker and the file
-  still holds a plain standard note. A pixel check in this environment measured
-  the icon at 360 red pixels and 0 after the marker was drawn over it. Markers
-  are derived from the document (`noteMarkers`), never stored separately, so a
-  marker cannot outlive its annotation.
+  `⌘Return` submits. The sticker face on the left opens the appearance popover
+  (templates, six tints and the 20 motifs), and the `ellipsis` menu offers
+  "Expand to Edit" and "Delete". Expand switches to the 540×560 sheet editor
+  with a `TextEditor` for long notes, the same appearance controls and the same
+  Save and Cancel, so there is only one commit path. An existing note reopens
+  from its marker with its body and its style.
+- **Twenty original sticker motifs and six paper tints.** Honey, Rose, Mint,
+  Sky, Lavender and Sand remain the existing `NotePaperColor` values, used for
+  `/C`, the composer paper and the marker's rounded-square fallback. Every motif
+  has a stable raw ID and a 256×256 transparent PNG in
+  `YoPDF/Resources/Assets.xcassets`; the inventory, provenance and SHA-256
+  hashes are in `STICKER_ASSETS_MANIFEST.md`. Simple Paper (`plain`) has no
+  illustration.
+- **The sticker marker is a page overlay, not a written appearance.** PDFKit
+  still draws its own icon for a `/Text` annotation, so the overlay redraws the
+  page content with YoPDF's notes suppressed inside each marker rect and then
+  paints the 32pt artwork with its shadow (or a tinted rounded square with the
+  template's SF Symbol). The page shows one sticker while the file holds a
+  standard note. The overlay is transparent to hit testing everywhere except a
+  marker, where it shows a pointing-hand cursor and claims the click, so
+  PDFKit's native note popup cannot open over the sticker. Markers are derived
+  from the document (`noteMarkers`), never stored separately, so a marker cannot
+  outlive its annotation.
+- **Templates are a seed, not a reference.** The twelve built-in outlines carry
+  ShuaMac's identities, symbols, tints, motifs and prompt text; personal
+  templates live in `UserDefaults` under `YoPDFNoteTemplates.v1` and are edited
+  in a 760×590 library sheet. Applying a template replaces the body only while
+  the draft still holds the previous seed (or is empty), and it copies the
+  appearance into the draft. The saved note stores its own style snapshot, so
+  editing or deleting a template later cannot restyle an existing note. An
+  unreadable template library is kept as stored and refuses writes instead of
+  being silently replaced with an empty one.
 - **Notes share the markup edit pipeline.** `addNote`, `updateNote` and
   `deleteNote` build one `MarkupEdit`, so a body change and a paper change in
   one Save are a single Undo entry, and a successful save clears the history
@@ -356,15 +386,73 @@ database — the saved PDF is the whole document.
   `PDFDocument` with its body, tint and rectangle, and a `/Text` annotation
   created by another application (no YoPDF keys at all) can be read, edited and
   deleted here; its highlight and square neighbours survive the round trip.
+  An untouched third-party note keeps PDFKit's native icon and native hit
+  target. Restyling it through YoPDF adopts it explicitly (see P2d below).
   Apple Preview reads the body from `/Contents`. That was checked by inspecting
   the written annotation dictionary and by reopening the file in a separate
   PDFKit process, not by watching Preview's window.
 
+### Sticker persistence (P2d)
+
+- **`/YoPDFNoteStyle` is a versioned JSON string**, currently
+  `{"v":2,"title":"","symbol":"note.text","motif":"bunny","palette":"honey"}`.
+  A motif ID is the persistent identity; the collection is only a UI grouping.
+  `title` and `symbol` are the template identity the expanded editor shows; a
+  v1 value has neither and reads as an empty title with `note.text`. A style is
+  a value on the annotation, so a future template cannot change a saved note.
+- **`/YoPDFNoteAnchorX` and `/YoPDFNoteAnchorY` are numbers normalized to the
+  page's CropBox** (0…1). The marker centre is
+  `crop.minX + x * crop.width`, `crop.minY + y * crop.height`. For owned
+  notes, rendering, hit testing and the popover all use
+  `NoteService.markerCenter` and `NoteService.displayBounds`, so they cannot
+  disagree. Third-party notes use their native annotation bounds instead.
+- **`/YoPDFNoteIdentity` is the ownership marker**, currently
+  `yopdf-note-1`. New notes write it. A note is recognised as YoPDF only when
+  that key is present, or when the legacy PR #6 keys (`/YoPDFNotePaper`,
+  `/YoPDFNotePageLevel`) are present. `/NM` is dropped by PDFKit, and
+  `userName`, `/C` and the body are never used to infer ownership. Recognition
+  is read-only: opening a PR #6 file does not add the identity key.
+- **Third-party `/Text` notes keep their native icon.** Only recognised YoPDF
+  notes enter `noteMarkers` and get the custom sticker card. An untouched
+  third-party note uses its own annotation rectangle for hit testing, not an
+  invisible sticker-sized card, and its popover points at the native icon.
+- **Restyling a third-party note is the adoption point.** A body-only edit
+  leaves it native. An explicit motif or palette change writes
+  `/YoPDFNoteIdentity` and `/YoPDFNoteStyle` in the same `MarkupEdit`, so the
+  note becomes YoPDF-styled. That edit carries an exact before/after snapshot
+  (including the original `/C` and which keys were absent), so Undo removes the
+  new keys and returns the note to its native icon and hit target.
+- **`/Contents` remains the body.** `/YoPDFNotePaper` and `/C` stay in sync with
+  the palette, so a PR #6 build or another reader still sees the right tint.
+  Losing the style key costs the motif and tint, never the text.
+- **Fallbacks are deliberate.** A missing or malformed style key becomes
+  `plain` + the legacy paper. An unknown motif ID becomes `plain`; an unknown
+  palette uses the legacy paper. None of these rewrites the file on open. A
+  brand-new note does not use `plain`: it starts as `newNote` (Little Bunny on
+  honey paper) and writes that motif explicitly, so no reader has to guess.
+- **Existing notes are not migrated on open.** A PR #6 note keeps its `/Rect`
+  centre and gains no anchor or identity key; only a note created by this build
+  writes the 24×24 `/Rect` + normalized anchor. A third-party note is not
+  touched at all. PDFKit may still rewrite an old `/Rect` on save, which is the
+  pre-existing one-point drift, not a migration.
+- **One Save is one Undo entry.** Body, motif, palette, title and symbol changes
+  are packaged in one `MarkupEdit`; Undo restores the whole prior style.
+  LockedContents permits a style change and refuses the body; ReadOnly and
+  Locked refuse both.
+- **Verification.** `macos/scripts/verify-sticker-assets.sh` checks the manifest
+  hashes, the 20 imagesets, the built `Assets.car` renditions (20, 256×256,
+  alpha) and loads every asset through AppKit from the actual `.app` bundle.
+  The unit tests pin the style wire format (v1 read, v2 write, body-only edits
+  adding no keys), the anchor math, the 32pt marker face and 3pt hit inset, the
+  template seed rules, and the refusal to overwrite an unreadable template
+  library. Window-level rendering of the marker is still a manual check (see
+  below).
+
 Known P2a/P2b limitations:
 
 - No annotation sidebar, no StrikeOut, free-text or ink annotations, and no
-  annotation search. Notes are a single body per annotation: no threads, no
-  templates, no sticker library, and no note list.
+  annotation search. Notes store one body per annotation: templates only seed a
+  draft, so a document carries no template list, no threads and no note list.
 - An annotation without valid `/QuadPoints` falls back to its bounds for
   hit-testing and for the selection overlay. Every mark YoPDF creates has
   quads, but a malformed third-party one has no better geometry available.
@@ -402,7 +490,7 @@ Known P2a/P2b limitations:
   rendering the saved file in a separate PDFKit process, not by observing
   Preview's window.
 
-Known P2c limitations:
+Known P2c/P2d limitations:
 
 - A note body is plain text. `/Contents` holds no formatting, and the composer
   does not offer any.
@@ -411,11 +499,12 @@ Known P2c limitations:
   true of the marker and the composer card; it cannot be true of a viewer that
   renders `/C` itself, and suppressing `/C` would make the note look unrelated
   in other applications.
-- The marker is an overlay drawn at the annotation rectangle. It follows the
-  page transform like the P2b selection outline, but this environment cannot
-  capture a window, so marker alignment after zoom/scroll and on rotated pages
-  is still a manual check. The artwork itself and its coverage of PDFKit's icon
-  were verified offscreen.
+- The sticker marker is a fixed-size overlay centred on the persisted anchor.
+  It follows the page transform like the P2b selection outline, but this
+  environment cannot capture a window, so card alignment after zoom/scroll,
+  rotated pages, edge clamping and coverage of PDFKit's native icon are still
+  manual checks. Unit tests verify the anchor math, the saved keys and asset
+  loading, not pixels on screen.
 - Popover placement is computed from the PDFView's bounds (converted from the
   unflipped AppKit origin). The composer's layout was rendered offscreen, but
   the arrow's position on a real window — including near a screen edge — has not
@@ -425,6 +514,19 @@ Known P2c limitations:
   marker yet.
 - A note is deleted without a confirmation dialog. It is a single Undo away and
   the composer says so, but a user who does not know ⌘Z may be surprised.
+- The template library is a flat list. There are no template folders, no
+  import/export, and no per-document templates; personal templates are
+  preferences on this Mac, so they do not travel with a PDF. Threads/groups,
+  count badges, drag-to-move and a note list are later stages.
+- A future `/YoPDFNoteStyle` version is read leniently, but unknown fields in
+  that value are not preserved when the style is rewritten. `v` is recorded so a
+  later migration can change that without guessing.
+- Artwork parity is a visual acceptance item. The exact 256 px PNGs are the
+  ShuaMac runtime assets, but the card scale, border and decoration were written
+  natively here and must be compared side by side in a GUI session.
+- `Assets.car` re-encodes PNGs. Manifest hashes are of the source runtime PNGs;
+  the verification script checks those hashes plus the compiled rendition names,
+  dimensions and alpha, not the bytes inside `Assets.car`.
 
 Window-level behaviour that still needs a human with a GUI session (this
 environment cannot drive windows: `screencapture`, `osascript` against
@@ -498,6 +600,31 @@ System Events / Preview and `qlmanage -t` are all blocked here):
 23. Repeat the two-window case with both windows approving exit: the app quits.
     The deferred discard has only been exercised through logic tests here, not
     through a real window or a real termination.
+24. Create a note, open the Sticker menu and choose all 20 illustrated motifs
+    plus Simple Paper. The preview and the page marker follow the selection;
+    Save, quit, reopen: every motif and tint is still there, and reopening the
+    note shows the same selection in the menu.
+25. Compare the same page content side by side with ShuaMac: artwork, card
+    colour, border/dashed treatment, artwork scale and marker size. Record the
+    differences; this PR does not claim pixel parity.
+26. With a sticker marker over the native note icon, zoom between Fit and 200%
+    and scroll: exactly one sticker is visible, it stays anchored, and text
+    selection/copy still works through and around it.
+27. Rotate a page and use a PDF with a non-zero CropBox origin: markers stay on
+    the same page point after save/reopen, and a click still opens the right
+    note.
+28. Change only the motif or only the palette, confirm "Edited" appears, dismiss
+    the popover, then reopen "Note Draft": the style is still selected. Do this
+    in two windows and cancel a quit: both style drafts survive.
+29. With a LockedContents note, change the motif: Save succeeds and the body is
+    unchanged; try to change the body: it is refused. With ReadOnly/Locked, the
+    motif and palette controls are disabled.
+30. Open a PDF with a third-party `/Text` note that has no YoPDF keys: it must
+    show PDFKit's native icon, not a sticker card. Clicking the icon opens the
+    composer; clicking just outside the native rectangle must not hit it.
+31. In that third-party note, change only the body and Save: the native icon
+    must remain. Reopen it, change the motif or palette and Save: it becomes a
+    sticker note; ⌘Z must return it to the native icon and original colour.
 
 `YoPDFCore` is a framework so tests are pure logic tests: they link the module
 and never launch the app, so no window server or accessibility permission is
@@ -524,8 +651,11 @@ accounts, sync and PDF editing. P1 added file access and safe persistence. P2a
 adds yellow highlights with a manual save. P2b makes Highlight and Underline
 editable: selection, six presets plus custom colours, recolour, delete, convert
 and Undo/Redo. P2c adds standard `/Text` notes with a compact composer, six paper
-tints, page markers, editing, deletion and Undo/Redo. There is still no autosave,
-document library, annotation sidebar, StrikeOut support, note templates or agent
+tints, page markers, editing, deletion and Undo/Redo. P2d adds 20 original
+sticker motifs, a persistent versioned style (v2 with template title and symbol),
+a CropBox-relative marker anchor, twelve built-in templates with a personal
+template library, and ShuaMac's compact composer. There is still no autosave,
+document library, annotation sidebar, StrikeOut support, note threads or agent
 integration.
 
 Known P1 boundaries:

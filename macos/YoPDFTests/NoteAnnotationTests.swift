@@ -639,13 +639,16 @@ final class NoteAnnotationTests: XCTestCase {
     func testThirdPartyNoteIsReadableEditableAndOtherAnnotationsSurvive() throws {
         let url = try makeThirdPartyFixture()
         let model = openModel(at: url)
+        let page = try XCTUnwrap(model.document?.page(at: 0))
+        let annotation = try XCTUnwrap(page.annotations.first { $0.type == "Text" })
 
-        XCTAssertEqual(model.noteMarkers.count, 1, "only the /Text annotation is a note marker")
-        let marker = try XCTUnwrap(model.noteMarkers.first)
+        XCTAssertTrue(model.noteMarkers.isEmpty, "an untouched third-party note gets no sticker overlay")
         let selection = try XCTUnwrap(model.noteSelection(
-            at: CGPoint(x: marker.bounds.midX, y: marker.bounds.midY),
-            on: try XCTUnwrap(model.document?.page(at: 0))
+            at: CGPoint(x: annotation.bounds.midX, y: annotation.bounds.midY),
+            on: page
         ))
+        XCTAssertFalse(selection.isYoPDFNote)
+        XCTAssertEqual(selection.bounds, annotation.bounds, "the native bounds stay the hit target")
         XCTAssertEqual(selection.contents, "Third party note")
         XCTAssertEqual(selection.paperColor, .honey, "an unknown colour falls back to the default paper")
         XCTAssertTrue(model.notePermissions(for: selection).canEditContents)
@@ -658,15 +661,25 @@ final class NoteAnnotationTests: XCTestCase {
             return XCTFail("a standard /Text annotation from another app must be editable")
         }
 
+        XCTAssertTrue(
+            model.noteMarkers.isEmpty,
+            "a body-only edit must not claim the third-party note's presentation"
+        )
         XCTAssertEqual(model.save(), .saved)
         let reopened = try XCTUnwrap(PDFDocument(url: url))
-        let page = try XCTUnwrap(reopened.page(at: 0))
-        XCTAssertEqual(
-            page.annotations.filter { $0.type == "Text" }.first?.contents,
-            "Edited third party note"
+        let reopenedPage = try XCTUnwrap(reopened.page(at: 0))
+        let reopenedNote = try XCTUnwrap(
+            reopenedPage.annotations.first { $0.type == "Text" }
         )
-        XCTAssertEqual(page.annotations.filter { $0.type == "Highlight" }.count, 1)
-        XCTAssertEqual(page.annotations.filter { $0.type == "Square" }.count, 1)
+        XCTAssertEqual(reopenedNote.contents, "Edited third party note")
+        XCTAssertNil(
+            reopenedNote.value(forAnnotationKey: NoteService.identityKey),
+            "a body-only edit must not write the YoPDF identity marker"
+        )
+        XCTAssertNil(reopenedNote.value(forAnnotationKey: NoteService.styleKey))
+        XCTAssertNil(reopenedNote.value(forAnnotationKey: NoteService.paperColorKey))
+        XCTAssertEqual(reopenedPage.annotations.filter { $0.type == "Highlight" }.count, 1)
+        XCTAssertEqual(reopenedPage.annotations.filter { $0.type == "Square" }.count, 1)
     }
 
     func testHiddenAnnotationIsNotAMarker() throws {

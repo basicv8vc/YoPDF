@@ -24,6 +24,13 @@ struct PDFReaderView: View {
     /// Converts page rectangles into popover anchors through the live PDFView.
     @State private var anchorResolver = PageAnchorResolver()
 
+    #if DEBUG
+    /// Test-only launch hook for deterministic screenshot runs. It is compiled
+    /// out of Release builds and does nothing unless the environment variable is
+    /// present.
+    @State private var didOpenScreenshotPDF = false
+    #endif
+
     /// Something the reader was asked to do that could discard work.
     private enum PendingAction: Equatable {
         case open(URL)
@@ -134,6 +141,17 @@ struct PDFReaderView: View {
         }
         .onOpenURL { url in
             requestOpen(url)
+        }
+        .task {
+            #if DEBUG
+            let environmentPath = ProcessInfo.processInfo.environment["YOPDF_SCREENSHOT_PDF"]
+            let preferencePath = UserDefaults.standard.string(forKey: "YOPDF_SCREENSHOT_PDF")
+            guard !didOpenScreenshotPDF,
+                  let path = environmentPath ?? preferencePath
+            else { return }
+            didOpenScreenshotPDF = true
+            requestOpen(URL(fileURLWithPath: path))
+            #endif
         }
         .focusedSceneValue(\.documentModel, model)
         .focusedSceneValue(\.openDocument, { isImporterPresented = true })
@@ -710,7 +728,7 @@ struct PDFReaderView: View {
                 pageLabel: draft.pageLabel,
                 excerpt: draft.excerpt,
                 contents: "",
-                paper: .honey
+                style: .newNote
             )
         case let .note(note, anchor):
             composerStore.begin(
@@ -719,7 +737,7 @@ struct PDFReaderView: View {
                 pageLabel: note.pageLabel,
                 excerpt: note.excerpt,
                 contents: note.contents,
-                paper: note.paperColor
+                style: note.style
             )
         }
     }

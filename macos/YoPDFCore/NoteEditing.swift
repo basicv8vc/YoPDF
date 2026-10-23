@@ -136,7 +136,7 @@ extension PDFDocumentModel {
     public func addNote(
         _ draft: NoteDraft,
         contents: String,
-        paperColor: NotePaperColor
+        style: NoteStickerStyle
     ) -> Result<NoteSelection, NoteEditError> {
         guard let document else { return .failure(.noDocument) }
         guard isCurrent(draft) else { return .failure(.documentChanged) }
@@ -151,7 +151,8 @@ extension PDFDocumentModel {
         guard let annotation = NoteService.annotation(
             for: draft,
             contents: text,
-            paperColor: paperColor
+            style: style,
+            on: page
         ) else { return .failure(.emptyContents) }
 
         let edit = MarkupEdit(changes: [
@@ -172,17 +173,37 @@ extension PDFDocumentModel {
         return .success(selection)
     }
 
+    /// Compatibility entry point for callers that only choose a paper tint.
+    ///
+    /// New UI code uses `addNote(_:contents:style:)`; this keeps the PR #6 API
+    /// working for tests and any future caller without inventing a second
+    /// persistence path.
+    @discardableResult
+    public func addNote(
+        _ draft: NoteDraft,
+        contents: String,
+        paperColor: NotePaperColor
+    ) -> Result<NoteSelection, NoteEditError> {
+        addNote(
+            draft,
+            contents: contents,
+            style: NoteStickerStyle(motif: .plain, palette: paperColor)
+        )
+    }
+
     // MARK: - Editing
 
-    /// Applies a body change and a paper change as one undoable edit.
+    /// Applies a body change and an appearance change as one undoable edit.
     ///
     /// Unchanged aspects are left out, so saving a colour-only change does not
-    /// rewrite `/Contents`, and a LockedContents note can still be recoloured.
+    /// rewrite `/Contents`, and a LockedContents note can still be restyled.
+    /// The style is read from the annotation, not from the possibly stale
+    /// selection value, so another editor's change is not silently reverted.
     @discardableResult
     public func updateNote(
         _ note: NoteSelection,
         contents: String,
-        paperColor: NotePaperColor
+        style: NoteStickerStyle
     ) -> Result<NoteSelection, NoteEditError> {
         guard let document, isAttached(note),
               let page = document.page(at: note.pageIndex)
@@ -197,6 +218,7 @@ extension PDFDocumentModel {
 
         let oldContents = note.annotation.contents
         let oldText = (oldContents ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let oldStyle = NoteService.style(of: note.annotation)
 
         var changes: [MarkupEditChange] = []
         if oldText != text {
@@ -212,12 +234,16 @@ extension PDFDocumentModel {
                 to: text
             ))
         }
-        if note.paperColor != paperColor {
+        if oldStyle != style {
+            // An explicit style change is the documented adoption point for a
+            // third-party note; a body-only edit leaves it native. The snapshot
+            // also records the original `/C` and which keys did not exist, so
+            // Undo removes the identity and restores the native presentation.
             changes.append(.setNoteStyle(
                 annotation: note.annotation,
                 pageIndex: note.pageIndex,
-                from: note.paperColor,
-                to: paperColor
+                from: NoteService.styleSnapshot(of: note.annotation),
+                to: NoteService.styledSnapshot(for: style, on: note.annotation)
             ))
         }
 
@@ -233,6 +259,24 @@ extension PDFDocumentModel {
             pageIndex: note.pageIndex
         ) else { return .failure(.annotationUnavailable) }
         return .success(selection)
+    }
+
+    /// Compatibility entry point that changes only the paper palette.
+    ///
+    /// The current motif is preserved, so calling this on a sticker note must
+    /// not turn it back into Simple Paper.
+    @discardableResult
+    public func updateNote(
+        _ note: NoteSelection,
+        contents: String,
+        paperColor: NotePaperColor
+    ) -> Result<NoteSelection, NoteEditError> {
+        let current = NoteService.style(of: note.annotation)
+        return updateNote(
+            note,
+            contents: contents,
+            style: NoteStickerStyle(motif: current.motif, palette: paperColor)
+        )
     }
 
     // MARK: - Deleting

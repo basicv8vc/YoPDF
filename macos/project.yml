@@ -91,6 +91,11 @@ targets:
     platform: macOS
     sources:
       - path: YoPDFTests
+      # The sticker tests load the real Asset Catalog. Adding it to the test
+      # bundle keeps them independent of where the .app was built; the separate
+      # verification script checks the actual application bundle.
+      - path: YoPDF/Resources/Assets.xcassets
+        buildPhase: resources
     dependencies:
       - target: YoPDFCore
     settings:

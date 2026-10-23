@@ -269,6 +269,7 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
     private var mouseDownPoint: CGPoint?
     private var mouseDidDrag = false
     private var consumedMouseDown = false
+    private var pendingNoteActivation: (NoteSelection, CGRect)?
     private var overlayViews: [ObjectIdentifier: MarkupSelectionOverlayView] = [:]
 
     override init(frame frameRect: NSRect) {
@@ -318,12 +319,22 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
             let pagePoint = convert(location, to: page)
             let marker = NoteService.markerBounds(
                 center: pagePoint,
-                in: page.bounds(for: displayBox)
+                in: page.bounds(for: .cropBox)
             )
             onPlaceNote?(pagePoint, page, containerRect(forPageRect: marker, on: page))
             return
         }
 
+        if let page = page(for: location, nearest: false) {
+            let pagePoint = convert(location, to: page)
+            if let note = onNoteHit?(pagePoint, page), note.isYoPDFNote {
+                consumedMouseDown = true
+                pendingNoteActivation = (note, containerRect(forPageRect: note.bounds, on: page))
+                mouseDownPoint = location
+                mouseDidDrag = false
+                return
+            }
+        }
         mouseDownPoint = location
         mouseDidDrag = false
         super.mouseDown(with: event)
@@ -337,6 +348,12 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
     override func mouseUp(with event: NSEvent) {
         if consumedMouseDown {
             consumedMouseDown = false
+            if let pendingNoteActivation {
+                onNoteActivated?(pendingNoteActivation.0, pendingNoteActivation.1)
+            }
+            pendingNoteActivation = nil
+            mouseDownPoint = nil
+            mouseDidDrag = false
             return
         }
 
@@ -386,7 +403,7 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
             ?? containerRect(
                 forPageRect: NoteService.markerBounds(
                     center: pagePoint,
-                    in: page.bounds(for: displayBox)
+                    in: page.bounds(for: .cropBox)
                 ),
                 on: page
             )
@@ -420,9 +437,42 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
         let overlay = MarkupSelectionOverlayView()
         let pageIndex = view.document?.index(for: page) ?? -1
         overlay.pageIndex = pageIndex
-        overlay.pageBounds = page.bounds(for: view.displayBox)
+        overlay.page = page
+        overlay.pageBounds = page.bounds(for: .cropBox)
         overlay.selectedMarkup = selectedMarkup
         overlay.markers = noteMarkers.filter { $0.pageIndex == pageIndex }
+        overlay.onMarkerActivated = { [weak self] marker in
+            guard let self,
+                  let page = self.document?.page(at: marker.pageIndex),
+                  let note = self.onNoteHit?(marker.center, page)
+            else { return }
+            self.onNoteActivated?(
+                note,
+                self.containerRect(forPageRect: note.bounds, on: page)
+            )
+        }
+        overlay.onMarkerMenu = { [weak self] marker in
+            guard let self,
+                  let page = self.document?.page(at: marker.pageIndex)
+            else { return nil }
+            let note = self.onNoteHit?(marker.center, page)
+            let anchor = note.map { self.containerRect(forPageRect: $0.bounds, on: page) }
+                ?? self.containerRect(forPageRect: marker.bounds, on: page)
+            let items = self.makeMenuItems?(
+                PageMenuContext(
+                    page: page,
+                    pagePoint: marker.center,
+                    note: note,
+                    anchorRect: anchor
+                )
+            ) ?? []
+            guard !items.isEmpty else { return nil }
+            let menu = NSMenu()
+            for item in items {
+                menu.addItem(item)
+            }
+            return menu
+        }
         overlayViews[ObjectIdentifier(page)] = overlay
         return overlay
     }
@@ -454,6 +504,7 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
 private final class MarkupSelectionOverlayView: NSView {
 
     var pageIndex = -1
+    var page: PDFPage?
     var pageBounds: CGRect = .zero
     var selectedMarkup: MarkupSelection? {
         didSet { needsDisplay = true }
@@ -462,14 +513,51 @@ private final class MarkupSelectionOverlayView: NSView {
         didSet {
             guard markers != oldValue else { return }
             needsDisplay = true
+            window?.invalidateCursorRects(for: self)
         }
     }
+    var onMarkerActivated: ((NoteMarker) -> Void)?
+    var onMarkerMenu: ((NoteMarker) -> NSMenu?)?
 
     override var isOpaque: Bool { false }
 
-    /// The overlay is presentation-only; clicks must continue to reach the
-    /// PDFView beneath it for text selection and note/markup hit-testing.
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    private func marker(at point: NSPoint) -> NoteMarker? {
+        let pagePoint = CGPoint(
+            x: point.x + pageBounds.minX,
+            y: point.y + pageBounds.minY
+        )
+        return markers.reversed().first {
+            stickerFrame(for: $0.bounds).contains(pagePoint)
+        }
+    }
+
+    /// Markers take clicks so PDFKit cannot open its native note popup over the
+    /// sticker. Everywhere else the overlay is transparent to hit testing, so
+    /// text selection, links and scrolling keep working.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        marker(at: point) == nil ? nil : self
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        for marker in markers {
+            let frame = stickerFrame(for: marker.bounds)
+            let rect = frame.offsetBy(dx: -pageBounds.minX, dy: -pageBounds.minY)
+            addCursorRect(rect, cursor: .pointingHand)
+        }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard let marker = self.marker(at: point) else { return }
+        onMarkerActivated?(marker)
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let point = convert(event.locationInWindow, from: nil)
+        guard let marker = self.marker(at: point) else { return nil }
+        return onMarkerMenu?(marker)
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         drawSelectedMarkup()
@@ -497,63 +585,130 @@ private final class MarkupSelectionOverlayView: NSView {
         }
     }
 
-    /// A small paper-coloured marker with two ruled lines.
+    /// Draws the ShuaMac marker treatment: the original 32pt artwork with its
+    /// subtle shadow, or a colored rounded-square fallback with a brown symbol.
     ///
-    /// It is drawn slightly larger than the annotation's rectangle and filled
-    /// opaquely on purpose: PDFKit renders its own icon for a `/Text`
-    /// annotation, and this covers it so the page shows one marker rather than
-    /// two. The marker is presentation only — nothing about it is written to the
-    /// file, so another reader still sees a standard note icon.
+    /// PDFKit still renders its native note icon underneath. The page content
+    /// is re-drawn with YoPDF's annotations removed inside each marker's small
+    /// rect, exactly like ShuaMac's page overlay, so the transparent parts of a
+    /// sticker cannot reveal a second icon. There is deliberately no card,
+    /// stacked border or palette fill here.
     private func drawNoteMarkers() {
+        guard let page else { return }
+
         for marker in markers where marker.pageIndex == pageIndex {
             let rect = marker.bounds.offsetBy(dx: -pageBounds.minX, dy: -pageBounds.minY)
             guard rect.width > 1, rect.height > 1 else { continue }
-
-            let outer = rect.insetBy(dx: -2, dy: -2)
-            let paper = marker.paperColor.color
-
-            let body = NSBezierPath(roundedRect: outer, xRadius: 6, yRadius: 6)
-            paper.setFill()
-            body.fill()
-            // Stroking in the fill colour closes the rounded corners so the
-            // annotation icon underneath cannot peek through them.
-            paper.setStroke()
-            body.lineWidth = 2
-            body.stroke()
-
-            let border = NSBezierPath(
-                roundedRect: outer.insetBy(dx: 0.5, dy: 0.5),
-                xRadius: 5.5,
-                yRadius: 5.5
-            )
-            NSColor.black.withAlphaComponent(0.18).setStroke()
-            border.lineWidth = 1
-            border.stroke()
-
-            drawRuledLines(in: outer)
+            drawPageBackground(in: rect, page: page)
+            drawSticker(marker.style, at: rect)
         }
     }
 
-    private func drawRuledLines(in rect: CGRect) {
-        let ink = NSColor(calibratedRed: 0.32, green: 0.26, blue: 0.16, alpha: 0.55)
-        ink.setFill()
-        let inset = rect.width * 0.24
-        let lineHeight = max(rect.height * 0.09, 1)
-        let widths: [CGFloat] = [1, 0.72]
-        for (index, factor) in widths.enumerated() {
-            let y = rect.minY + rect.height * (0.60 - CGFloat(index) * 0.20)
-            let width = (rect.width - inset * 2) * factor
-            let line = NSBezierPath(
-                roundedRect: CGRect(
-                    x: rect.minX + inset,
-                    y: y,
-                    width: max(width, 1),
-                    height: lineHeight
-                ),
-                xRadius: lineHeight / 2,
-                yRadius: lineHeight / 2
-            )
-            line.fill()
+    /// Masks PDFKit's built-in note icon by reproducing the page without this
+    /// application's note annotations inside the marker rectangle only. The rest
+    /// of PDFKit's rendering, text selection and links stay untouched.
+    private func drawPageBackground(in rect: CGRect, page: PDFPage) {
+        guard let context = NSGraphicsContext.current?.cgContext,
+              let pageCopy = page.copy() as? PDFPage
+        else { return }
+
+        pageCopy.rotation = 0
+        pageCopy.displaysAnnotations = page.displaysAnnotations
+        for annotation in pageCopy.annotations {
+            if NoteService.isYoPDFNote(annotation) || annotation.type == "Popup" {
+                pageCopy.removeAnnotation(annotation)
+            }
+        }
+
+        let crop = pageCopy.bounds(for: .cropBox)
+        guard crop.width > 0, crop.height > 0, bounds.width > 0, bounds.height > 0 else {
+            return
+        }
+
+        let scale = min(bounds.width / crop.width, bounds.height / crop.height)
+        let renderedSize = CGSize(
+            width: crop.width * scale,
+            height: crop.height * scale
+        )
+
+        context.saveGState()
+        context.clip(to: rect)
+        context.translateBy(
+            x: bounds.midX - renderedSize.width / 2 - crop.minX * scale,
+            y: bounds.midY - renderedSize.height / 2 - crop.minY * scale
+        )
+        context.scaleBy(x: scale, y: scale)
+        pageCopy.draw(with: .cropBox, to: context)
+        context.restoreGState()
+    }
+
+    /// The size of ShuaMac's sticker artwork inside a marker.
+    private static let stickerArtworkSize: CGFloat = 32
+
+    /// The marker frame: exactly the sticker artwork.
+    ///
+    /// ShuaMac grows its overlay frame sideways for a multi-thought count badge.
+    /// A YoPDF note holds exactly one body, so there is no count to show and no
+    /// badge to reserve room for; the marker is the 32pt face itself.
+    private static var stickerSize: CGSize {
+        CGSize(width: stickerArtworkSize, height: stickerArtworkSize)
+    }
+
+    /// The marker frame centred on a note's anchor, clamped to the page.
+    ///
+    /// ShuaMac centres the frame on the anchor point and then clamps it inside the
+    /// overlay, so a marker near a page edge cannot push its artwork out of view.
+    /// YoPDF stores a 24pt `/Rect` rather than a point, so the frame is centred on
+    /// that rect and clamped to the same page area.
+    private func stickerFrame(for anchorRect: CGRect) -> CGRect {
+        let size = Self.stickerSize
+        let proposed = CGRect(
+            x: anchorRect.midX - size.width / 2,
+            y: anchorRect.midY - size.height / 2,
+            width: size.width,
+            height: size.height
+        )
+        guard pageBounds.width > 0, pageBounds.height > 0 else { return proposed }
+
+        let minimumX = pageBounds.minX + 2
+        let minimumY = pageBounds.minY + 2
+        let maximumX = max(minimumX, pageBounds.maxX - size.width - 2)
+        let maximumY = max(minimumY, pageBounds.maxY - size.height - 2)
+        return CGRect(
+            x: min(max(proposed.minX, minimumX), maximumX),
+            y: min(max(proposed.minY, minimumY), maximumY),
+            width: size.width,
+            height: size.height
+        )
+    }
+
+    private func drawSticker(_ style: NoteStickerStyle, at anchor: CGRect) {
+        let artRect = stickerFrame(for: anchor)
+
+        if let name = style.motif.assetName,
+           let image = NSImage(named: NSImage.Name(name)) {
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current?.imageInterpolation = .high
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(0.13)
+            shadow.shadowBlurRadius = 1.5
+            shadow.shadowOffset = NSSize(width: 0, height: -1)
+            shadow.set()
+            image.draw(in: artRect, from: .zero, operation: .sourceOver, fraction: 1)
+            NSGraphicsContext.restoreGraphicsState()
+        } else {
+            style.palette.color.setFill()
+            NSBezierPath(
+                roundedRect: artRect.insetBy(dx: 3, dy: 3),
+                xRadius: 6,
+                yRadius: 6
+            ).fill()
+            let icon = NSImage(
+                systemSymbolName: style.resolvedSymbol,
+                accessibilityDescription: nil
+            )?.withSymbolConfiguration(.init(paletteColors: [.brown]))
+            icon?.draw(in: artRect.insetBy(dx: 8, dy: 8))
         }
     }
+
 }
