@@ -282,6 +282,10 @@ public enum NoteService {
     private struct ShuaThoughtIdentity: Equatable {
         let anchorID: UUID
         let thoughtID: UUID
+
+        var persistenceValue: String {
+            "\(anchorID.uuidString):\(thoughtID.uuidString)"
+        }
     }
 
     /// The identity and presentation fields ShuaMac embeds on thought notes.
@@ -364,6 +368,9 @@ public enum NoteService {
     /// ShuaMac stores its appearance in an optional custom PDF string.
     static let shuaStickerStyleKey = PDFAnnotationKey(rawValue: "ShuaStickerStyle")
     private static let shuaThoughtMetadataKey = PDFAnnotationKey(rawValue: "ShuaThoughtMetadata")
+    /// Full `/NM` identity retained when it conflicts with embedded metadata,
+    /// because PDFKit may drop `/NM` while writing the document.
+    private static let shuaIdentityPersistenceKey = PDFAnnotationKey(rawValue: "/YoPDFShuaThoughtIdentity")
     /// Legacy fallback for Shua PDFs whose only group identity is `/NM`, which
     /// PDFKit may discard while serializing. Newer PDFs retain their embedded
     /// `ShuaThoughtMetadata` without this extra key.
@@ -420,15 +427,26 @@ public enum NoteService {
         let persistedAnchorID = (annotation.value(forAnnotationKey: shuaAnchorPersistenceKey) as? String)
             .flatMap(UUID.init(uuidString:))
         let namedIdentity = shuaThoughtIdentityFromName(of: annotation)
+        let persistedIdentity = shuaThoughtIdentityFromPersistence(of: annotation)
         let metadata = shuaThoughtMetadata(of: annotation)
 
         if let metadata {
-            if let namedIdentity, namedIdentity != metadata.identity { return nil }
+            if let namedIdentity {
+                return namedIdentity == metadata.identity ? metadata.anchor.id : nil
+            }
+            if let persistedIdentity, persistedIdentity != metadata.identity { return nil }
             if let persistedAnchorID, persistedAnchorID != metadata.anchor.id { return nil }
             return metadata.anchor.id
         }
 
-        let anchorIDs = [persistedAnchorID, namedIdentity?.anchorID].compactMap { $0 }
+        if let namedIdentity, let persistedIdentity, namedIdentity != persistedIdentity {
+            return nil
+        }
+        let anchorIDs = [
+            persistedAnchorID,
+            namedIdentity?.anchorID,
+            persistedIdentity?.anchorID,
+        ].compactMap { $0 }
         guard Set(anchorIDs).count <= 1 else { return nil }
         return anchorIDs.first
     }
@@ -450,35 +468,79 @@ public enum NoteService {
         return metadata
     }
 
-    /// Preserves legacy Shua group IDs through PDFKit's `/NM` loss on write.
+    /// Preserves Shua identities through PDFKit's `/NM` loss on write.
     ///
-    /// The temporary key is included only for name-only annotations, then
-    /// removed from the live annotations before returning. PR #1007 files keep
-    /// their embedded identity, order, and anchor metadata in the PDF itself.
+    /// Name-only annotations use a temporary anchor cache. If `/NM` conflicts
+    /// with valid embedded metadata, a second temporary key preserves the full
+    /// name identity so the conflict remains detectable after serialization.
+    /// Temporary keys are removed from live annotations before returning.
     public static func dataRepresentationPreservingShuaGroups(
         in document: PDFDocument
     ) -> Data? {
-        var previousValues: [(PDFAnnotation, Any?)] = []
+        var previousValues: [(PDFAnnotation, PDFAnnotationKey, Any?)] = []
+        defer {
+            for (annotation, key, value) in previousValues {
+                if let value {
+                    _ = annotation.setValue(value, forAnnotationKey: key)
+                } else {
+                    annotation.removeValue(forAnnotationKey: key)
+                }
+            }
+        }
+
+        func temporarilySet(
+            _ value: String?,
+            for key: PDFAnnotationKey,
+            on annotation: PDFAnnotation
+        ) -> Bool {
+            previousValues.append((annotation, key, annotation.value(forAnnotationKey: key)))
+            if let value {
+                return annotation.setValue(value, forAnnotationKey: key)
+            } else {
+                annotation.removeValue(forAnnotationKey: key)
+                return true
+            }
+        }
+
         for pageIndex in 0..<document.pageCount {
             guard let page = document.page(at: pageIndex) else { continue }
             for annotation in page.annotations {
-                guard let anchorID = shuaAnchorIDFromName(of: annotation),
+                let nameIdentity = shuaThoughtIdentityFromName(of: annotation)
+                let persistedIdentity = shuaThoughtIdentityFromPersistence(of: annotation)
+                let metadata = shuaThoughtMetadata(of: annotation)
+
+                if let metadata {
+                    if let nameIdentity {
+                        if nameIdentity != metadata.identity {
+                            if persistedIdentity != nameIdentity {
+                                guard temporarilySet(
+                                    nameIdentity.persistenceValue,
+                                    for: shuaIdentityPersistenceKey,
+                                    on: annotation
+                                ) else { return nil }
+                            }
+                        } else if annotation.value(forAnnotationKey: shuaIdentityPersistenceKey) != nil {
+                            // Current Shua fields agree; discard any stale conflict cache.
+                            guard temporarilySet(nil, for: shuaIdentityPersistenceKey, on: annotation)
+                            else { return nil }
+                        }
+                    } else if persistedIdentity == metadata.identity,
+                              annotation.value(forAnnotationKey: shuaIdentityPersistenceKey) != nil {
+                        guard temporarilySet(nil, for: shuaIdentityPersistenceKey, on: annotation)
+                        else { return nil }
+                    }
+                }
+
+                guard let nameIdentity,
                       (annotation.value(forAnnotationKey: shuaAnchorPersistenceKey) as? String)
-                        .flatMap(UUID.init(uuidString:)) == nil
+                        .flatMap(UUID.init(uuidString:)) != nameIdentity.anchorID
                 else { continue }
 
-                let previous = annotation.value(forAnnotationKey: shuaAnchorPersistenceKey)
-                previousValues.append((annotation, previous))
-                _ = annotation.setValue(anchorID.uuidString, forAnnotationKey: shuaAnchorPersistenceKey)
-            }
-        }
-        defer {
-            for (annotation, value) in previousValues {
-                if let value {
-                    _ = annotation.setValue(value, forAnnotationKey: shuaAnchorPersistenceKey)
-                } else {
-                    annotation.removeValue(forAnnotationKey: shuaAnchorPersistenceKey)
-                }
+                guard temporarilySet(
+                    nameIdentity.anchorID.uuidString,
+                    for: shuaAnchorPersistenceKey,
+                    on: annotation
+                ) else { return nil }
             }
         }
         return document.dataRepresentation()
@@ -497,8 +559,18 @@ public enum NoteService {
         return ShuaThoughtIdentity(anchorID: anchorID, thoughtID: thoughtID)
     }
 
-    private static func shuaAnchorIDFromName(of annotation: PDFAnnotation) -> UUID? {
-        shuaThoughtIdentityFromName(of: annotation)?.anchorID
+    private static func shuaThoughtIdentityFromPersistence(
+        of annotation: PDFAnnotation
+    ) -> ShuaThoughtIdentity? {
+        guard isTextAnnotation(annotation),
+              let raw = annotation.value(forAnnotationKey: shuaIdentityPersistenceKey) as? String
+        else { return nil }
+        let parts = raw.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              let anchorID = UUID(uuidString: String(parts[0])),
+              let thoughtID = UUID(uuidString: String(parts[1]))
+        else { return nil }
+        return ShuaThoughtIdentity(anchorID: anchorID, thoughtID: thoughtID)
     }
 
     private static func shuaMarkerCenter(
@@ -857,7 +929,11 @@ public enum NoteService {
                 shuaGroups[anchorID, default: []].append(annotation)
             }
 
-            for annotation in visible where isYoPDFNote(annotation) && shuaAnchorID(of: annotation) == nil {
+            for annotation in visible
+                where isYoPDFNote(annotation)
+                    && !isShuaThought(annotation)
+                    && shuaAnchorID(of: annotation) == nil
+            {
                 let center = markerCenter(of: annotation, on: page)
                 let bounds = displayBounds(center: center, in: page.bounds(for: .cropBox))
                 markers.append(NoteMarker(
