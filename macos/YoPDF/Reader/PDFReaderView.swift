@@ -459,6 +459,9 @@ struct PDFReaderView: View {
                     isPlacingNote = false
                     requestCompose(.note(note, anchor))
                 },
+                onNoteMoved: { note, center in
+                    _ = model.moveNoteMarker(note, to: center)
+                },
                 onPlaceNote: { point, page, anchor in
                     placePageNote(at: point, on: page, anchor: anchor)
                 },

@@ -40,6 +40,14 @@ enum MarkupEditChange {
         from: NoteStyleSnapshot,
         to: NoteStyleSnapshot
     )
+    /// Moving a note keeps its standard PDF rectangle and YoPDF's normalized
+    /// marker anchor in one reversible edit.
+    case setNotePosition(
+        annotation: PDFAnnotation,
+        pageIndex: Int,
+        from: NotePositionSnapshot,
+        to: NotePositionSnapshot
+    )
 
     var pageIndex: Int {
         switch self {
@@ -47,7 +55,8 @@ enum MarkupEditChange {
              let .remove(_, pageIndex),
              let .recolor(_, pageIndex, _, _),
              let .setContents(_, pageIndex, _, _),
-             let .setNoteStyle(_, pageIndex, _, _):
+             let .setNoteStyle(_, pageIndex, _, _),
+             let .setNotePosition(_, pageIndex, _, _):
             return pageIndex
         }
     }
@@ -58,7 +67,8 @@ enum MarkupEditChange {
              let .remove(annotation, _),
              let .recolor(annotation, _, _, _),
              let .setContents(annotation, _, _, _),
-             let .setNoteStyle(annotation, _, _, _):
+             let .setNoteStyle(annotation, _, _, _),
+             let .setNotePosition(annotation, _, _, _):
             return annotation
         }
     }
@@ -438,7 +448,7 @@ extension PDFDocumentModel {
                           !page.annotations.contains(where: { $0 === annotation })
                     else { return .invalidHistory }
                 }
-            case .recolor, .setNoteStyle:
+            case .recolor, .setNoteStyle, .setNotePosition:
                 guard annotation.page === page,
                       page.annotations.contains(where: { $0 === annotation })
                 else { return .invalidHistory }
@@ -459,7 +469,7 @@ extension PDFDocumentModel {
                 guard document.allowsCommenting,
                       MarkupPermissions.allowsContentsChanges(annotation)
                 else { return .permissionDenied }
-            case .insert, .remove, .recolor, .setNoteStyle:
+            case .insert, .remove, .recolor, .setNoteStyle, .setNotePosition:
                 guard MarkupPermissions.allowsAnnotationChanges(annotation, in: document)
                 else { return .permissionDenied }
             }
@@ -488,6 +498,8 @@ extension PDFDocumentModel {
                 NoteService.setContents(forward ? to : from, on: annotation)
             case let .setNoteStyle(annotation, _, from, to):
                 NoteService.applyStyleSnapshot(forward ? to : from, to: annotation)
+            case let .setNotePosition(annotation, _, from, to):
+                NoteService.applyPositionSnapshot(forward ? to : from, to: annotation)
             }
         }
 

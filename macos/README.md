@@ -31,7 +31,10 @@ rewrites a `/Text` annotation's `/Rect` on the first save. The composer follows
 ShuaMac's compact layout: a 32pt sticker face, a template menu with the twelve
 built-in outlines plus a personal template library, and an expandable sheet
 editor. ShuaMac thought groups imported from PDF show one sticker with a count
-badge; full grouped editing and marker dragging remain later stages.
+badge. Legacy stacks that lost their group ID are recognized when same-style,
+24pt Shua note rectangles form a continuous 23pt vertical stack. Dragging a
+group marker moves its member notes together. Editing individual thoughts
+within a group remains a later stage.
 
 ## Requirements
 

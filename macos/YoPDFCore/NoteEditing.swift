@@ -143,6 +143,79 @@ extension PDFDocumentModel {
         return NoteService.permissions(for: note.annotation, in: document)
     }
 
+    /// Moves a sticker marker and its PDF note rectangle as one undoable edit.
+    ///
+    /// ShuaMac stores one `/Text` annotation per thought in a group. Moving the
+    /// group translates every member together and writes the shared normalized
+    /// anchor on each note, so both YoPDF and other PDF readers keep the new
+    /// location after saving.
+    @discardableResult
+    public func moveNoteMarker(_ note: NoteSelection, to proposedCenter: CGPoint) -> Bool {
+        guard let document,
+              isAttached(note),
+              note.usesStickerPresentation,
+              document.allowsCommenting,
+              let page = document.page(at: note.pageIndex),
+              let marker = noteMarkers.first(where: {
+                  $0.pageIndex == note.pageIndex && $0.id == note.id
+              })
+        else { return false }
+
+        let targetBounds = NoteService.displayBounds(
+            center: proposedCenter,
+            in: page.bounds(for: .cropBox),
+            count: marker.count,
+            showsCountBadge: marker.showsCountBadge
+        )
+        let targetCenter = CGPoint(x: targetBounds.midX, y: targetBounds.midY)
+        let currentCenter = CGPoint(x: marker.bounds.midX, y: marker.bounds.midY)
+        let delta = CGPoint(
+            x: targetCenter.x - currentCenter.x,
+            y: targetCenter.y - currentCenter.y
+        )
+        guard hypot(delta.x, delta.y) > 0.25 else { return false }
+
+        let groupID = NoteService.shuaAnchorID(of: note.annotation)
+        let annotations: [PDFAnnotation]
+        if let groupID {
+            annotations = page.annotations.filter {
+                NoteService.shuaAnchorID(of: $0) == groupID
+            }
+        } else {
+            annotations = NoteService.shuaStackMembers(of: note.annotation, on: page)
+        }
+        guard !annotations.isEmpty,
+              annotations.allSatisfy({
+                  annotation in
+                  annotation.page === page
+                      && page.annotations.contains(where: { $0 === annotation })
+                      && MarkupPermissions.allowsAnnotationChanges(annotation, in: document)
+              })
+        else { return false }
+
+        let changes = annotations.compactMap { annotation -> MarkupEditChange? in
+            let from = NoteService.positionSnapshot(of: annotation)
+            let translatedBounds = annotation.bounds.offsetBy(dx: delta.x, dy: delta.y)
+            guard let to = NoteService.positionSnapshot(
+                bounds: translatedBounds,
+                anchor: targetCenter,
+                on: page
+            ) else { return nil }
+            return .setNotePosition(
+                annotation: annotation,
+                pageIndex: note.pageIndex,
+                from: from,
+                to: to
+            )
+        }
+        guard changes.count == annotations.count,
+              performMarkupEdit(MarkupEdit(changes: changes))
+        else { return false }
+
+        selectedMarkup = nil
+        return true
+    }
+
     // MARK: - Creating
 
     /// Adds a standard `/Text` annotation for a captured anchor.
