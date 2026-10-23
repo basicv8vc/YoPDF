@@ -30,7 +30,8 @@ still reads). The marker position is a CropBox-relative anchor because PDFKit
 rewrites a `/Text` annotation's `/Rect` on the first save. The composer follows
 ShuaMac's compact layout: a 32pt sticker face, a template menu with the twelve
 built-in outlines plus a personal template library, and an expandable sheet
-editor. Note threads, count badges and marker dragging remain later stages.
+editor. ShuaMac thought groups imported from PDF show one sticker with a count
+badge; full grouped editing and marker dragging remain later stages.
 
 ## Requirements
 
@@ -391,6 +392,15 @@ database — the saved PDF is the whole document.
   Apple Preview reads the body from `/Contents`. That was checked by inspecting
   the written annotation dictionary and by reopening the file in a separate
   PDFKit process, not by watching Preview's window.
+- **ShuaMac thought groups.** ShuaMac writes each thought as a standard `/Text`
+  annotation, stores the optional appearance JSON in `ShuaStickerStyle`, and
+  includes the shared anchor UUID in `/NM` as
+  `shua-thought:<anchor UUID>:<thought UUID>`. YoPDF recognizes those fields,
+  paints one sticker and count badge per anchor, and masks the stack of native
+  PDFKit icons. Clicking it opens the first note and a disclosure list keeps
+  the other note bodies readable. A save temporarily writes the shared anchor
+  ID under `/YoPDFShuaAnchorID`, because PDFKit may drop `/NM` while serializing;
+  the live document is restored before the save returns.
 
 ### Sticker persistence (P2d)
 
@@ -412,10 +422,11 @@ database — the saved PDF is the whole document.
   `/YoPDFNotePageLevel`) are present. `/NM` is dropped by PDFKit, and
   `userName`, `/C` and the body are never used to infer ownership. Recognition
   is read-only: opening a PR #6 file does not add the identity key.
-- **Third-party `/Text` notes keep their native icon.** Only recognised YoPDF
-  notes enter `noteMarkers` and get the custom sticker card. An untouched
-  third-party note uses its own annotation rectangle for hit testing, not an
-  invisible sticker-sized card, and its popover points at the native icon.
+- **Untagged third-party `/Text` notes keep their native icon.** YoPDF notes and
+  recognized ShuaMac thoughts enter `noteMarkers`; the latter are grouped by
+  ShuaMac's anchor UUID and use its saved sticker style when available. An
+  untagged third-party note uses its own annotation rectangle for hit testing,
+  not an invisible sticker-sized card, and its popover points at the native icon.
 - **Restyling a third-party note is the adoption point.** A body-only edit
   leaves it native. An explicit motif or palette change writes
   `/YoPDFNoteIdentity` and `/YoPDFNoteStyle` in the same `MarkupEdit`, so the
@@ -451,8 +462,11 @@ database — the saved PDF is the whole document.
 Known P2a/P2b limitations:
 
 - No annotation sidebar, no StrikeOut, free-text or ink annotations, and no
-  annotation search. Notes store one body per annotation: templates only seed a
-  draft, so a document carries no template list, no threads and no note list.
+  annotation search. YoPDF-created notes still store one body per annotation.
+  Imported ShuaMac groups show their count and all bodies, but YoPDF currently
+  edits only the first note in the group; adding, editing and deleting other
+  group members remains future work. Templates only seed drafts and are not
+  stored in the document.
 - An annotation without valid `/QuadPoints` falls back to its bounds for
   hit-testing and for the selection overlay. Every mark YoPDF creates has
   quads, but a malformed third-party one has no better geometry available.
@@ -516,8 +530,9 @@ Known P2c/P2d limitations:
   the composer says so, but a user who does not know ⌘Z may be surprised.
 - The template library is a flat list. There are no template folders, no
   import/export, and no per-document templates; personal templates are
-  preferences on this Mac, so they do not travel with a PDF. Threads/groups,
-  count badges, drag-to-move and a note list are later stages.
+  preferences on this Mac, so they do not travel with a PDF. Creating and
+  editing grouped notes, drag-to-move and a document-wide note list are later
+  stages.
 - A future `/YoPDFNoteStyle` version is read leniently, but unknown fields in
   that value are not preserved when the style is rewritten. `v` is recorded so a
   later migration can change that without guessing.
@@ -625,6 +640,11 @@ System Events / Preview and `qlmanage -t` are all blocked here):
 31. In that third-party note, change only the body and Save: the native icon
     must remain. Reopen it, change the motif or palette and Save: it becomes a
     sticker note; ⌘Z must return it to the native icon and original colour.
+32. Open a ShuaMac PDF with several `shua-thought:<anchor>:<thought>` notes:
+    each anchor shows one sticker with the correct count, the first sticker style
+    is used, the hidden native icon stack does not show through, and the disclosure
+    lists the remaining note bodies. Save, close and reopen; the group count must
+    survive PDFKit serialization via `/YoPDFShuaAnchorID`.
 
 `YoPDFCore` is a framework so tests are pure logic tests: they link the module
 and never launch the app, so no window server or accessibility permission is

@@ -327,7 +327,7 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
 
         if let page = page(for: location, nearest: false) {
             let pagePoint = convert(location, to: page)
-            if let note = onNoteHit?(pagePoint, page), note.isYoPDFNote {
+            if let note = onNoteHit?(pagePoint, page), note.usesStickerPresentation {
                 consumedMouseDown = true
                 pendingNoteActivation = (note, containerRect(forPageRect: note.bounds, on: page))
                 mouseDownPoint = location
@@ -527,7 +527,7 @@ private final class MarkupSelectionOverlayView: NSView {
             y: point.y + pageBounds.minY
         )
         return markers.reversed().first {
-            stickerFrame(for: $0.bounds).contains(pagePoint)
+            $0.bounds.contains(pagePoint)
         }
     }
 
@@ -541,7 +541,7 @@ private final class MarkupSelectionOverlayView: NSView {
     override func resetCursorRects() {
         super.resetCursorRects()
         for marker in markers {
-            let frame = stickerFrame(for: marker.bounds)
+            let frame = marker.bounds
             let rect = frame.offsetBy(dx: -pageBounds.minX, dy: -pageBounds.minY)
             addCursorRect(rect, cursor: .pointingHand)
         }
@@ -595,12 +595,39 @@ private final class MarkupSelectionOverlayView: NSView {
     /// stacked border or palette fill here.
     private func drawNoteMarkers() {
         guard let page else { return }
+        let pageMarkers = markers.filter { $0.pageIndex == pageIndex }
 
-        for marker in markers where marker.pageIndex == pageIndex {
+        // Clear every native icon stack first. If two masks overlap, drawing
+        // them in a separate pass prevents a later mask from erasing an earlier
+        // sticker.
+        for marker in pageMarkers {
             let rect = marker.bounds.offsetBy(dx: -pageBounds.minX, dy: -pageBounds.minY)
             guard rect.width > 1, rect.height > 1 else { continue }
-            drawPageBackground(in: rect, page: page)
-            drawSticker(marker.style, at: rect)
+            let candidate = marker.maskBounds
+            let maskBounds = candidate.origin.x.isFinite
+                && candidate.origin.y.isFinite
+                && candidate.width.isFinite
+                && candidate.height.isFinite
+                && candidate.width > 0
+                && candidate.height > 0
+                ? candidate
+                : marker.bounds
+            let maskRect = maskBounds.offsetBy(
+                dx: -pageBounds.minX,
+                dy: -pageBounds.minY
+            )
+            drawPageBackground(in: maskRect, page: page)
+        }
+
+        for marker in pageMarkers {
+            let rect = marker.bounds.offsetBy(dx: -pageBounds.minX, dy: -pageBounds.minY)
+            guard rect.width > 1, rect.height > 1 else { continue }
+            drawSticker(
+                marker.style,
+                at: rect,
+                count: marker.count,
+                showsCountBadge: marker.showsCountBadge
+            )
         }
     }
 
@@ -615,7 +642,7 @@ private final class MarkupSelectionOverlayView: NSView {
         pageCopy.rotation = 0
         pageCopy.displaysAnnotations = page.displaysAnnotations
         for annotation in pageCopy.annotations {
-            if NoteService.isYoPDFNote(annotation) || annotation.type == "Popup" {
+            if NoteService.usesStickerPresentation(annotation) || annotation.type == "Popup" {
                 pageCopy.removeAnnotation(annotation)
             }
         }
@@ -642,48 +669,18 @@ private final class MarkupSelectionOverlayView: NSView {
         context.restoreGState()
     }
 
-    /// The size of ShuaMac's sticker artwork inside a marker.
-    private static let stickerArtworkSize: CGFloat = 32
-
-    /// The marker frame: exactly the sticker artwork.
-    ///
-    /// ShuaMac grows its overlay frame sideways for a multi-thought count badge.
-    /// A YoPDF note holds exactly one body, so there is no count to show and no
-    /// badge to reserve room for; the marker is the 32pt face itself.
-    private static var stickerSize: CGSize {
-        CGSize(width: stickerArtworkSize, height: stickerArtworkSize)
-    }
-
-    /// The marker frame centred on a note's anchor, clamped to the page.
-    ///
-    /// ShuaMac centres the frame on the anchor point and then clamps it inside the
-    /// overlay, so a marker near a page edge cannot push its artwork out of view.
-    /// YoPDF stores a 24pt `/Rect` rather than a point, so the frame is centred on
-    /// that rect and clamped to the same page area.
-    private func stickerFrame(for anchorRect: CGRect) -> CGRect {
-        let size = Self.stickerSize
-        let proposed = CGRect(
-            x: anchorRect.midX - size.width / 2,
-            y: anchorRect.midY - size.height / 2,
-            width: size.width,
-            height: size.height
+    private func drawSticker(
+        _ style: NoteStickerStyle,
+        at frame: CGRect,
+        count: Int,
+        showsCountBadge: Bool
+    ) {
+        let artRect = CGRect(
+            x: frame.minX,
+            y: frame.midY - NoteService.markerDisplaySize / 2,
+            width: NoteService.markerDisplaySize,
+            height: NoteService.markerDisplaySize
         )
-        guard pageBounds.width > 0, pageBounds.height > 0 else { return proposed }
-
-        let minimumX = pageBounds.minX + 2
-        let minimumY = pageBounds.minY + 2
-        let maximumX = max(minimumX, pageBounds.maxX - size.width - 2)
-        let maximumY = max(minimumY, pageBounds.maxY - size.height - 2)
-        return CGRect(
-            x: min(max(proposed.minX, minimumX), maximumX),
-            y: min(max(proposed.minY, minimumY), maximumY),
-            width: size.width,
-            height: size.height
-        )
-    }
-
-    private func drawSticker(_ style: NoteStickerStyle, at anchor: CGRect) {
-        let artRect = stickerFrame(for: anchor)
 
         if let name = style.motif.assetName,
            let image = NSImage(named: NSImage.Name(name)) {
@@ -709,6 +706,36 @@ private final class MarkupSelectionOverlayView: NSView {
             )?.withSymbolConfiguration(.init(paletteColors: [.brown]))
             icon?.draw(in: artRect.insetBy(dx: 8, dy: 8))
         }
+
+        guard showsCountBadge else { return }
+        drawCountBadge(count, in: frame)
+    }
+
+    private func drawCountBadge(_ count: Int, in frame: CGRect) {
+        let label = "\(max(count, 1))" as NSString
+        let ink = NSColor(srgbRed: 0.37, green: 0.26, blue: 0.21, alpha: 1)
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 9, weight: .semibold),
+            .foregroundColor: ink
+        ]
+        let textSize = label.size(withAttributes: attributes)
+        let badgeWidth = max(14, textSize.width + 7)
+        let badge = CGRect(
+            x: frame.maxX - badgeWidth,
+            y: frame.minY + 1,
+            width: badgeWidth,
+            height: 14
+        )
+        let outline = NSBezierPath(roundedRect: badge, xRadius: 7, yRadius: 7)
+        NSColor.white.setFill()
+        outline.fill()
+        ink.withAlphaComponent(0.20).setStroke()
+        outline.lineWidth = 0.7
+        outline.stroke()
+        label.draw(
+            at: CGPoint(x: badge.midX - textSize.width / 2, y: badge.midY - textSize.height / 2),
+            withAttributes: attributes
+        )
     }
 
 }

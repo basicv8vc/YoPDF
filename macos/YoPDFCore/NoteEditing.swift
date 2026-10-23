@@ -80,9 +80,25 @@ extension PDFDocumentModel {
         let pageIndex = document.index(for: page)
         guard pageIndex >= 0 else { return nil }
 
+        // Sticker overlays represent one YoPDF note or one ShuaMac thought
+        // group. Resolve the marker before PDFKit's underlying annotation rects
+        // so a grouped sticker opens its representative note at the shared hit
+        // target instead of the last stacked `/Text` icon.
+        if let marker = noteMarkers.reversed().first(where: {
+            $0.pageIndex == pageIndex && $0.bounds.contains(point)
+        }) {
+            return NoteService.selection(
+                for: marker.annotation,
+                on: page,
+                pageIndex: pageIndex,
+                marker: marker
+            )
+        }
+
         // Last annotation wins, matching PDFKit's paint order.
         for annotation in page.annotations.reversed() where NoteService.isTextAnnotation(annotation) {
             guard annotation.shouldDisplay,
+                  !NoteService.usesStickerPresentation(annotation),
                   NoteService.hitRect(for: annotation, on: page).contains(point)
             else { continue }
             return NoteService.selection(for: annotation, on: page, pageIndex: pageIndex)

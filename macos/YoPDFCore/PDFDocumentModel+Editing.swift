@@ -94,7 +94,9 @@ extension PDFDocumentModel {
     public func save() -> SaveOutcome {
         guard let document, let session = documentSession else { return .failed(.noDocument) }
         guard hasUnsavedChanges else { return .saved }
-        guard let data = document.dataRepresentation() else { return .failed(.serializationFailed) }
+        guard let data = NoteService.dataRepresentationPreservingShuaGroups(in: document) else {
+            return .failed(.serializationFailed)
+        }
 
         do {
             try session.save(data)
@@ -113,7 +115,9 @@ extension PDFDocumentModel {
     @discardableResult
     public func saveAs(to destination: URL, overwrite: Bool = false) -> SaveOutcome {
         guard let document, let session = documentSession else { return .failed(.noDocument) }
-        guard let data = document.dataRepresentation() else { return .failed(.serializationFailed) }
+        guard let data = NoteService.dataRepresentationPreservingShuaGroups(in: document) else {
+            return .failed(.serializationFailed)
+        }
 
         do {
             let newSession = try session.saveAs(data, to: destination, overwrite: overwrite)
