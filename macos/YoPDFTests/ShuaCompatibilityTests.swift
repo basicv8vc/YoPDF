@@ -83,6 +83,8 @@ final class ShuaCompatibilityTests: XCTestCase {
         x: CGFloat,
         y: CGFloat,
         contents: String,
+        excerpt: String = "Mooncake architecture",
+        isPageLevel: Bool = false,
         includesName: Bool = true,
         style: NoteStickerStyle = NoteStickerStyle(motif: .cat, palette: .honey)
     ) throws -> PDFAnnotation {
@@ -108,9 +110,9 @@ final class ShuaCompatibilityTests: XCTestCase {
             version: 1,
             anchor: AnchorMetadata(
                 id: anchorID,
-                excerpt: "Mooncake architecture",
+                excerpt: excerpt,
                 regions: [Region(pageIndex: 0, x: 90, y: 360, width: 160, height: 22)],
-                isPageLevel: false,
+                isPageLevel: isPageLevel,
                 markerPosition: Point(x: 0.5, y: 0.5)
             ),
             thoughtID: thoughtID,
@@ -260,6 +262,9 @@ final class ShuaCompatibilityTests: XCTestCase {
         XCTAssertEqual(sourceMarker.threadContents, [
             "Metadata order 0", "Metadata order 1", "Metadata order 2",
         ])
+        let cropBox = page.bounds(for: .cropBox)
+        XCTAssertEqual(sourceMarker.center.x, cropBox.minX + cropBox.width / 2, accuracy: 0.001)
+        XCTAssertEqual(sourceMarker.center.y, cropBox.minY + cropBox.height / 2, accuracy: 0.001)
 
         try write(source, to: url)
         XCTAssertTrue(sourceNotes.allSatisfy { $0.value(forAnnotationKey: Self.yoPDFShuaAnchorKey) == nil })
@@ -273,6 +278,112 @@ final class ShuaCompatibilityTests: XCTestCase {
         XCTAssertEqual(reopenedMarker.threadContents, [
             "Metadata order 0", "Metadata order 1", "Metadata order 2",
         ])
+        XCTAssertEqual(reopenedMarker.center.x, sourceMarker.center.x, accuracy: 0.001)
+        XCTAssertEqual(reopenedMarker.center.y, sourceMarker.center.y, accuracy: 0.001)
+    }
+
+    func testShuaEmbeddedAnchorRetainsQuoteAndPageLevelContext() throws {
+        let url = try makeFixture(named: "shua-anchor-context")
+        let document = try XCTUnwrap(PDFDocument(url: url))
+        let page = try XCTUnwrap(document.page(at: 0))
+        let textNote = try addShuaThought(
+            to: page,
+            anchorID: UUID(),
+            order: 0,
+            x: 300,
+            y: 600,
+            contents: "Text anchored",
+            includesName: false
+        )
+        let pageNote = try addShuaThought(
+            to: page,
+            anchorID: UUID(),
+            order: 0,
+            x: 400,
+            y: 600,
+            contents: "Page anchored",
+            excerpt: "",
+            isPageLevel: true,
+            includesName: false
+        )
+
+        XCTAssertEqual(NoteService.excerpt(of: textNote), "Mooncake architecture")
+        XCTAssertFalse(NoteService.isPageLevel(textNote))
+        XCTAssertNil(NoteService.excerpt(of: pageNote))
+        XCTAssertTrue(NoteService.isPageLevel(pageNote))
+    }
+
+    func testConflictingShuaNameAndEmbeddedIdentityDoNotMergeThoughts() throws {
+        let url = try makeFixture(named: "shua-conflicting-identity")
+        let document = try XCTUnwrap(PDFDocument(url: url))
+        let page = try XCTUnwrap(document.page(at: 0))
+        let nameAnchorID = UUID()
+        let metadataAnchorID = UUID()
+        let thoughtID = UUID()
+        let conflicted = try addShuaThought(
+            to: page,
+            anchorID: nameAnchorID,
+            thoughtID: thoughtID,
+            order: 0,
+            x: 300,
+            y: 600,
+            contents: "Conflicting identity"
+        )
+        let rawMetadata = try XCTUnwrap(
+            conflicted.value(forAnnotationKey: Self.shuaThoughtMetadataKey) as? String
+        )
+        let oldMetadata = try JSONDecoder().decode(ThoughtMetadata.self, from: Data(rawMetadata.utf8))
+        let conflictingMetadata = ThoughtMetadata(
+            version: oldMetadata.version,
+            anchor: AnchorMetadata(
+                id: metadataAnchorID,
+                excerpt: oldMetadata.anchor.excerpt,
+                regions: oldMetadata.anchor.regions,
+                isPageLevel: oldMetadata.anchor.isPageLevel,
+                markerPosition: oldMetadata.anchor.markerPosition
+            ),
+            thoughtID: thoughtID,
+            thoughtOrder: oldMetadata.thoughtOrder,
+            createdAt: oldMetadata.createdAt,
+            modifiedAt: oldMetadata.modifiedAt
+        )
+        let conflictingData = try JSONEncoder().encode(conflictingMetadata)
+        XCTAssertTrue(conflicted.setValue(
+            try XCTUnwrap(String(data: conflictingData, encoding: .utf8)),
+            forAnnotationKey: Self.shuaThoughtMetadataKey
+        ))
+        _ = try addShuaThought(
+            to: page,
+            anchorID: metadataAnchorID,
+            order: 1,
+            x: 300,
+            y: 577,
+            contents: "Other thought",
+            includesName: false
+        )
+
+        XCTAssertNil(NoteService.shuaAnchorID(of: conflicted))
+        XCTAssertEqual(NoteService.markers(in: document).map(\.count).sorted(), [1, 1])
+    }
+
+    func testConflictingYoPDFAnchorCacheDoesNotJoinShuaGroup() throws {
+        let url = try makeFixture(named: "shua-conflicting-yopdf-anchor")
+        let document = try XCTUnwrap(PDFDocument(url: url))
+        let page = try XCTUnwrap(document.page(at: 0))
+        let anchorID = UUID()
+        let note = try addShuaThought(
+            to: page,
+            anchorID: anchorID,
+            order: 0,
+            x: 300,
+            y: 600,
+            contents: "Embedded identity",
+            includesName: false
+        )
+        XCTAssertTrue(note.setValue(UUID().uuidString, forAnnotationKey: Self.yoPDFShuaAnchorKey))
+
+        XCTAssertNil(NoteService.shuaAnchorID(of: note))
+        XCTAssertEqual(NoteService.markers(in: document).map(\.count), [1])
     }
 
     func testMalformedOrUnsupportedShuaMetadataDoesNotCreateAGroup() throws {

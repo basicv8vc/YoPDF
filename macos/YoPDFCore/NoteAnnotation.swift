@@ -279,18 +279,48 @@ public struct NotePermissions: Equatable, Sendable {
 @MainActor
 public enum NoteService {
 
-    /// The identity fields ShuaMac embeds on each thought annotation. Extra
-    /// anchor fields are intentionally ignored; only the versioned grouping
-    /// identity and order are needed by YoPDF.
+    private struct ShuaThoughtIdentity: Equatable {
+        let anchorID: UUID
+        let thoughtID: UUID
+    }
+
+    /// The identity and presentation fields ShuaMac embeds on thought notes.
+    /// Extra anchor fields are intentionally ignored so the reader stays
+    /// compatible as ShuaMac adds data to the same versioned payload.
     private struct ShuaThoughtMetadata: Decodable {
         struct Anchor: Decodable {
+            struct MarkerPosition: Decodable {
+                let x: Double
+                let y: Double
+
+                func point(in pageBounds: CGRect) -> CGPoint? {
+                    guard x.isFinite, y.isFinite,
+                          (0.0...1.0).contains(x), (0.0...1.0).contains(y),
+                          pageBounds.minX.isFinite, pageBounds.minY.isFinite,
+                          pageBounds.width.isFinite, pageBounds.height.isFinite,
+                          pageBounds.width > 0, pageBounds.height > 0
+                    else { return nil }
+                    return CGPoint(
+                        x: pageBounds.minX + CGFloat(x) * pageBounds.width,
+                        y: pageBounds.minY + CGFloat(y) * pageBounds.height
+                    )
+                }
+            }
+
             let id: UUID
+            let excerpt: String?
+            let isPageLevel: Bool?
+            let markerPosition: MarkerPosition?
         }
 
         let version: Int
         let anchor: Anchor
         let thoughtID: UUID
         let thoughtOrder: Int
+
+        var identity: ShuaThoughtIdentity {
+            ShuaThoughtIdentity(anchorID: anchor.id, thoughtID: thoughtID)
+        }
     }
 
     /// ShuaMac's unversioned Codable sticker payload. `palette` is required by
@@ -334,9 +364,9 @@ public enum NoteService {
     /// ShuaMac stores its appearance in an optional custom PDF string.
     static let shuaStickerStyleKey = PDFAnnotationKey(rawValue: "ShuaStickerStyle")
     private static let shuaThoughtMetadataKey = PDFAnnotationKey(rawValue: "ShuaThoughtMetadata")
-    /// PDFKit may discard the standard `/NM` annotation name while serializing.
-    /// This temporary serialization key keeps ShuaMac's group identity in the
-    /// saved PDF without changing the in-memory document just by opening it.
+    /// Legacy fallback for Shua PDFs whose only group identity is `/NM`, which
+    /// PDFKit may discard while serializing. Newer PDFs retain their embedded
+    /// `ShuaThoughtMetadata` without this extra key.
     private static let shuaAnchorPersistenceKey = PDFAnnotationKey(rawValue: "/YoPDFShuaAnchorID")
 
     public static func isTextAnnotation(_ annotation: PDFAnnotation) -> Bool {
@@ -379,21 +409,28 @@ public enum NoteService {
         return false
     }
 
-    /// ShuaMac thought annotations remain standard `/Text` notes. Group identity
-    /// comes from YoPDF's save-preservation key, ShuaMac's `/NM` name, or the
-    /// versioned `ShuaThoughtMetadata` payload (in that order). The embedded
-    /// payload also supplies thought order. These are read-only compatibility
-    /// signals: opening a document does not add YoPDF metadata to it.
+    /// ShuaMac thought annotations remain standard `/Text` notes. Older files
+    /// carry identity in `/NM`; newer files embed it in `ShuaThoughtMetadata`.
+    /// The embedded identity takes precedence over YoPDF's legacy cache after
+    /// `/NM` is lost. A conflict between Shua's two identity fields stays
+    /// ungrouped rather than merging unrelated thoughts.
     public static func shuaAnchorID(of annotation: PDFAnnotation) -> UUID? {
         guard isTextAnnotation(annotation) else { return nil }
-        if let raw = annotation.value(forAnnotationKey: shuaAnchorPersistenceKey) as? String,
-           let anchorID = UUID(uuidString: raw) {
-            return anchorID
+
+        let persistedAnchorID = (annotation.value(forAnnotationKey: shuaAnchorPersistenceKey) as? String)
+            .flatMap(UUID.init(uuidString:))
+        let namedIdentity = shuaThoughtIdentityFromName(of: annotation)
+        let metadata = shuaThoughtMetadata(of: annotation)
+
+        if let metadata {
+            if let namedIdentity, namedIdentity != metadata.identity { return nil }
+            if let persistedAnchorID, persistedAnchorID != metadata.anchor.id { return nil }
+            return metadata.anchor.id
         }
-        if let anchorID = shuaAnchorIDFromName(of: annotation) {
-            return anchorID
-        }
-        return shuaThoughtMetadata(of: annotation)?.anchor.id
+
+        let anchorIDs = [persistedAnchorID, namedIdentity?.anchorID].compactMap { $0 }
+        guard Set(anchorIDs).count <= 1 else { return nil }
+        return anchorIDs.first
     }
 
     /// Parses ShuaMac's embedded identity without changing the annotation.
@@ -413,12 +450,11 @@ public enum NoteService {
         return metadata
     }
 
-    /// Serializes ShuaMac group IDs through PDFKit's `/NM` loss on write.
+    /// Preserves legacy Shua group IDs through PDFKit's `/NM` loss on write.
     ///
-    /// The temporary key is included in the output PDF, then removed from the
-    /// live annotations before returning. This keeps a normal read or a failed
-    /// save from mutating in-memory metadata, while a successful save remains
-    /// groupable after PDFKit drops `/NM`.
+    /// The temporary key is included only for name-only annotations, then
+    /// removed from the live annotations before returning. PR #1007 files keep
+    /// their embedded identity, order, and anchor metadata in the PDF itself.
     public static func dataRepresentationPreservingShuaGroups(
         in document: PDFDocument
     ) -> Data? {
@@ -448,7 +484,7 @@ public enum NoteService {
         return document.dataRepresentation()
     }
 
-    private static func shuaAnchorIDFromName(of annotation: PDFAnnotation) -> UUID? {
+    private static func shuaThoughtIdentityFromName(of annotation: PDFAnnotation) -> ShuaThoughtIdentity? {
         guard isTextAnnotation(annotation),
               let name = annotation.value(forAnnotationKey: .name) as? String
         else { return nil }
@@ -456,14 +492,32 @@ public enum NoteService {
         guard parts.count == 3,
               parts[0] == "shua-thought",
               let anchorID = UUID(uuidString: String(parts[1])),
-              UUID(uuidString: String(parts[2])) != nil
+              let thoughtID = UUID(uuidString: String(parts[2]))
         else { return nil }
-        return anchorID
+        return ShuaThoughtIdentity(anchorID: anchorID, thoughtID: thoughtID)
+    }
+
+    private static func shuaAnchorIDFromName(of annotation: PDFAnnotation) -> UUID? {
+        shuaThoughtIdentityFromName(of: annotation)?.anchorID
+    }
+
+    private static func shuaMarkerCenter(
+        from annotations: [PDFAnnotation],
+        on page: PDFPage
+    ) -> CGPoint? {
+        let cropBox = page.bounds(for: .cropBox)
+        for annotation in annotations {
+            guard let position = shuaThoughtMetadata(of: annotation)?.anchor.markerPosition,
+                  let point = position.point(in: cropBox) else { continue }
+            return point
+        }
+        return nil
     }
 
     public static func isShuaThought(_ annotation: PDFAnnotation) -> Bool {
         guard isTextAnnotation(annotation) else { return false }
         if shuaAnchorID(of: annotation) != nil { return true }
+        if shuaThoughtMetadata(of: annotation) != nil { return true }
         if annotation.value(forAnnotationKey: shuaStickerStyleKey) != nil { return true }
         return (annotation.value(forAnnotationKey: .name) as? String)?
             .hasPrefix("shua-thought:") == true
@@ -564,9 +618,11 @@ public enum NoteService {
     }
 
     public static func excerpt(of annotation: PDFAnnotation) -> String? {
-        guard let raw = annotation.value(forAnnotationKey: excerptKey) as? String else {
-            return nil
+        if let raw = annotation.value(forAnnotationKey: excerptKey) as? String {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
         }
+        guard let raw = shuaThoughtMetadata(of: annotation)?.anchor.excerpt else { return nil }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
@@ -574,6 +630,9 @@ public enum NoteService {
     public static func isPageLevel(_ annotation: PDFAnnotation) -> Bool {
         if let raw = annotation.value(forAnnotationKey: pageLevelKey) as? String {
             return raw == "1" || raw.caseInsensitiveCompare("true") == .orderedSame
+        }
+        if let isPageLevel = shuaThoughtMetadata(of: annotation)?.anchor.isPageLevel {
+            return isPageLevel
         }
         return excerpt(of: annotation) == nil
     }
@@ -842,23 +901,16 @@ public enum NoteService {
             )
             for anchorID in shuaGroupOrder {
                 guard let group = shuaGroups[anchorID] else { continue }
-                let thoughtOrderByAnnotation = Dictionary(
-                    group.compactMap { annotation in
-                        shuaThoughtMetadata(of: annotation).map {
-                            (ObjectIdentifier(annotation), $0.thoughtOrder)
-                        }
-                    },
-                    uniquingKeysWith: { first, _ in first }
-                )
+                let hasCompleteThoughtOrder = group.allSatisfy {
+                    shuaThoughtMetadata(of: $0) != nil
+                }
                 let notes = group.sorted {
-                    let leftThoughtOrder = thoughtOrderByAnnotation[ObjectIdentifier($0)]
-                    let rightThoughtOrder = thoughtOrderByAnnotation[ObjectIdentifier($1)]
-                    if let leftThoughtOrder, let rightThoughtOrder,
-                       leftThoughtOrder != rightThoughtOrder {
-                        return leftThoughtOrder < rightThoughtOrder
-                    }
-                    if (leftThoughtOrder != nil) != (rightThoughtOrder != nil) {
-                        return leftThoughtOrder != nil
+                    if hasCompleteThoughtOrder {
+                        let leftThoughtOrder = shuaThoughtMetadata(of: $0)?.thoughtOrder ?? 0
+                        let rightThoughtOrder = shuaThoughtMetadata(of: $1)?.thoughtOrder ?? 0
+                        if leftThoughtOrder != rightThoughtOrder {
+                            return leftThoughtOrder < rightThoughtOrder
+                        }
                     }
                     if $0.bounds.midY != $1.bounds.midY {
                         return $0.bounds.midY > $1.bounds.midY
@@ -870,11 +922,13 @@ public enum NoteService {
                 guard let first = notes.first else { continue }
                 // ShuaMac stores each group's thought annotations as 20pt icons
                 // stepped down by 23pt. The first icon's centre is 10pt below
-                // the shared sticker anchor.
+                // the shared sticker anchor. PR #1007 also persists the exact
+                // CropBox-relative anchor; prefer it after PDFKit rewrites Rect.
                 let proposedCenter = CGPoint(x: first.bounds.midX, y: first.bounds.midY + 10)
-                let center = proposedCenter.x.isFinite && proposedCenter.y.isFinite
-                    ? proposedCenter
-                    : markerCenter(of: first, on: page)
+                let center = shuaMarkerCenter(from: notes, on: page)
+                    ?? (proposedCenter.x.isFinite && proposedCenter.y.isFinite
+                        ? proposedCenter
+                        : markerCenter(of: first, on: page))
                 let bounds = displayBounds(
                     center: center,
                     in: page.bounds(for: .cropBox),
