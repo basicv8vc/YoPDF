@@ -279,6 +279,30 @@ public struct NotePermissions: Equatable, Sendable {
 @MainActor
 public enum NoteService {
 
+    /// The identity fields ShuaMac embeds on each thought annotation. Extra
+    /// anchor fields are intentionally ignored; only the versioned grouping
+    /// identity and order are needed by YoPDF.
+    private struct ShuaThoughtMetadata: Decodable {
+        struct Anchor: Decodable {
+            let id: UUID
+        }
+
+        let version: Int
+        let anchor: Anchor
+        let thoughtID: UUID
+        let thoughtOrder: Int
+    }
+
+    /// ShuaMac's unversioned Codable sticker payload. `palette` is required by
+    /// ShuaMac; title and symbol are optional here so older/partial payloads
+    /// can retain YoPDF's template-only fields when available.
+    private struct ShuaStickerStyleMetadata: Decodable {
+        let title: String?
+        let symbol: String?
+        let palette: String
+        let motif: String?
+    }
+
     /// The minimum `/Text` rectangle PDFKit keeps after serialization.
     public static let markerSize: CGFloat = 24
     /// The visible sticker artwork, matching ShuaMac's 32pt marker face.
@@ -309,6 +333,7 @@ public enum NoteService {
     static let anchorYKey = PDFAnnotationKey(rawValue: "/YoPDFNoteAnchorY")
     /// ShuaMac stores its appearance in an optional custom PDF string.
     static let shuaStickerStyleKey = PDFAnnotationKey(rawValue: "ShuaStickerStyle")
+    private static let shuaThoughtMetadataKey = PDFAnnotationKey(rawValue: "ShuaThoughtMetadata")
     /// PDFKit may discard the standard `/NM` annotation name while serializing.
     /// This temporary serialization key keeps ShuaMac's group identity in the
     /// saved PDF without changing the in-memory document just by opening it.
@@ -354,9 +379,10 @@ public enum NoteService {
         return false
     }
 
-    /// ShuaMac thought annotations remain standard `/Text` notes. Their `/NM`
-    /// value carries a stable anchor and thought UUID; `ShuaStickerStyle` is an
-    /// optional JSON appearance snapshot. These are read-only compatibility
+    /// ShuaMac thought annotations remain standard `/Text` notes. Group identity
+    /// comes from YoPDF's save-preservation key, ShuaMac's `/NM` name, or the
+    /// versioned `ShuaThoughtMetadata` payload (in that order). The embedded
+    /// payload also supplies thought order. These are read-only compatibility
     /// signals: opening a document does not add YoPDF metadata to it.
     public static func shuaAnchorID(of annotation: PDFAnnotation) -> UUID? {
         guard isTextAnnotation(annotation) else { return nil }
@@ -364,15 +390,27 @@ public enum NoteService {
            let anchorID = UUID(uuidString: raw) {
             return anchorID
         }
-        guard let name = annotation.value(forAnnotationKey: .name) as? String else { return nil }
+        if let anchorID = shuaAnchorIDFromName(of: annotation) {
+            return anchorID
+        }
+        return shuaThoughtMetadata(of: annotation)?.anchor.id
+    }
 
-        let parts = name.split(separator: ":", omittingEmptySubsequences: false)
-        guard parts.count == 3,
-              parts[0] == "shua-thought",
-              let anchorID = UUID(uuidString: String(parts[1])),
-              UUID(uuidString: String(parts[2])) != nil
+    /// Parses ShuaMac's embedded identity without changing the annotation.
+    /// Unknown versions, malformed UUIDs, missing identity fields, and
+    /// negative order values are ignored so arbitrary PDF strings cannot be
+    /// mistaken for a Shua group.
+    private static func shuaThoughtMetadata(
+        of annotation: PDFAnnotation
+    ) -> ShuaThoughtMetadata? {
+        guard isTextAnnotation(annotation),
+              let raw = annotation.value(forAnnotationKey: shuaThoughtMetadataKey) as? String,
+              let data = raw.data(using: .utf8),
+              let metadata = try? JSONDecoder().decode(ShuaThoughtMetadata.self, from: data),
+              metadata.version == 1,
+              metadata.thoughtOrder >= 0
         else { return nil }
-        return anchorID
+        return metadata
     }
 
     /// Serializes ShuaMac group IDs through PDFKit's `/NM` loss on write.
@@ -540,35 +578,33 @@ public enum NoteService {
         return excerpt(of: annotation) == nil
     }
 
-    /// The note's appearance, with PR #6 compatibility.
+    /// The note's appearance, with ShuaMac and PR #6 compatibility.
     ///
-    /// A note written before this build has no `/YoPDFNoteStyle`; it is shown as
-    /// Simple Paper on its existing paper tint. A value that is not a JSON
-    /// object is treated the same way. An unknown motif becomes `plain` without
-    /// rewriting the file, so merely opening a document cannot change it.
+    /// Shua thoughts prefer a valid `ShuaStickerStyle`, then fall back to the
+    /// YoPDF style key. Other notes use `/YoPDFNoteStyle`; a note with no valid
+    /// key is shown on its existing paper tint. Unknown values never rewrite
+    /// the file, so merely opening a document cannot change its style.
     public static func style(of annotation: PDFAnnotation) -> NoteStickerStyle {
         let legacyPaper = paperColor(of: annotation)
         if isShuaThought(annotation) {
-            // An explicit YoPDF edit is authoritative for this annotation.
-            // ShuaStickerStyle remains synchronized for ShuaMac's reader.
-            if let raw = annotation.value(forAnnotationKey: styleKey) as? String,
-               let style = NoteStickerStyle(serialized: raw, paletteFallback: legacyPaper) {
-                return style
+            // ShuaMac may edit the same PDF after YoPDF. Its current style key
+            // is the shared source of truth; the YoPDF value is a fallback for
+            // older files and supplies template fields absent from a partial
+            // Shua payload.
+            let yoPDFStyle = (annotation.value(forAnnotationKey: styleKey) as? String)
+                .flatMap { NoteStickerStyle(serialized: $0, paletteFallback: legacyPaper) }
+            if let raw = annotation.value(forAnnotationKey: shuaStickerStyleKey) as? String,
+               let shuaStyle = decodeShuaStickerStyle(raw),
+               let palette = NotePaperColor(rawValue: shuaStyle.palette),
+               shuaStyle.motif.map({ NoteMotif(rawValue: $0) != nil }) ?? true {
+                return NoteStickerStyle(
+                    motif: shuaStyle.motif.flatMap(NoteMotif.init(rawValue:)) ?? .bunny,
+                    palette: palette,
+                    title: shuaStyle.title ?? yoPDFStyle?.title ?? "",
+                    symbol: shuaStyle.symbol ?? yoPDFStyle?.symbol ?? NoteStickerStyle.defaultSymbol
+                )
             }
-            guard let raw = annotation.value(forAnnotationKey: shuaStickerStyleKey) as? String,
-                  var style = NoteStickerStyle(serialized: raw, paletteFallback: legacyPaper)
-            else { return .newNote }
-
-            // In ShuaMac, a missing motif resolves to its default bunny. YoPDF's
-            // own versioned style instead treats a missing motif as plain paper.
-            let fields = raw.data(using: .utf8)
-                .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-            if let rawMotif = fields?["motif"] as? String {
-                style.motif = NoteMotif(rawValue: rawMotif) ?? .bunny
-            } else {
-                style.motif = .bunny
-            }
-            return style
+            return yoPDFStyle ?? .newNote
         }
         guard let raw = annotation.value(forAnnotationKey: styleKey) as? String,
               let style = NoteStickerStyle(serialized: raw, paletteFallback: legacyPaper)
@@ -576,6 +612,11 @@ public enum NoteService {
             return NoteStickerStyle(motif: .plain, palette: legacyPaper)
         }
         return style
+    }
+
+    private static func decodeShuaStickerStyle(_ raw: String) -> ShuaStickerStyleMetadata? {
+        guard let data = raw.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(ShuaStickerStyleMetadata.self, from: data)
     }
 
     private static func normalizedAnchor(
@@ -801,7 +842,24 @@ public enum NoteService {
             )
             for anchorID in shuaGroupOrder {
                 guard let group = shuaGroups[anchorID] else { continue }
+                let thoughtOrderByAnnotation = Dictionary(
+                    group.compactMap { annotation in
+                        shuaThoughtMetadata(of: annotation).map {
+                            (ObjectIdentifier(annotation), $0.thoughtOrder)
+                        }
+                    },
+                    uniquingKeysWith: { first, _ in first }
+                )
                 let notes = group.sorted {
+                    let leftThoughtOrder = thoughtOrderByAnnotation[ObjectIdentifier($0)]
+                    let rightThoughtOrder = thoughtOrderByAnnotation[ObjectIdentifier($1)]
+                    if let leftThoughtOrder, let rightThoughtOrder,
+                       leftThoughtOrder != rightThoughtOrder {
+                        return leftThoughtOrder < rightThoughtOrder
+                    }
+                    if (leftThoughtOrder != nil) != (rightThoughtOrder != nil) {
+                        return leftThoughtOrder != nil
+                    }
                     if $0.bounds.midY != $1.bounds.midY {
                         return $0.bounds.midY > $1.bounds.midY
                     }

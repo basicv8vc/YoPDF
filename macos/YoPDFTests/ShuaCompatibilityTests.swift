@@ -83,6 +83,7 @@ final class ShuaCompatibilityTests: XCTestCase {
         x: CGFloat,
         y: CGFloat,
         contents: String,
+        includesName: Bool = true,
         style: NoteStickerStyle = NoteStickerStyle(motif: .cat, palette: .honey)
     ) throws -> PDFAnnotation {
         let note = PDFAnnotation(
@@ -95,7 +96,9 @@ final class ShuaCompatibilityTests: XCTestCase {
         note.userName = "Shua"
         note.color = style.palette.color
         let annotationName = "shua-thought:\(anchorID.uuidString):\(thoughtID.uuidString)"
-        XCTAssertTrue(note.setValue(annotationName, forAnnotationKey: .name))
+        if includesName {
+            XCTAssertTrue(note.setValue(annotationName, forAnnotationKey: .name))
+        }
         let styleData = try JSONEncoder().encode(style)
         note.setValue(
             try XCTUnwrap(String(data: styleData, encoding: .utf8)),
@@ -228,6 +231,116 @@ final class ShuaCompatibilityTests: XCTestCase {
         XCTAssertEqual(metadata.map(\.anchor.id), Array(repeating: anchorID, count: 3))
         XCTAssertEqual(metadata.map(\.thoughtID), thoughtIDs)
         XCTAssertEqual(metadata.map(\.thoughtOrder), [0, 1, 2])
+    }
+
+    func testShuaMetadataAloneRestoresGroupAndThoughtOrder() throws {
+        let url = try makeFixture(named: "shua-metadata-only")
+        let source = try XCTUnwrap(PDFDocument(url: url))
+        let page = try XCTUnwrap(source.page(at: 0))
+        let anchorID = UUID()
+        let orderToY: [CGFloat] = [610, 690, 650]
+        for order in orderToY.indices {
+            try addShuaThought(
+                to: page,
+                anchorID: anchorID,
+                order: order,
+                x: 320,
+                y: orderToY[order],
+                contents: "Metadata order \(order)",
+                includesName: false
+            )
+        }
+
+        let sourceNotes = textAnnotations(on: page)
+        XCTAssertEqual(sourceNotes.count, 3)
+        XCTAssertTrue(sourceNotes.allSatisfy { $0.value(forAnnotationKey: .name) == nil })
+        XCTAssertTrue(sourceNotes.allSatisfy { $0.value(forAnnotationKey: Self.yoPDFShuaAnchorKey) == nil })
+        let sourceMarker = try XCTUnwrap(NoteService.markers(in: source).first)
+        XCTAssertEqual(sourceMarker.count, 3)
+        XCTAssertEqual(sourceMarker.threadContents, [
+            "Metadata order 0", "Metadata order 1", "Metadata order 2",
+        ])
+
+        try write(source, to: url)
+        XCTAssertTrue(sourceNotes.allSatisfy { $0.value(forAnnotationKey: Self.yoPDFShuaAnchorKey) == nil })
+        let reopened = try XCTUnwrap(PDFDocument(url: url))
+        let reopenedNotes = textAnnotations(on: try XCTUnwrap(reopened.page(at: 0)))
+        XCTAssertTrue(reopenedNotes.allSatisfy { $0.value(forAnnotationKey: .name) == nil })
+        XCTAssertTrue(reopenedNotes.allSatisfy { $0.value(forAnnotationKey: Self.yoPDFShuaAnchorKey) == nil })
+        let reopenedMarker = try XCTUnwrap(NoteService.markers(in: reopened).first)
+        XCTAssertEqual(NoteService.markers(in: reopened).count, 1)
+        XCTAssertEqual(reopenedMarker.count, 3)
+        XCTAssertEqual(reopenedMarker.threadContents, [
+            "Metadata order 0", "Metadata order 1", "Metadata order 2",
+        ])
+    }
+
+    func testMalformedOrUnsupportedShuaMetadataDoesNotCreateAGroup() throws {
+        let malformedValues = [
+            "not-json",
+            #"{"version":2,"anchor":{"id":"\#(UUID().uuidString)"},"thoughtID":"\#(UUID().uuidString)","thoughtOrder":0}"#,
+            #"{"version":1,"anchor":{"id":"\#(UUID().uuidString)"},"thoughtID":"\#(UUID().uuidString)","thoughtOrder":-1}"#,
+        ]
+        for raw in malformedValues {
+            let note = PDFAnnotation(
+                bounds: CGRect(x: 100, y: 100, width: 20, height: 20),
+                forType: .text,
+                withProperties: nil
+            )
+            XCTAssertTrue(note.setValue(raw, forAnnotationKey: Self.shuaThoughtMetadataKey))
+            XCTAssertNil(NoteService.shuaAnchorID(of: note))
+            XCTAssertFalse(NoteService.isShuaThought(note))
+        }
+    }
+
+    func testExternalShuaStyleWinsAndPartialStyleKeepsYoPDFTemplateFields() throws {
+        let url = try makeFixture(named: "shua-external-style")
+        let document = try XCTUnwrap(PDFDocument(url: url))
+        let page = try XCTUnwrap(document.page(at: 0))
+        _ = try addShuaThought(
+            to: page,
+            anchorID: UUID(),
+            order: 0,
+            x: 300,
+            y: 600,
+            contents: "Style source of truth"
+        )
+        let annotation = try XCTUnwrap(textAnnotations(on: page).first)
+        let yopdfStyle = NoteStickerStyle(
+            motif: .washi,
+            palette: .rose,
+            title: "YoPDF template",
+            symbol: "quote.opening"
+        )
+        let externalStyle = NoteStickerStyle(
+            motif: .star,
+            palette: .sky,
+            title: "Shua edit",
+            symbol: "sparkles"
+        )
+        annotation.setValue(yopdfStyle.serialized, forAnnotationKey: PDFAnnotationKey(rawValue: "/YoPDFNoteStyle"))
+        annotation.setValue(
+            try XCTUnwrap(String(data: JSONEncoder().encode(externalStyle), encoding: .utf8)),
+            forAnnotationKey: Self.shuaStickerStyleKey
+        )
+        XCTAssertEqual(NoteService.style(of: annotation), externalStyle)
+
+        // A Shua style can omit template-only fields. Keep those from YoPDF
+        // while still taking the motif and palette from ShuaMac's current key.
+        let partialShuaStyle = #"{"palette":"mint","motif":"flower"}"#
+        annotation.setValue(partialShuaStyle, forAnnotationKey: Self.shuaStickerStyleKey)
+        XCTAssertEqual(
+            NoteService.style(of: annotation),
+            NoteStickerStyle(
+                motif: .flower,
+                palette: .mint,
+                title: yopdfStyle.title,
+                symbol: yopdfStyle.symbol
+            )
+        )
+
+        annotation.setValue(#"{"palette":"unknown"}"#, forAnnotationKey: Self.shuaStickerStyleKey)
+        XCTAssertEqual(NoteService.style(of: annotation), yopdfStyle)
     }
 
     func testRestylingShuaThoughtUpdatesBothFormatsAndUndoRedoRoundTrips() throws {
