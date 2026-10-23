@@ -762,14 +762,8 @@ private final class MarkupSelectionOverlayView: NSView {
 
         pageCopy.rotation = 0
         pageCopy.displaysAnnotations = page.displaysAnnotations
-        let sourceAnnotations = page.annotations
-        for (index, annotation) in pageCopy.annotations.enumerated().reversed() {
-            let sourceAnnotation = sourceAnnotations.indices.contains(index)
-                ? sourceAnnotations[index]
-                : nil
-            if sourceAnnotation.map(NoteService.usesStickerPresentation) == true
-                || sourceAnnotation?.type == "Popup"
-                || NoteService.usesStickerPresentation(annotation)
+        for annotation in pageCopy.annotations.reversed() {
+            if NoteService.usesStickerPresentation(annotation)
                 || annotation.type == "Popup"
                 || annotation.type == "/Popup"
             {
@@ -790,6 +784,13 @@ private final class MarkupSelectionOverlayView: NSView {
 
         context.saveGState()
         context.clip(to: rect)
+        // PDF pages are transparent by default. Repainting only their content
+        // would leave transparent pixels in this overlay, allowing PDFKit's
+        // native note icon beneath the sticker to show through. PDFView presents
+        // those transparent areas on a white page, so make that backdrop opaque
+        // before redrawing the page content without the sticker annotations.
+        context.setFillColor(NSColor.white.cgColor)
+        context.fill(rect)
         context.translateBy(
             x: bounds.midX - renderedSize.width / 2 - crop.minX * scale,
             y: bounds.midY - renderedSize.height / 2 - crop.minY * scale
