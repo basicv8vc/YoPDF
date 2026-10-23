@@ -40,7 +40,8 @@ struct NoteCompactComposer: View {
                 NoteStickerStyleControls(
                     text: $text,
                     style: $style,
-                    templateSelection: $templateSelection
+                    templateSelection: $templateSelection,
+                    canEditContents: canEditContents
                 )
                 .padding(14)
                 .frame(width: 330)

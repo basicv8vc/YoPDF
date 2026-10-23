@@ -213,6 +213,7 @@ struct NoteStickerStyleControls: View {
     @Binding var style: NoteStickerStyle
     @ObservedObject private var library = NoteTemplateStore.shared
     @Binding var templateSelection: NoteTemplateSelection
+    var canEditContents = true
 
     @State private var showsLibrary = false
 
@@ -293,7 +294,11 @@ struct NoteStickerStyleControls: View {
     }
 
     private func apply(_ template: NoteTemplate) {
-        text = templateSelection.apply(template, to: text)
+        text = templateSelection.apply(
+            template,
+            to: text,
+            canEditContents: canEditContents
+        )
         style = template.style
     }
 }
@@ -314,7 +319,8 @@ struct NoteStickerComposer: View {
             NoteStickerStyleControls(
                 text: $text,
                 style: $style,
-                templateSelection: $templateSelection
+                templateSelection: $templateSelection,
+                canEditContents: canEditContents
             )
             .disabled(!canChangeStyle)
 

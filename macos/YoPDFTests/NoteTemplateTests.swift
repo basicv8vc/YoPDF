@@ -103,6 +103,18 @@ final class NoteTemplateTests: XCTestCase {
         XCTAssertEqual(selection.seed, insight.body)
     }
 
+    func testLockedContentsTemplateSelectionPreservesBodyAndSeed() {
+        let insight = NoteTemplate.builtIns().first { $0.id == "builtin.insight" }!
+        let question = NoteTemplate.builtIns().first { $0.id == "builtin.question" }!
+        var selection = NoteTemplateSelection()
+        selection.restoreIfNeeded(text: insight.body, templates: NoteTemplate.builtIns())
+
+        let body = selection.apply(question, to: insight.body, canEditContents: false)
+
+        XCTAssertEqual(body, insight.body)
+        XCTAssertEqual(selection.seed, insight.body, "a locked action must not advance the body seed")
+    }
+
     func testTemplateSelectionResets() {
         var selection = NoteTemplateSelection()
         selection.restoreIfNeeded(

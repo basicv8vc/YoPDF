@@ -91,7 +91,13 @@ public struct NoteTemplateSelection: Equatable, Sendable {
         seed = templates.first { $0.body == text }?.body
     }
 
-    public mutating func apply(_ template: NoteTemplate, to text: String) -> String {
+    public mutating func apply(
+        _ template: NoteTemplate,
+        to text: String,
+        canEditContents: Bool = true
+    ) -> String {
+        guard canEditContents else { return text }
+
         let result = template.applying(to: text, previousSeed: seed)
         seed = template.body
         return result
