@@ -143,6 +143,114 @@ extension PDFDocumentModel {
         return NoteService.permissions(for: note.annotation, in: document)
     }
 
+    /// Moves a sticker marker and its PDF note rectangle as one undoable edit.
+    ///
+    /// ShuaMac stores one `/Text` annotation per thought in a group. Moving the
+    /// group translates every member together and writes the shared normalized
+    /// anchor on each note. When Shua's embedded metadata exists, its shared
+    /// `markerPosition` is updated too, so ShuaMac reopens the group at the new
+    /// location.
+    @discardableResult
+    public func moveNoteMarker(_ note: NoteSelection, to proposedCenter: CGPoint) -> Bool {
+        guard let document,
+              isAttached(note),
+              note.usesStickerPresentation,
+              proposedCenter.x.isFinite,
+              proposedCenter.y.isFinite,
+              document.allowsCommenting,
+              let page = document.page(at: note.pageIndex),
+              let marker = noteMarkers.first(where: {
+                  $0.pageIndex == note.pageIndex && $0.id == note.id
+              })
+        else { return false }
+
+        let groupID = NoteService.shuaAnchorID(of: note.annotation)
+        let annotations: [PDFAnnotation]
+        if let groupID {
+            annotations = page.annotations.filter {
+                NoteService.shuaAnchorID(of: $0) == groupID
+            }
+        } else {
+            annotations = NoteService.shuaStackMembers(of: note.annotation, on: page)
+        }
+        guard !annotations.isEmpty,
+              annotations.allSatisfy({
+                  annotation in
+                  annotation.page === page
+                      && page.annotations.contains(where: { $0 === annotation })
+                      && MarkupPermissions.allowsAnnotationChanges(annotation, in: document)
+              })
+        else { return false }
+
+        let crop = page.bounds(for: .cropBox)
+        let movingBounds = annotations.reduce(marker.bounds) { $0.union($1.bounds) }
+        guard crop.width.isFinite, crop.height.isFinite,
+              crop.width > 0, crop.height > 0,
+              movingBounds.minX.isFinite, movingBounds.minY.isFinite,
+              movingBounds.maxX.isFinite, movingBounds.maxY.isFinite,
+              movingBounds.width <= crop.width, movingBounds.height <= crop.height
+        else { return false }
+
+        let requestedStickerBounds = NoteService.displayBounds(
+            center: proposedCenter,
+            in: crop,
+            count: marker.count,
+            showsCountBadge: marker.showsCountBadge
+        )
+        let currentCenter = CGPoint(x: marker.bounds.midX, y: marker.bounds.midY)
+        let requestedDelta = CGPoint(
+            x: requestedStickerBounds.midX - currentCenter.x,
+            y: requestedStickerBounds.midY - currentCenter.y
+        )
+        // Clamp the complete translated group, including the visible sticker,
+        // instead of clamping only the sticker center and allowing hidden
+        // thought rectangles to leave the CropBox.
+        let minimumDelta = CGPoint(
+            x: crop.minX - movingBounds.minX,
+            y: crop.minY - movingBounds.minY
+        )
+        let maximumDelta = CGPoint(
+            x: crop.maxX - movingBounds.maxX,
+            y: crop.maxY - movingBounds.maxY
+        )
+        guard minimumDelta.x <= maximumDelta.x,
+              minimumDelta.y <= maximumDelta.y
+        else { return false }
+
+        let delta = CGPoint(
+            x: min(max(requestedDelta.x, minimumDelta.x), maximumDelta.x),
+            y: min(max(requestedDelta.y, minimumDelta.y), maximumDelta.y)
+        )
+        guard hypot(delta.x, delta.y) > 0.25 else { return false }
+        let targetCenter = CGPoint(
+            x: currentCenter.x + delta.x,
+            y: currentCenter.y + delta.y
+        )
+
+        let changes = annotations.compactMap { annotation -> MarkupEditChange? in
+            let from = NoteService.positionSnapshot(of: annotation)
+            let translatedBounds = annotation.bounds.offsetBy(dx: delta.x, dy: delta.y)
+            guard let to = NoteService.positionSnapshot(
+                bounds: translatedBounds,
+                anchor: targetCenter,
+                on: page,
+                for: annotation
+            ) else { return nil }
+            return .setNotePosition(
+                annotation: annotation,
+                pageIndex: note.pageIndex,
+                from: from,
+                to: to
+            )
+        }
+        guard changes.count == annotations.count,
+              performMarkupEdit(MarkupEdit(changes: changes))
+        else { return false }
+
+        selectedMarkup = nil
+        return true
+    }
+
     // MARK: - Creating
 
     /// Adds a standard `/Text` annotation for a captured anchor.

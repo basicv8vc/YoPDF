@@ -162,6 +162,19 @@ public struct NoteMarker: Identifiable, Equatable {
     }
 }
 
+/// The reversible position state of one PDF note annotation.
+///
+/// The PDF rectangle is kept alongside the normalized anchor: third-party PDF
+/// viewers use the rectangle for the standard `/Text` note, while YoPDF uses
+/// the anchor to keep its sticker from drifting when PDFKit rewrites `/Rect`.
+struct NotePositionSnapshot {
+    let bounds: CGRect
+    let anchorX: Any?
+    let anchorY: Any?
+    /// Raw Shua metadata is retained so movement participates in Undo/Redo.
+    let shuaMetadata: Any?
+}
+
 /// The note the user clicked, in the terms the composer needs.
 ///
 /// The `PDFAnnotation` stays internal so a SwiftUI view cannot mutate PDFKit
@@ -468,6 +481,36 @@ public enum NoteService {
         return metadata
     }
 
+    /// Updates only Shua's shared sticker anchor inside its versioned payload.
+    /// Editing the JSON object in place preserves fields owned by newer
+    /// ShuaMac versions.
+    private static func shuaThoughtMetadata(
+        of annotation: PDFAnnotation,
+        markerPosition: CGPoint,
+        in pageBounds: CGRect
+    ) -> String? {
+        guard shuaThoughtMetadata(of: annotation) != nil,
+              let raw = annotation.value(forAnnotationKey: shuaThoughtMetadataKey) as? String,
+              let data = raw.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              var payload = object as? [String: Any],
+              var anchor = payload["anchor"] as? [String: Any],
+              pageBounds.width.isFinite, pageBounds.height.isFinite,
+              pageBounds.width > 0, pageBounds.height > 0,
+              markerPosition.x.isFinite, markerPosition.y.isFinite
+        else { return nil }
+
+        let x = min(max((markerPosition.x - pageBounds.minX) / pageBounds.width, 0), 1)
+        let y = min(max((markerPosition.y - pageBounds.minY) / pageBounds.height, 0), 1)
+        anchor["markerPosition"] = ["x": Double(x), "y": Double(y)]
+        payload["anchor"] = anchor
+
+        guard let updated = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            return nil
+        }
+        return String(data: updated, encoding: .utf8)
+    }
+
     /// Preserves Shua identities through PDFKit's `/NM` loss on write.
     ///
     /// Name-only annotations use a temporary anchor cache. If `/NM` conflicts
@@ -577,6 +620,19 @@ public enum NoteService {
         from annotations: [PDFAnnotation],
         on page: PDFPage
     ) -> CGPoint? {
+        // A move made in YoPDF writes the same explicit CropBox-relative anchor
+        // used by YoPDF notes. It takes precedence over Shua's original marker
+        // position so grouped stickers stay where the user dropped them.
+        if let first = annotations.first,
+           let x = normalizedAnchor(of: first, key: anchorXKey),
+           let y = normalizedAnchor(of: first, key: anchorYKey) {
+            let cropBox = page.bounds(for: .cropBox)
+            return CGPoint(
+                x: cropBox.minX + x * cropBox.width,
+                y: cropBox.minY + y * cropBox.height
+            )
+        }
+
         let cropBox = page.bounds(for: .cropBox)
         for annotation in annotations {
             guard let position = shuaThoughtMetadata(of: annotation)?.anchor.markerPosition,
@@ -584,6 +640,82 @@ public enum NoteService {
             return point
         }
         return nil
+    }
+
+    /// Returns a legacy Shua stack that contains `annotation`, when the PDF
+    /// has no persisted group identity but still preserves Shua's stack layout.
+    ///
+    /// Some PDF round trips keep `/T = Shua` and `ShuaStickerStyle` while
+    /// dropping both `/NM` and `ShuaThoughtMetadata`. In that case the only
+    /// remaining group signal is the original 20pt icon rectangles stepped
+    /// down by 23pt. Some PDFKit round trips rewrite those rectangles to 24pt.
+    /// Requiring the exact author, matching style, matching column and a
+    /// continuous run avoids merging notes merely because they are close.
+    static func shuaStackMembers(
+        of annotation: PDFAnnotation,
+        on page: PDFPage
+    ) -> [PDFAnnotation] {
+        legacyShuaStackGroups(in: page.annotations).first(where: {
+            $0.contains(where: { $0 === annotation })
+        }) ?? [annotation]
+    }
+
+    private static func legacyShuaStackGroups(
+        in annotations: [PDFAnnotation]
+    ) -> [[PDFAnnotation]] {
+        let tolerance: CGFloat = 0.5
+        let candidates = annotations.filter { annotation in
+            let bounds = annotation.bounds
+            let hasSupportedIconSize = [CGFloat(20), CGFloat(24)].contains { size in
+                abs(bounds.width - size) <= tolerance
+                    && abs(bounds.height - size) <= tolerance
+            }
+            return isTextAnnotation(annotation)
+                && annotation.shouldDisplay
+                && annotation.userName == "Shua"
+                && isShuaThought(annotation)
+                && shuaAnchorID(of: annotation) == nil
+                && annotation.value(forAnnotationKey: .name) == nil
+                && annotation.value(forAnnotationKey: shuaThoughtMetadataKey) == nil
+                && annotation.value(forAnnotationKey: shuaIdentityPersistenceKey) == nil
+                && annotation.value(forAnnotationKey: shuaAnchorPersistenceKey) == nil
+                && annotation.value(forAnnotationKey: shuaStickerStyleKey) != nil
+                && hasSupportedIconSize
+                && bounds.origin.x.isFinite
+                && bounds.origin.y.isFinite
+                && bounds.width.isFinite
+                && bounds.height.isFinite
+        }.sorted {
+            if $0.bounds.midX != $1.bounds.midX {
+                return $0.bounds.midX < $1.bounds.midX
+            }
+            return $0.bounds.midY > $1.bounds.midY
+        }
+
+        var visited = Set<ObjectIdentifier>()
+        var groups: [[PDFAnnotation]] = []
+        for top in candidates where !visited.contains(ObjectIdentifier(top)) {
+            let topStyle = style(of: top)
+            var stack = [top]
+            visited.insert(ObjectIdentifier(top))
+            var current = top
+
+            while let next = candidates.first(where: { candidate in
+                !visited.contains(ObjectIdentifier(candidate))
+                    && style(of: candidate) == topStyle
+                    && abs(candidate.bounds.midX - top.bounds.midX) <= tolerance
+                    && abs(candidate.bounds.midY - (current.bounds.midY - 23)) <= tolerance
+            }) {
+                stack.append(next)
+                visited.insert(ObjectIdentifier(next))
+                current = next
+            }
+
+            if stack.count > 1 {
+                groups.append(stack)
+            }
+        }
+        return groups
     }
 
     public static func isShuaThought(_ annotation: PDFAnnotation) -> Bool {
@@ -813,6 +945,72 @@ public enum NoteService {
         _ = annotation.setValue(NSNumber(value: Double(y)), forAnnotationKey: anchorYKey)
     }
 
+    static func positionSnapshot(of annotation: PDFAnnotation) -> NotePositionSnapshot {
+        NotePositionSnapshot(
+            bounds: annotation.bounds,
+            anchorX: annotation.value(forAnnotationKey: anchorXKey),
+            anchorY: annotation.value(forAnnotationKey: anchorYKey),
+            shuaMetadata: annotation.value(forAnnotationKey: shuaThoughtMetadataKey)
+        )
+    }
+
+    static func positionSnapshot(
+        bounds: CGRect,
+        anchor: CGPoint,
+        on page: PDFPage,
+        for annotation: PDFAnnotation
+    ) -> NotePositionSnapshot? {
+        let crop = page.bounds(for: .cropBox)
+        guard crop.width > 0, crop.height > 0,
+              crop.width.isFinite, crop.height.isFinite,
+              anchor.x.isFinite, anchor.y.isFinite
+        else { return nil }
+
+        let shuaMetadata: Any?
+        if annotation.value(forAnnotationKey: shuaThoughtMetadataKey) != nil {
+            guard let updated = shuaThoughtMetadata(
+                of: annotation,
+                markerPosition: anchor,
+                in: crop
+            ) else { return nil }
+            shuaMetadata = updated
+        } else {
+            shuaMetadata = nil
+        }
+
+        let x = min(max((anchor.x - crop.minX) / crop.width, 0), 1)
+        let y = min(max((anchor.y - crop.minY) / crop.height, 0), 1)
+        return NotePositionSnapshot(
+            bounds: bounds,
+            anchorX: NSNumber(value: Double(x)),
+            anchorY: NSNumber(value: Double(y)),
+            shuaMetadata: shuaMetadata
+        )
+    }
+
+    static func applyPositionSnapshot(
+        _ snapshot: NotePositionSnapshot,
+        to annotation: PDFAnnotation
+    ) {
+        annotation.bounds = snapshot.bounds
+        if let anchorX = snapshot.anchorX {
+            _ = annotation.setValue(anchorX, forAnnotationKey: anchorXKey)
+        } else {
+            annotation.removeValue(forAnnotationKey: anchorXKey)
+        }
+        if let anchorY = snapshot.anchorY {
+            _ = annotation.setValue(anchorY, forAnnotationKey: anchorYKey)
+        } else {
+            annotation.removeValue(forAnnotationKey: anchorYKey)
+        }
+        if let shuaMetadata = snapshot.shuaMetadata {
+            _ = annotation.setValue(shuaMetadata, forAnnotationKey: shuaThoughtMetadataKey)
+        } else {
+            annotation.removeValue(forAnnotationKey: shuaThoughtMetadataKey)
+        }
+        annotation.modificationDate = Date()
+    }
+
     /// The sticker artwork in page space, clamped into the page.
     public static func displayBounds(
         center: CGPoint,
@@ -947,7 +1145,15 @@ public enum NoteService {
                 ))
             }
 
-            for annotation in visible where isShuaThought(annotation) && shuaAnchorID(of: annotation) == nil {
+            let legacyStacks = legacyShuaStackGroups(in: visible)
+            let legacyStackMembers = Set(
+                legacyStacks.flatMap { $0 }.map(ObjectIdentifier.init)
+            )
+            for annotation in visible
+                where isShuaThought(annotation)
+                    && shuaAnchorID(of: annotation) == nil
+                    && !legacyStackMembers.contains(ObjectIdentifier(annotation))
+            {
                 let center = markerCenter(of: annotation, on: page)
                 let bounds = displayBounds(
                     center: center,
@@ -967,6 +1173,41 @@ public enum NoteService {
                     showsCountBadge: true,
                     threadContents: [annotation.contents ?? ""],
                     sourceHitBounds: [annotation.bounds]
+                ))
+            }
+
+            for notes in legacyStacks {
+                guard let first = notes.first else { continue }
+                let proposedCenter = CGPoint(
+                    x: first.bounds.midX,
+                    y: first.bounds.midY + 10
+                )
+                let center = shuaMarkerCenter(from: notes, on: page)
+                    ?? (proposedCenter.x.isFinite && proposedCenter.y.isFinite
+                        ? proposedCenter
+                        : markerCenter(of: first, on: page))
+                let bounds = displayBounds(
+                    center: center,
+                    in: page.bounds(for: .cropBox),
+                    count: notes.count,
+                    showsCountBadge: true
+                )
+                let notesBounds = notes.dropFirst().reduce(first.bounds) { $0.union($1.bounds) }
+                let maskBounds = notesBounds
+                    .union(bounds)
+                    .insetBy(dx: -2, dy: -2)
+                    .intersection(page.bounds(for: .cropBox))
+                markers.append(NoteMarker(
+                    annotation: first,
+                    pageIndex: pageIndex,
+                    center: center,
+                    bounds: bounds,
+                    maskBounds: maskBounds,
+                    style: style(of: first),
+                    count: notes.count,
+                    showsCountBadge: true,
+                    threadContents: notes.map { $0.contents ?? "" },
+                    sourceHitBounds: notes.map(\.bounds)
                 ))
             }
 

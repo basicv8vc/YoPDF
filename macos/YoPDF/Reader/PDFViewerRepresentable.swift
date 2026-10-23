@@ -45,6 +45,8 @@ struct PDFViewerRepresentable: NSViewRepresentable {
     /// A note marker was clicked. The rectangle is in the reader's
     /// top-left-origin space, ready to anchor a popover.
     let onNoteActivated: (NoteSelection, CGRect) -> Void
+    /// A sticker was dragged to a new center in PDF page coordinates.
+    let onNoteMoved: (NoteSelection, CGPoint) -> Void
     let onPlaceNote: (CGPoint, PDFPage, CGRect) -> Void
     let onCancelPlacement: () -> Void
     let makeMenuItems: (PageMenuContext) -> [NSMenuItem]
@@ -173,6 +175,9 @@ struct PDFViewerRepresentable: NSViewRepresentable {
             view.onNoteActivated = { [weak self] note, rect in
                 self?.parent.onNoteActivated(note, rect)
             }
+            view.onNoteMoved = { [weak self] note, center in
+                self?.parent.onNoteMoved(note, center)
+            }
             view.onPlaceNote = { [weak self] point, page, rect in
                 self?.parent.onPlaceNote(point, page, rect)
             }
@@ -262,6 +267,7 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
     var onMarkupClick: ((CGPoint, PDFPage) -> Bool)?
     var onNoteHit: ((CGPoint, PDFPage) -> NoteSelection?)?
     var onNoteActivated: ((NoteSelection, CGRect) -> Void)?
+    var onNoteMoved: ((NoteSelection, CGPoint) -> Void)?
     var onPlaceNote: ((CGPoint, PDFPage, CGRect) -> Void)?
     var onCancelPlacement: (() -> Void)?
     var makeMenuItems: ((PageMenuContext) -> [NSMenuItem])?
@@ -270,6 +276,13 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
     private var mouseDidDrag = false
     private var consumedMouseDown = false
     private var pendingNoteActivation: (NoteSelection, CGRect)?
+    private struct MarkerDragSession {
+        let marker: NoteMarker
+        let page: PDFPage
+        let startPagePoint: CGPoint
+        let startCenter: CGPoint
+    }
+    private var markerDragSession: MarkerDragSession?
     private var overlayViews: [ObjectIdentifier: MarkupSelectionOverlayView] = [:]
 
     override init(frame frameRect: NSRect) {
@@ -325,6 +338,23 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
             return
         }
 
+        if let marker = noteMarker(at: location),
+           let page = document?.page(at: marker.pageIndex) {
+            // The PDFView path is a fallback for page overlays whose input
+            // hit-testing does not follow PDFKit's rotation transform. Use
+            // PDFView's page conversion for both the initial point and drag.
+            consumedMouseDown = true
+            markerDragSession = MarkerDragSession(
+                marker: marker,
+                page: page,
+                startPagePoint: convert(location, to: page),
+                startCenter: CGPoint(x: marker.bounds.midX, y: marker.bounds.midY)
+            )
+            mouseDownPoint = location
+            mouseDidDrag = false
+            return
+        }
+
         if let page = page(for: location, nearest: false) {
             let pagePoint = convert(location, to: page)
             if let note = onNoteHit?(pagePoint, page), note.usesStickerPresentation {
@@ -341,11 +371,67 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if let session = markerDragSession {
+            let location = convert(event.locationInWindow, from: nil)
+            let pagePoint = convert(location, to: session.page)
+            let delta = CGPoint(
+                x: pagePoint.x - session.startPagePoint.x,
+                y: pagePoint.y - session.startPagePoint.y
+            )
+            if !mouseDidDrag, hypot(delta.x, delta.y) > 3 {
+                mouseDidDrag = true
+            }
+            guard mouseDidDrag else { return }
+            let center = CGPoint(
+                x: session.startCenter.x + delta.x,
+                y: session.startCenter.y + delta.y
+            )
+            overlayViews[ObjectIdentifier(session.page)]?.setExternalDragPreview(
+                session.marker,
+                center: center
+            )
+            return
+        }
+
         mouseDidDrag = true
         super.mouseDragged(with: event)
     }
 
     override func mouseUp(with event: NSEvent) {
+        if let session = markerDragSession {
+            let location = convert(event.locationInWindow, from: nil)
+            let pagePoint = convert(location, to: session.page)
+            let delta = CGPoint(
+                x: pagePoint.x - session.startPagePoint.x,
+                y: pagePoint.y - session.startPagePoint.y
+            )
+            if !mouseDidDrag, hypot(delta.x, delta.y) > 3 {
+                mouseDidDrag = true
+            }
+            let moved = mouseDidDrag
+            let destination = CGPoint(
+                x: session.startCenter.x + delta.x,
+                y: session.startCenter.y + delta.y
+            )
+            markerDragSession = nil
+            consumedMouseDown = false
+            mouseDownPoint = nil
+            mouseDidDrag = false
+            overlayViews[ObjectIdentifier(session.page)]?.setExternalDragPreview(nil, center: nil)
+
+            if let note = onNoteHit?(session.startCenter, session.page) {
+                if moved {
+                    onNoteMoved?(note, destination)
+                } else {
+                    onNoteActivated?(
+                        note,
+                        containerRect(forPageRect: note.bounds, on: session.page)
+                    )
+                }
+            }
+            return
+        }
+
         if consumedMouseDown {
             consumedMouseDown = false
             if let pendingNoteActivation {
@@ -439,23 +525,35 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
         overlay.pageIndex = pageIndex
         overlay.page = page
         overlay.pageBounds = page.bounds(for: .cropBox)
+        overlay.pagePointForOverlayPoint = { [weak self, weak overlay, weak page] point in
+            guard let self, let overlay, let page else { return .zero }
+            let pdfViewPoint = self.convert(point, from: overlay)
+            return self.convert(pdfViewPoint, to: page)
+        }
         overlay.selectedMarkup = selectedMarkup
         overlay.markers = noteMarkers.filter { $0.pageIndex == pageIndex }
         overlay.onMarkerActivated = { [weak self] marker in
             guard let self,
                   let page = self.document?.page(at: marker.pageIndex),
-                  let note = self.onNoteHit?(marker.center, page)
+                  let note = self.onNoteHit?(markerDisplayCenter(marker), page)
             else { return }
             self.onNoteActivated?(
                 note,
                 self.containerRect(forPageRect: note.bounds, on: page)
             )
         }
+        overlay.onMarkerMoved = { [weak self] marker, center in
+            guard let self,
+                  let page = self.document?.page(at: marker.pageIndex),
+                  let note = self.onNoteHit?(markerDisplayCenter(marker), page)
+            else { return }
+            self.onNoteMoved?(note, center)
+        }
         overlay.onMarkerMenu = { [weak self] marker in
             guard let self,
                   let page = self.document?.page(at: marker.pageIndex)
             else { return nil }
-            let note = self.onNoteHit?(marker.center, page)
+            let note = self.onNoteHit?(markerDisplayCenter(marker), page)
             let anchor = note.map { self.containerRect(forPageRect: $0.bounds, on: page) }
                 ?? self.containerRect(forPageRect: marker.bounds, on: page)
             let items = self.makeMenuItems?(
@@ -475,6 +573,17 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
         }
         overlayViews[ObjectIdentifier(page)] = overlay
         return overlay
+    }
+
+    private func markerDisplayCenter(_ marker: NoteMarker) -> CGPoint {
+        CGPoint(x: marker.bounds.midX, y: marker.bounds.midY)
+    }
+
+    private func noteMarker(at viewPoint: CGPoint) -> NoteMarker? {
+        noteMarkers.reversed().first { marker in
+            guard let page = document?.page(at: marker.pageIndex) else { return false }
+            return convert(marker.bounds, from: page).contains(viewPoint)
+        }
     }
 
     func pdfView(
@@ -506,6 +615,7 @@ private final class MarkupSelectionOverlayView: NSView {
     var pageIndex = -1
     var page: PDFPage?
     var pageBounds: CGRect = .zero
+    var pagePointForOverlayPoint: ((CGPoint) -> CGPoint)?
     var selectedMarkup: MarkupSelection? {
         didSet { needsDisplay = true }
     }
@@ -517,40 +627,160 @@ private final class MarkupSelectionOverlayView: NSView {
         }
     }
     var onMarkerActivated: ((NoteMarker) -> Void)?
+    var onMarkerMoved: ((NoteMarker, CGPoint) -> Void)?
     var onMarkerMenu: ((NoteMarker) -> NSMenu?)?
+
+    private var pressedMarker: NoteMarker?
+    private var dragStartPagePoint: CGPoint?
+    private var dragStartCenter: CGPoint?
+    private var previewCenter: CGPoint?
+    private var didDragMarker = false
 
     override var isOpaque: Bool { false }
 
     private func marker(at point: NSPoint) -> NoteMarker? {
-        let pagePoint = CGPoint(
-            x: point.x + pageBounds.minX,
-            y: point.y + pageBounds.minY
-        )
+        let pagePoint = self.pagePoint(for: point)
         return markers.reversed().first {
-            $0.bounds.contains(pagePoint)
+            displayedBounds(for: $0).contains(pagePoint)
+                || $0.sourceHitBounds.contains { $0.contains(pagePoint) }
         }
     }
 
-    /// Markers take clicks so PDFKit cannot open its native note popup over the
-    /// sticker. Everywhere else the overlay is transparent to hit testing, so
-    /// text selection, links and scrolling keep working.
+    private func displayedBounds(for marker: NoteMarker) -> CGRect {
+        guard pressedMarker?.id == marker.id,
+              let previewCenter
+        else { return marker.bounds }
+        return CGRect(
+            x: previewCenter.x - marker.bounds.width / 2,
+            y: previewCenter.y - marker.bounds.height / 2,
+            width: marker.bounds.width,
+            height: marker.bounds.height
+        )
+    }
+
+    private func displayedMaskBounds(for marker: NoteMarker) -> CGRect {
+        marker.maskBounds
+            .union(marker.bounds)
+            .union(displayedBounds(for: marker))
+    }
+
+    private func pagePoint(for viewPoint: NSPoint) -> CGPoint {
+        pagePointForOverlayPoint?(CGPoint(x: viewPoint.x, y: viewPoint.y))
+            ?? CGPoint(
+                x: viewPoint.x + pageBounds.minX,
+                y: viewPoint.y + pageBounds.minY
+            )
+    }
+
+    func setExternalDragPreview(_ marker: NoteMarker?, center: CGPoint?) {
+        pressedMarker = marker
+        if let marker, let center {
+            previewCenter = clampedCenter(center, for: marker)
+            didDragMarker = true
+        } else {
+            previewCenter = nil
+            didDragMarker = false
+        }
+        needsDisplay = true
+        window?.invalidateCursorRects(for: self)
+    }
+
+    private func clampedCenter(_ center: CGPoint, for marker: NoteMarker) -> CGPoint {
+        let movingBounds = marker.sourceHitBounds.reduce(marker.bounds) { $0.union($1) }
+        guard movingBounds.width <= pageBounds.width,
+              movingBounds.height <= pageBounds.height
+        else { return CGPoint(x: marker.bounds.midX, y: marker.bounds.midY) }
+
+        let minimumDelta = CGPoint(
+            x: pageBounds.minX - movingBounds.minX,
+            y: pageBounds.minY - movingBounds.minY
+        )
+        let maximumDelta = CGPoint(
+            x: pageBounds.maxX - movingBounds.maxX,
+            y: pageBounds.maxY - movingBounds.maxY
+        )
+        guard minimumDelta.x <= maximumDelta.x,
+              minimumDelta.y <= maximumDelta.y
+        else { return CGPoint(x: marker.bounds.midX, y: marker.bounds.midY) }
+
+        let requestedDelta = CGPoint(
+            x: center.x - marker.bounds.midX,
+            y: center.y - marker.bounds.midY
+        )
+        return CGPoint(
+            x: marker.bounds.midX + min(max(requestedDelta.x, minimumDelta.x), maximumDelta.x),
+            y: marker.bounds.midY + min(max(requestedDelta.y, minimumDelta.y), maximumDelta.y)
+        )
+    }
+
+    /// Markers take input so PDFKit cannot open its native note popup over the
+    /// sticker and a drag can move it. Everywhere else the overlay is
+    /// transparent to hit testing, so text selection, links and scrolling work.
     override func hitTest(_ point: NSPoint) -> NSView? {
-        marker(at: point) == nil ? nil : self
+        guard let superview else { return nil }
+        let localPoint = convert(point, from: superview)
+        return marker(at: localPoint) == nil ? nil : self
     }
 
     override func resetCursorRects() {
         super.resetCursorRects()
         for marker in markers {
-            let frame = marker.bounds
+            let frame = displayedBounds(for: marker)
             let rect = frame.offsetBy(dx: -pageBounds.minX, dy: -pageBounds.minY)
             addCursorRect(rect, cursor: .pointingHand)
         }
     }
 
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard let marker = marker(at: point) else { return }
+        pressedMarker = marker
+        dragStartPagePoint = pagePoint(for: point)
+        let center = CGPoint(x: marker.bounds.midX, y: marker.bounds.midY)
+        dragStartCenter = center
+        previewCenter = center
+        didDragMarker = false
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let marker = pressedMarker,
+              let dragStartPagePoint,
+              let dragStartCenter
+        else { return }
+        let pointer = pagePoint(for: convert(event.locationInWindow, from: nil))
+        let delta = CGPoint(
+            x: pointer.x - dragStartPagePoint.x,
+            y: pointer.y - dragStartPagePoint.y
+        )
+        if !didDragMarker, hypot(delta.x, delta.y) > 3 {
+            didDragMarker = true
+        }
+        guard didDragMarker else { return }
+        previewCenter = clampedCenter(
+            CGPoint(x: dragStartCenter.x + delta.x, y: dragStartCenter.y + delta.y),
+            for: marker
+        )
+        needsDisplay = true
+        window?.invalidateCursorRects(for: self)
+    }
+
     override func mouseUp(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        guard let marker = self.marker(at: point) else { return }
-        onMarkerActivated?(marker)
+        guard let marker = pressedMarker else { return }
+        let moved = didDragMarker
+        let destination = previewCenter
+        pressedMarker = nil
+        dragStartPagePoint = nil
+        dragStartCenter = nil
+        previewCenter = nil
+        didDragMarker = false
+        if moved, let destination {
+            onMarkerMoved?(marker, destination)
+        } else if self.marker(at: point)?.id == marker.id {
+            onMarkerActivated?(marker)
+        }
+        needsDisplay = true
+        window?.invalidateCursorRects(for: self)
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {
@@ -602,9 +832,12 @@ private final class MarkupSelectionOverlayView: NSView {
         // them in a separate pass prevents a later mask from erasing an earlier
         // sticker.
         for marker in pageMarkers {
-            let rect = marker.bounds.offsetBy(dx: -pageBounds.minX, dy: -pageBounds.minY)
+            let rect = displayedBounds(for: marker).offsetBy(
+                dx: -pageBounds.minX,
+                dy: -pageBounds.minY
+            )
             guard rect.width > 1, rect.height > 1 else { continue }
-            let candidate = marker.maskBounds
+            let candidate = displayedMaskBounds(for: marker)
             let maskBounds = candidate.origin.x.isFinite
                 && candidate.origin.y.isFinite
                 && candidate.width.isFinite
@@ -626,7 +859,10 @@ private final class MarkupSelectionOverlayView: NSView {
     private func drawNoteStickerArtwork() {
         let pageMarkers = markers.filter { $0.pageIndex == pageIndex }
         for marker in pageMarkers {
-            let rect = marker.bounds.offsetBy(dx: -pageBounds.minX, dy: -pageBounds.minY)
+            let rect = displayedBounds(for: marker).offsetBy(
+                dx: -pageBounds.minX,
+                dy: -pageBounds.minY
+            )
             guard rect.width > 1, rect.height > 1 else { continue }
             drawSticker(
                 marker.style,
@@ -647,8 +883,11 @@ private final class MarkupSelectionOverlayView: NSView {
 
         pageCopy.rotation = 0
         pageCopy.displaysAnnotations = page.displaysAnnotations
-        for annotation in pageCopy.annotations {
-            if NoteService.usesStickerPresentation(annotation) || annotation.type == "Popup" {
+        for annotation in pageCopy.annotations.reversed() {
+            if NoteService.usesStickerPresentation(annotation)
+                || annotation.type == "Popup"
+                || annotation.type == "/Popup"
+            {
                 pageCopy.removeAnnotation(annotation)
             }
         }
@@ -666,6 +905,13 @@ private final class MarkupSelectionOverlayView: NSView {
 
         context.saveGState()
         context.clip(to: rect)
+        // PDF pages are transparent by default. Repainting only their content
+        // would leave transparent pixels in this overlay, allowing PDFKit's
+        // native note icon beneath the sticker to show through. PDFView presents
+        // those transparent areas on a white page, so make that backdrop opaque
+        // before redrawing the page content without the sticker annotations.
+        context.setFillColor(NSColor.white.cgColor)
+        context.fill(rect)
         context.translateBy(
             x: bounds.midX - renderedSize.width / 2 - crop.minX * scale,
             y: bounds.midY - renderedSize.height / 2 - crop.minY * scale
