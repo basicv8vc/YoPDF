@@ -108,6 +108,24 @@ extension PDFDocumentModel {
         return nil
     }
 
+    /// Resolves one saved thought into a normal single-note selection for the
+    /// row's Edit and Delete actions in the group composer.
+    public func noteSelection(
+        forThreadEntry entry: NoteThreadEntry,
+        in group: NoteSelection
+    ) -> NoteSelection? {
+        guard isAttached(group),
+              let page = document?.page(at: group.pageIndex),
+              entry.annotation.page === page,
+              page.annotations.contains(where: { $0 === entry.annotation })
+        else { return nil }
+        return NoteService.selection(
+            for: entry.annotation,
+            on: page,
+            pageIndex: group.pageIndex
+        )
+    }
+
     /// Whether a captured anchor still describes the document on screen.
     ///
     /// A composer can outlive the document its anchor was taken from, and a
@@ -297,6 +315,45 @@ extension PDFDocumentModel {
             pageIndex: draft.pageIndex
         ) else { return .failure(.annotationUnavailable) }
         return .success(selection)
+    }
+
+    /// Adds one thought to an existing ShuaMac group at the same sticker
+    /// anchor, preserving the group's identity and ordering for both readers.
+    @discardableResult
+    public func addThought(
+        to group: NoteSelection,
+        contents: String,
+        style: NoteStickerStyle
+    ) -> Result<NoteSelection, NoteEditError> {
+        guard let document else { return .failure(.noDocument) }
+        guard isAttached(group) else { return .failure(.annotationUnavailable) }
+        guard group.groupCount > 1,
+              document.allowsCommenting
+        else { return .failure(.permissionDenied) }
+
+        let text = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return .failure(.emptyContents) }
+        guard let page = document.page(at: group.pageIndex), page.document === document else {
+            return .failure(.pageUnavailable)
+        }
+        guard let annotation = NoteService.groupedThoughtAnnotation(
+            for: group,
+            contents: text,
+            style: style,
+            on: page
+        ) else { return .failure(.annotationUnavailable) }
+
+        let edit = MarkupEdit(changes: [
+            .insert(annotation: annotation, pageIndex: group.pageIndex)
+        ])
+        guard performMarkupEdit(edit) else { return .failure(.permissionDenied) }
+
+        selectedMarkup = nil
+        updateSelection(nil)
+        guard let updatedGroup = noteSelection(at: group.center, on: page) else {
+            return .failure(.annotationUnavailable)
+        }
+        return .success(updatedGroup)
     }
 
     /// Compatibility entry point for callers that only choose a paper tint.

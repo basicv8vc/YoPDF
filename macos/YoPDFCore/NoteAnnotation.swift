@@ -99,6 +99,27 @@ struct NoteStyleSnapshot {
 /// `center` is the persisted anchor in page space; `bounds` is the fixed-size
 /// card the overlay draws around it. The annotation's own `/Rect` is not used
 /// once an anchor exists, because PDFKit may rewrite it on the first save.
+public struct NoteThreadEntry: Identifiable, Equatable {
+    public let id: ObjectIdentifier
+    public let contents: String
+    public let style: NoteStickerStyle
+
+    let annotation: PDFAnnotation
+
+    init(annotation: PDFAnnotation, contents: String, style: NoteStickerStyle) {
+        self.id = ObjectIdentifier(annotation)
+        self.contents = contents
+        self.style = style
+        self.annotation = annotation
+    }
+
+    public static func == (lhs: NoteThreadEntry, rhs: NoteThreadEntry) -> Bool {
+        lhs.annotation === rhs.annotation
+            && lhs.contents == rhs.contents
+            && lhs.style == rhs.style
+    }
+}
+
 public struct NoteMarker: Identifiable, Equatable {
     public let id: ObjectIdentifier
     public let pageIndex: Int
@@ -115,6 +136,8 @@ public struct NoteMarker: Identifiable, Equatable {
     public let showsCountBadge: Bool
     /// Bodies in group order, so the thread remains readable without ShuaMac's sidecar.
     public let threadContents: [String]
+    /// Individual thoughts in group order, with the sticker style of each note.
+    public let threadEntries: [NoteThreadEntry]
     /// Original ShuaMac icon rectangles, including portions hidden by the
     /// grouped sticker overlay. These remain valid hit targets for the group.
     public let sourceHitBounds: [CGRect]
@@ -133,6 +156,7 @@ public struct NoteMarker: Identifiable, Equatable {
         count: Int = 1,
         showsCountBadge: Bool = false,
         threadContents: [String] = [],
+        threadEntries: [NoteThreadEntry] = [],
         sourceHitBounds: [CGRect] = []
     ) {
         self.id = ObjectIdentifier(annotation)
@@ -144,6 +168,13 @@ public struct NoteMarker: Identifiable, Equatable {
         self.count = count
         self.showsCountBadge = showsCountBadge
         self.threadContents = threadContents
+        self.threadEntries = threadEntries.isEmpty
+            ? [NoteThreadEntry(
+                annotation: annotation,
+                contents: annotation.contents ?? "",
+                style: style
+            )]
+            : threadEntries
         self.sourceHitBounds = sourceHitBounds
         self.annotation = annotation
     }
@@ -158,6 +189,7 @@ public struct NoteMarker: Identifiable, Equatable {
             && lhs.count == rhs.count
             && lhs.showsCountBadge == rhs.showsCountBadge
             && lhs.threadContents == rhs.threadContents
+            && lhs.threadEntries == rhs.threadEntries
             && lhs.sourceHitBounds == rhs.sourceHitBounds
     }
 }
@@ -200,6 +232,8 @@ public struct NoteSelection: Identifiable, Equatable {
     public let groupCount: Int
     /// The full body list for a ShuaMac group, ordered as its notes are stacked.
     public let threadContents: [String]
+    /// The notes in the thread, including each note's own motif and palette.
+    public let threadEntries: [NoteThreadEntry]
 
     public var paperColor: NotePaperColor { style.palette }
 
@@ -222,7 +256,8 @@ public struct NoteSelection: Identifiable, Equatable {
         isYoPDFNote: Bool,
         usesStickerPresentation: Bool,
         groupCount: Int,
-        threadContents: [String]
+        threadContents: [String],
+        threadEntries: [NoteThreadEntry]
     ) {
         self.annotation = annotation
         self.pageIndex = pageIndex
@@ -236,6 +271,7 @@ public struct NoteSelection: Identifiable, Equatable {
         self.usesStickerPresentation = usesStickerPresentation
         self.groupCount = groupCount
         self.threadContents = threadContents
+        self.threadEntries = threadEntries
     }
 
     public static func == (lhs: NoteSelection, rhs: NoteSelection) -> Bool {
@@ -251,6 +287,7 @@ public struct NoteSelection: Identifiable, Equatable {
             && lhs.usesStickerPresentation == rhs.usesStickerPresentation
             && lhs.groupCount == rhs.groupCount
             && lhs.threadContents == rhs.threadContents
+            && lhs.threadEntries == rhs.threadEntries
     }
 }
 
@@ -1054,7 +1091,8 @@ public enum NoteService {
     ) -> CGRect {
         displayBounds(
             center: markerCenter(of: annotation, on: page),
-            in: page.bounds(for: .cropBox)
+            in: page.bounds(for: .cropBox),
+            showsCountBadge: true
         )
     }
 
@@ -1081,7 +1119,7 @@ public enum NoteService {
             bounds = displayBounds(
                 center: center,
                 in: page.bounds(for: .cropBox),
-                showsCountBadge: isShuaThought(annotation)
+                showsCountBadge: true
             )
         } else {
             // No overlay is drawn for a third-party note, so the popover and the
@@ -1102,7 +1140,14 @@ public enum NoteService {
             isYoPDFNote: owned,
             usesStickerPresentation: usesSticker,
             groupCount: marker?.count ?? 1,
-            threadContents: marker?.threadContents ?? [annotation.contents ?? ""]
+            threadContents: marker?.threadContents ?? [annotation.contents ?? ""],
+            threadEntries: marker?.threadEntries ?? [
+                NoteThreadEntry(
+                    annotation: annotation,
+                    contents: annotation.contents ?? "",
+                    style: style(of: annotation)
+                ),
+            ]
         )
     }
 
@@ -1133,7 +1178,11 @@ public enum NoteService {
                     && shuaAnchorID(of: annotation) == nil
             {
                 let center = markerCenter(of: annotation, on: page)
-                let bounds = displayBounds(center: center, in: page.bounds(for: .cropBox))
+                let bounds = displayBounds(
+                    center: center,
+                    in: page.bounds(for: .cropBox),
+                    showsCountBadge: true
+                )
                 markers.append(NoteMarker(
                     annotation: annotation,
                     pageIndex: pageIndex,
@@ -1141,6 +1190,7 @@ public enum NoteService {
                     bounds: bounds,
                     maskBounds: bounds,
                     style: style(of: annotation),
+                    showsCountBadge: true,
                     threadContents: [annotation.contents ?? ""]
                 ))
             }
@@ -1207,6 +1257,13 @@ public enum NoteService {
                     count: notes.count,
                     showsCountBadge: true,
                     threadContents: notes.map { $0.contents ?? "" },
+                    threadEntries: notes.map {
+                        NoteThreadEntry(
+                            annotation: $0,
+                            contents: $0.contents ?? "",
+                            style: style(of: $0)
+                        )
+                    },
                     sourceHitBounds: notes.map(\.bounds)
                 ))
             }
@@ -1267,6 +1324,13 @@ public enum NoteService {
                     count: notes.count,
                     showsCountBadge: true,
                     threadContents: notes.map { $0.contents ?? "" },
+                    threadEntries: notes.map {
+                        NoteThreadEntry(
+                            annotation: $0,
+                            contents: $0.contents ?? "",
+                            style: style(of: $0)
+                        )
+                    },
                     sourceHitBounds: notes.map(\.bounds)
                 ))
             }
@@ -1408,6 +1472,141 @@ public enum NoteService {
         setExcerpt(draft.excerpt, on: annotation)
         setPageLevel(draft.isPageLevel, on: annotation)
         return annotation
+    }
+
+    /// Creates one additional thought in an imported ShuaMac group.
+    ///
+    /// Shua groups are still ordinary `/Text` annotations. Groups with an
+    /// embedded identity get a fresh thought ID and the next order value;
+    /// legacy geometry-only stacks stay geometry-only so their existing
+    /// members continue to resolve as one marker.
+    static func groupedThoughtAnnotation(
+        for group: NoteSelection,
+        contents: String,
+        style: NoteStickerStyle,
+        on page: PDFPage
+    ) -> PDFAnnotation? {
+        let text = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty,
+              group.groupCount > 1,
+              isShuaThought(group.annotation),
+              group.annotation.page === page,
+              page.document != nil
+        else { return nil }
+
+        let anchorID = shuaAnchorID(of: group.annotation)
+        let members: [PDFAnnotation]
+        if let anchorID {
+            members = page.annotations.filter { shuaAnchorID(of: $0) == anchorID }
+        } else {
+            members = shuaStackMembers(of: group.annotation, on: page)
+        }
+        guard members.count >= 2 else { return nil }
+
+        let crop = page.bounds(for: .cropBox)
+        guard crop.width > 0, crop.height > 0 else { return nil }
+        let size: CGFloat = 20
+        let columnX = members.first?.bounds.midX ?? group.center.x
+        let bottom = members.map(\.bounds.minY).min() ?? (group.center.y - size / 2)
+        let maximumX = max(crop.minX, crop.maxX - size)
+        let maximumY = max(crop.minY, crop.maxY - size)
+        let bounds = CGRect(
+            x: min(max(columnX - size / 2, crop.minX), maximumX),
+            y: min(max(bottom - 23, crop.minY), maximumY),
+            width: size,
+            height: size
+        )
+
+        let annotation = PDFAnnotation(bounds: bounds, forType: .text, withProperties: nil)
+        annotation.iconType = .comment
+        annotation.contents = text
+        annotation.userName = "Shua"
+        annotation.color = style.palette.color
+        annotation.modificationDate = Date()
+        setStyle(style, on: annotation)
+        setAnchor(group.center, on: annotation, page: page)
+        setExcerpt(group.excerpt, on: annotation)
+        setPageLevel(group.isPageLevel, on: annotation)
+
+        guard let shuaStyleData = try? JSONEncoder().encode(style),
+              let shuaStyle = String(data: shuaStyleData, encoding: .utf8)
+        else { return nil }
+        _ = annotation.setValue(shuaStyle, forAnnotationKey: shuaStickerStyleKey)
+
+        if let anchorID {
+            let thoughtID = UUID()
+            let nextOrder = members
+                .compactMap { shuaThoughtMetadata(of: $0)?.thoughtOrder }
+                .max()
+                .map { $0 + 1 }
+                ?? members.count
+            _ = annotation.setValue(
+                "shua-thought:\(anchorID.uuidString):\(thoughtID.uuidString)",
+                forAnnotationKey: .name
+            )
+            _ = annotation.setValue(
+                "\(anchorID.uuidString):\(thoughtID.uuidString)",
+                forAnnotationKey: shuaIdentityPersistenceKey
+            )
+            _ = annotation.setValue(anchorID.uuidString, forAnnotationKey: shuaAnchorPersistenceKey)
+            guard let metadata = newShuaThoughtMetadata(
+                basedOn: members.first(where: {
+                    $0.value(forAnnotationKey: shuaThoughtMetadataKey) != nil
+                }),
+                anchorID: anchorID,
+                thoughtID: thoughtID,
+                thoughtOrder: nextOrder,
+                group: group,
+                markerCenter: group.center,
+                crop: crop
+            ) else { return nil }
+            _ = annotation.setValue(metadata, forAnnotationKey: shuaThoughtMetadataKey)
+        }
+
+        return annotation
+    }
+
+    private static func newShuaThoughtMetadata(
+        basedOn source: PDFAnnotation?,
+        anchorID: UUID,
+        thoughtID: UUID,
+        thoughtOrder: Int,
+        group: NoteSelection,
+        markerCenter: CGPoint,
+        crop: CGRect
+    ) -> String? {
+        var payload: [String: Any]
+        if let source,
+           let raw = source.value(forAnnotationKey: shuaThoughtMetadataKey) as? String,
+           let data = raw.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            payload = object
+        } else {
+            let x = min(max((markerCenter.x - crop.minX) / crop.width, 0), 1)
+            let y = min(max((markerCenter.y - crop.minY) / crop.height, 0), 1)
+            let anchor: [String: Any] = [
+                "id": anchorID.uuidString,
+                "excerpt": group.excerpt ?? "",
+                "regions": [[String: Any]](),
+                "isPageLevel": group.isPageLevel,
+                "markerPosition": ["x": Double(x), "y": Double(y)],
+            ]
+            payload = ["version": 1, "anchor": anchor]
+        }
+
+        guard var anchor = payload["anchor"] as? [String: Any] else { return nil }
+        anchor["id"] = anchorID.uuidString
+        payload["anchor"] = anchor
+        payload["version"] = 1
+        payload["thoughtID"] = thoughtID.uuidString
+        payload["thoughtOrder"] = thoughtOrder
+        payload["createdAt"] = Date().timeIntervalSinceReferenceDate
+        payload["modifiedAt"] = Date().timeIntervalSinceReferenceDate
+
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 
     /// Applies the YoPDF paper tint. `/C` is also updated so the standard note

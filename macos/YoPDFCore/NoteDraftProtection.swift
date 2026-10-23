@@ -101,6 +101,8 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
     public enum Mode {
         case create(NoteDraft)
         case edit(NoteSelection)
+        /// Adds a new thought to an existing ShuaMac thought group.
+        case group(NoteSelection)
     }
 
     public let id = UUID()
@@ -211,11 +213,18 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
                 motif: NoteService.style(of: note.annotation).motif,
                 palette: paper
             )
+        case let .group(note):
+            return NoteService.style(of: note.annotation)
         }
     }
 
     public var isEditing: Bool {
         if case .edit = mode { return true }
+        return false
+    }
+
+    public var isGroupComposer: Bool {
+        if case .group = mode { return true }
         return false
     }
 
@@ -261,6 +270,8 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
             return model.addNote(draft, contents: contents, style: style)
         case let .edit(note):
             return model.updateNote(note, contents: contents, style: style)
+        case let .group(note):
+            return model.addThought(to: note, contents: contents, style: style)
         }
     }
 
@@ -272,6 +283,9 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
             return model.canCreateNote ? .ready : .commentingDisabled
         case let .edit(note):
             return model.isAttached(note) ? .ready : .noteRemoved
+        case let .group(note):
+            guard model.isAttached(note) else { return .noteRemoved }
+            return model.canCreateNote ? .ready : .commentingDisabled
         }
     }
 

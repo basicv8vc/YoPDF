@@ -44,6 +44,7 @@ struct PDFReaderView: View {
         enum ComposerTarget: Equatable {
             case draft(NoteDraft, CGRect)
             case note(NoteSelection, CGRect)
+            case group(NoteSelection, CGRect)
         }
 
         var readerAction: ReaderAction {
@@ -457,7 +458,7 @@ struct PDFReaderView: View {
                 },
                 onNoteActivated: { note, anchor in
                     isPlacingNote = false
-                    requestCompose(.note(note, anchor))
+                    requestCompose(note.groupCount > 1 ? .group(note, anchor) : .note(note, anchor))
                 },
                 onNoteMoved: { note, center in
                     _ = model.moveNoteMarker(note, to: center)
@@ -480,6 +481,15 @@ struct PDFReaderView: View {
                 if let session = composerStore.session {
                     NoteComposerView(session: session, model: model) {
                         composerStore.end()
+                    } onEditGroupEntry: { group, entry in
+                        guard let note = model.noteSelection(forThreadEntry: entry, in: group) else {
+                            return
+                        }
+                        let anchor = anchorResolver.containerRect(
+                            forPageBounds: group.bounds,
+                            pageIndex: group.pageIndex
+                        ) ?? Self.fallbackAnchor
+                        requestCompose(.note(note, anchor))
                     }
                     .id(session.id)
                 }
@@ -740,6 +750,15 @@ struct PDFReaderView: View {
                 pageLabel: note.pageLabel,
                 excerpt: note.excerpt,
                 contents: note.contents,
+                style: note.style
+            )
+        case let .group(note, anchor):
+            composerStore.begin(
+                mode: .group(note),
+                anchorRect: anchor,
+                pageLabel: note.pageLabel,
+                excerpt: note.excerpt,
+                contents: "",
                 style: note.style
             )
         }
