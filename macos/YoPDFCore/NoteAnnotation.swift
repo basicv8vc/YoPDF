@@ -171,6 +171,8 @@ struct NotePositionSnapshot {
     let bounds: CGRect
     let anchorX: Any?
     let anchorY: Any?
+    /// Raw Shua metadata is retained so movement participates in Undo/Redo.
+    let shuaMetadata: Any?
 }
 
 /// The note the user clicked, in the terms the composer needs.
@@ -479,6 +481,36 @@ public enum NoteService {
         return metadata
     }
 
+    /// Updates only Shua's shared sticker anchor inside its versioned payload.
+    /// Editing the JSON object in place preserves fields owned by newer
+    /// ShuaMac versions.
+    private static func shuaThoughtMetadata(
+        of annotation: PDFAnnotation,
+        markerPosition: CGPoint,
+        in pageBounds: CGRect
+    ) -> String? {
+        guard shuaThoughtMetadata(of: annotation) != nil,
+              let raw = annotation.value(forAnnotationKey: shuaThoughtMetadataKey) as? String,
+              let data = raw.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              var payload = object as? [String: Any],
+              var anchor = payload["anchor"] as? [String: Any],
+              pageBounds.width.isFinite, pageBounds.height.isFinite,
+              pageBounds.width > 0, pageBounds.height > 0,
+              markerPosition.x.isFinite, markerPosition.y.isFinite
+        else { return nil }
+
+        let x = min(max((markerPosition.x - pageBounds.minX) / pageBounds.width, 0), 1)
+        let y = min(max((markerPosition.y - pageBounds.minY) / pageBounds.height, 0), 1)
+        anchor["markerPosition"] = ["x": Double(x), "y": Double(y)]
+        payload["anchor"] = anchor
+
+        guard let updated = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            return nil
+        }
+        return String(data: updated, encoding: .utf8)
+    }
+
     /// Preserves Shua identities through PDFKit's `/NM` loss on write.
     ///
     /// Name-only annotations use a temporary anchor cache. If `/NM` conflicts
@@ -615,9 +647,10 @@ public enum NoteService {
     ///
     /// Some PDF round trips keep `/T = Shua` and `ShuaStickerStyle` while
     /// dropping both `/NM` and `ShuaThoughtMetadata`. In that case the only
-    /// remaining group signal is the original 24pt icon rectangles stepped
-    /// down by 23pt. Requiring the exact author, matching style, matching column
-    /// and a continuous run avoids merging notes merely because they are close.
+    /// remaining group signal is the original 20pt icon rectangles stepped
+    /// down by 23pt. Some PDFKit round trips rewrite those rectangles to 24pt.
+    /// Requiring the exact author, matching style, matching column and a
+    /// continuous run avoids merging notes merely because they are close.
     static func shuaStackMembers(
         of annotation: PDFAnnotation,
         on page: PDFPage
@@ -633,6 +666,10 @@ public enum NoteService {
         let tolerance: CGFloat = 0.5
         let candidates = annotations.filter { annotation in
             let bounds = annotation.bounds
+            let hasSupportedIconSize = [CGFloat(20), CGFloat(24)].contains { size in
+                abs(bounds.width - size) <= tolerance
+                    && abs(bounds.height - size) <= tolerance
+            }
             return isTextAnnotation(annotation)
                 && annotation.shouldDisplay
                 && annotation.userName == "Shua"
@@ -643,8 +680,7 @@ public enum NoteService {
                 && annotation.value(forAnnotationKey: shuaIdentityPersistenceKey) == nil
                 && annotation.value(forAnnotationKey: shuaAnchorPersistenceKey) == nil
                 && annotation.value(forAnnotationKey: shuaStickerStyleKey) != nil
-                && abs(bounds.width - markerSize) <= tolerance
-                && abs(bounds.height - markerSize) <= tolerance
+                && hasSupportedIconSize
                 && bounds.origin.x.isFinite
                 && bounds.origin.y.isFinite
                 && bounds.width.isFinite
@@ -913,14 +949,16 @@ public enum NoteService {
         NotePositionSnapshot(
             bounds: annotation.bounds,
             anchorX: annotation.value(forAnnotationKey: anchorXKey),
-            anchorY: annotation.value(forAnnotationKey: anchorYKey)
+            anchorY: annotation.value(forAnnotationKey: anchorYKey),
+            shuaMetadata: annotation.value(forAnnotationKey: shuaThoughtMetadataKey)
         )
     }
 
     static func positionSnapshot(
         bounds: CGRect,
         anchor: CGPoint,
-        on page: PDFPage
+        on page: PDFPage,
+        for annotation: PDFAnnotation
     ) -> NotePositionSnapshot? {
         let crop = page.bounds(for: .cropBox)
         guard crop.width > 0, crop.height > 0,
@@ -928,12 +966,25 @@ public enum NoteService {
               anchor.x.isFinite, anchor.y.isFinite
         else { return nil }
 
+        let shuaMetadata: Any?
+        if annotation.value(forAnnotationKey: shuaThoughtMetadataKey) != nil {
+            guard let updated = shuaThoughtMetadata(
+                of: annotation,
+                markerPosition: anchor,
+                in: crop
+            ) else { return nil }
+            shuaMetadata = updated
+        } else {
+            shuaMetadata = nil
+        }
+
         let x = min(max((anchor.x - crop.minX) / crop.width, 0), 1)
         let y = min(max((anchor.y - crop.minY) / crop.height, 0), 1)
         return NotePositionSnapshot(
             bounds: bounds,
             anchorX: NSNumber(value: Double(x)),
-            anchorY: NSNumber(value: Double(y))
+            anchorY: NSNumber(value: Double(y)),
+            shuaMetadata: shuaMetadata
         )
     }
 
@@ -951,6 +1002,11 @@ public enum NoteService {
             _ = annotation.setValue(anchorY, forAnnotationKey: anchorYKey)
         } else {
             annotation.removeValue(forAnnotationKey: anchorYKey)
+        }
+        if let shuaMetadata = snapshot.shuaMetadata {
+            _ = annotation.setValue(shuaMetadata, forAnnotationKey: shuaThoughtMetadataKey)
+        } else {
+            annotation.removeValue(forAnnotationKey: shuaThoughtMetadataKey)
         }
         annotation.modificationDate = Date()
     }

@@ -21,7 +21,7 @@ final class ShuaCompatibilityTests: XCTestCase {
         let height: Double
     }
 
-    private struct Point: Codable {
+    private struct Point: Codable, Equatable {
         let x: Double
         let y: Double
     }
@@ -88,10 +88,11 @@ final class ShuaCompatibilityTests: XCTestCase {
         isPageLevel: Bool = false,
         includesName: Bool = true,
         markerPosition: Point = Point(x: 0.5, y: 0.5),
+        size: CGFloat = 20,
         style: NoteStickerStyle = NoteStickerStyle(motif: .cat, palette: .honey)
     ) throws -> PDFAnnotation {
         let note = PDFAnnotation(
-            bounds: CGRect(x: x, y: y, width: 20, height: 20),
+            bounds: CGRect(x: x, y: y, width: size, height: size),
             forType: .text,
             withProperties: nil
         )
@@ -133,6 +134,20 @@ final class ShuaCompatibilityTests: XCTestCase {
 
     private func textAnnotations(on page: PDFPage) -> [PDFAnnotation] {
         page.annotations.filter { NoteService.isTextAnnotation($0) }
+    }
+
+    private func markerPosition(in annotation: PDFAnnotation) throws -> Point {
+        let raw = try XCTUnwrap(
+            annotation.value(forAnnotationKey: Self.shuaThoughtMetadataKey) as? String
+        )
+        let payload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any]
+        )
+        let anchor = try XCTUnwrap(payload["anchor"] as? [String: Any])
+        let position = try XCTUnwrap(anchor["markerPosition"] as? [String: Any])
+        let x = try XCTUnwrap(position["x"] as? NSNumber).doubleValue
+        let y = try XCTUnwrap(position["y"] as? NSNumber).doubleValue
+        return Point(x: x, y: y)
     }
 
     private func replaceEmbeddedMetadata(
@@ -318,6 +333,191 @@ final class ShuaCompatibilityTests: XCTestCase {
         ])
         XCTAssertEqual(reopenedMarker.center.x, sourceMarker.center.x, accuracy: 0.001)
         XCTAssertEqual(reopenedMarker.center.y, sourceMarker.center.y, accuracy: 0.001)
+    }
+
+    func testMetadataFreeLegacyStacksRecognize20And24PointRectsAfterSerialization() throws {
+        let url = try makeFixture(named: "shua-legacy-stack-sizes")
+        let document = try XCTUnwrap(PDFDocument(url: url))
+        let page = try XCTUnwrap(document.page(at: 0))
+
+        for (groupIndex, size) in [CGFloat(20), CGFloat(24)].enumerated() {
+            let anchorID = UUID()
+            for order in 0..<3 {
+                let note = try addShuaThought(
+                    to: page,
+                    anchorID: anchorID,
+                    order: order,
+                    x: CGFloat(120 + groupIndex * 250),
+                    y: CGFloat(650 - order * 23),
+                    contents: "Legacy \(Int(size))pt thought \(order)",
+                    size: size
+                )
+                note.removeValue(forAnnotationKey: .name)
+                note.removeValue(forAnnotationKey: Self.shuaThoughtMetadataKey)
+            }
+        }
+
+        XCTAssertEqual(NoteService.markers(in: document).map(\.count).sorted(), [3, 3])
+        try write(document, to: url)
+
+        let reopened = try XCTUnwrap(PDFDocument(url: url))
+        XCTAssertEqual(NoteService.markers(in: reopened).map(\.count).sorted(), [3, 3])
+    }
+
+    func testMovingShuaGroupSyncsMetadataAcrossUndoRedoAndSaveReopen() throws {
+        let url = try makeFixture(named: "shua-move-metadata")
+        let source = try XCTUnwrap(PDFDocument(url: url))
+        let sourcePage = try XCTUnwrap(source.page(at: 0))
+        let anchorID = UUID()
+        for order in 0..<3 {
+            _ = try addShuaThought(
+                to: sourcePage,
+                anchorID: anchorID,
+                order: order,
+                x: 300,
+                y: CGFloat(650 - order * 23),
+                contents: "Move thought \(order)"
+            )
+        }
+
+        let sourceNotes = textAnnotations(on: sourcePage)
+        let extendedNote = try XCTUnwrap(sourceNotes.first)
+        let originalRaw = try XCTUnwrap(
+            extendedNote.value(forAnnotationKey: Self.shuaThoughtMetadataKey) as? String
+        )
+        var originalPayload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(originalRaw.utf8)) as? [String: Any]
+        )
+        originalPayload["futureTopLevelField"] = ["preserve": true]
+        var originalAnchor = try XCTUnwrap(originalPayload["anchor"] as? [String: Any])
+        originalAnchor["futureAnchorField"] = "keep this value"
+        originalPayload["anchor"] = originalAnchor
+        let extendedMetadata = try JSONSerialization.data(withJSONObject: originalPayload)
+        XCTAssertTrue(extendedNote.setValue(
+            try XCTUnwrap(String(data: extendedMetadata, encoding: .utf8)),
+            forAnnotationKey: Self.shuaThoughtMetadataKey
+        ))
+        let originalPosition = try markerPosition(in: extendedNote)
+        try write(source, to: url)
+
+        let model = openModel(at: url)
+        let marker = try XCTUnwrap(model.noteMarkers.first)
+        let modelPage = try XCTUnwrap(model.document?.page(at: 0))
+        let selection = try XCTUnwrap(model.noteSelection(at: marker.center, on: modelPage))
+        let target = CGPoint(x: marker.bounds.midX + 70, y: marker.bounds.midY + 45)
+        XCTAssertTrue(model.moveNoteMarker(selection, to: target))
+
+        let crop = modelPage.bounds(for: .cropBox)
+        let expectedPosition = Point(
+            x: Double((target.x - crop.minX) / crop.width),
+            y: Double((target.y - crop.minY) / crop.height)
+        )
+        let movedNotes = textAnnotations(on: modelPage)
+        XCTAssertEqual(movedNotes.count, 3)
+        for note in movedNotes {
+            let position = try markerPosition(in: note)
+            XCTAssertEqual(position.x, expectedPosition.x, accuracy: 0.000001)
+            XCTAssertEqual(position.y, expectedPosition.y, accuracy: 0.000001)
+        }
+
+        let movedExtendedNote = try XCTUnwrap(
+            movedNotes.first { $0.contents == extendedNote.contents }
+        )
+        let movedPayload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(
+                try XCTUnwrap(movedExtendedNote.value(forAnnotationKey: Self.shuaThoughtMetadataKey) as? String).utf8
+            )) as? [String: Any]
+        )
+        XCTAssertEqual(
+            (movedPayload["futureTopLevelField"] as? [String: Bool])?["preserve"],
+            true
+        )
+        XCTAssertEqual(
+            (movedPayload["anchor"] as? [String: Any])?["futureAnchorField"] as? String,
+            "keep this value"
+        )
+
+        XCTAssertTrue(model.undoMarkup())
+        let restoredMarker = try XCTUnwrap(model.noteMarkers.first)
+        XCTAssertEqual(restoredMarker.bounds.midX, marker.bounds.midX, accuracy: 0.001)
+        XCTAssertEqual(restoredMarker.bounds.midY, marker.bounds.midY, accuracy: 0.001)
+        for note in textAnnotations(on: modelPage) {
+            let position = try markerPosition(in: note)
+            XCTAssertEqual(position.x, originalPosition.x, accuracy: 0.000001)
+            XCTAssertEqual(position.y, originalPosition.y, accuracy: 0.000001)
+        }
+
+        XCTAssertTrue(model.redoMarkup())
+        let redoneMarker = try XCTUnwrap(model.noteMarkers.first)
+        XCTAssertEqual(redoneMarker.bounds.midX, target.x, accuracy: 0.001)
+        XCTAssertEqual(redoneMarker.bounds.midY, target.y, accuracy: 0.001)
+        XCTAssertEqual(model.save(), .saved)
+
+        let reopened = openModel(at: url)
+        let reopenedMarker = try XCTUnwrap(reopened.noteMarkers.first)
+        XCTAssertEqual(reopenedMarker.count, 3)
+        XCTAssertEqual(reopenedMarker.bounds.midX, target.x, accuracy: 0.001)
+        XCTAssertEqual(reopenedMarker.bounds.midY, target.y, accuracy: 0.001)
+        let reopenedPage = try XCTUnwrap(reopened.document?.page(at: 0))
+        for note in textAnnotations(on: reopenedPage) {
+            let position = try markerPosition(in: note)
+            XCTAssertEqual(position.x, expectedPosition.x, accuracy: 0.000001)
+            XCTAssertEqual(position.y, expectedPosition.y, accuracy: 0.000001)
+        }
+    }
+
+    func testMovingShuaGroupKeepsEveryNoteInsideCropBoxAtAllPageEdges() throws {
+        let url = try makeFixture(named: "shua-move-boundaries")
+        let source = try XCTUnwrap(PDFDocument(url: url))
+        let sourcePage = try XCTUnwrap(source.page(at: 0))
+        let anchorID = UUID()
+        for order in 0..<4 {
+            _ = try addShuaThought(
+                to: sourcePage,
+                anchorID: anchorID,
+                order: order,
+                x: 300,
+                y: CGFloat(650 - order * 23),
+                contents: "Boundary thought \(order)"
+            )
+        }
+        try write(source, to: url)
+
+        let model = openModel(at: url)
+        let marker = try XCTUnwrap(model.noteMarkers.first)
+        let page = try XCTUnwrap(model.document?.page(at: 0))
+        let selection = try XCTUnwrap(model.noteSelection(at: marker.center, on: page))
+        let crop = page.bounds(for: .cropBox)
+        let edgeTargets = [
+            CGPoint(x: crop.minX - 200, y: crop.minY - 200),
+            CGPoint(x: crop.maxX + 200, y: crop.minY - 200),
+            CGPoint(x: crop.minX - 200, y: crop.maxY + 200),
+            CGPoint(x: crop.maxX + 200, y: crop.maxY + 200),
+        ]
+
+        for target in edgeTargets {
+            XCTAssertTrue(model.moveNoteMarker(selection, to: target))
+            let currentMarker = try XCTUnwrap(model.noteMarkers.first)
+            XCTAssertTrue(crop.contains(currentMarker.bounds), "sticker remains inside the CropBox")
+            for note in textAnnotations(on: page) {
+                XCTAssertTrue(
+                    crop.insetBy(dx: -0.001, dy: -0.001).contains(note.bounds),
+                    "thought rectangle remains inside the CropBox: \(note.bounds)"
+                )
+            }
+        }
+
+        XCTAssertEqual(model.save(), .saved)
+        let reopened = openModel(at: url)
+        let reopenedPage = try XCTUnwrap(reopened.document?.page(at: 0))
+        let reopenedCrop = reopenedPage.bounds(for: .cropBox)
+        XCTAssertTrue(reopenedCrop.contains(try XCTUnwrap(reopened.noteMarkers.first).bounds))
+        for note in textAnnotations(on: reopenedPage) {
+            XCTAssertTrue(
+                reopenedCrop.insetBy(dx: -0.001, dy: -0.001).contains(note.bounds),
+                "saved thought rectangle remains inside the CropBox: \(note.bounds)"
+            )
+        }
     }
 
     func testShuaEmbeddedAnchorRetainsQuoteAndPageLevelContext() throws {

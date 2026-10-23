@@ -276,6 +276,13 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
     private var mouseDidDrag = false
     private var consumedMouseDown = false
     private var pendingNoteActivation: (NoteSelection, CGRect)?
+    private struct MarkerDragSession {
+        let marker: NoteMarker
+        let page: PDFPage
+        let startPagePoint: CGPoint
+        let startCenter: CGPoint
+    }
+    private var markerDragSession: MarkerDragSession?
     private var overlayViews: [ObjectIdentifier: MarkupSelectionOverlayView] = [:]
 
     override init(frame frameRect: NSRect) {
@@ -331,6 +338,23 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
             return
         }
 
+        if let marker = noteMarker(at: location),
+           let page = document?.page(at: marker.pageIndex) {
+            // The PDFView path is a fallback for page overlays whose input
+            // hit-testing does not follow PDFKit's rotation transform. Use
+            // PDFView's page conversion for both the initial point and drag.
+            consumedMouseDown = true
+            markerDragSession = MarkerDragSession(
+                marker: marker,
+                page: page,
+                startPagePoint: convert(location, to: page),
+                startCenter: CGPoint(x: marker.bounds.midX, y: marker.bounds.midY)
+            )
+            mouseDownPoint = location
+            mouseDidDrag = false
+            return
+        }
+
         if let page = page(for: location, nearest: false) {
             let pagePoint = convert(location, to: page)
             if let note = onNoteHit?(pagePoint, page), note.usesStickerPresentation {
@@ -347,11 +371,67 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if let session = markerDragSession {
+            let location = convert(event.locationInWindow, from: nil)
+            let pagePoint = convert(location, to: session.page)
+            let delta = CGPoint(
+                x: pagePoint.x - session.startPagePoint.x,
+                y: pagePoint.y - session.startPagePoint.y
+            )
+            if !mouseDidDrag, hypot(delta.x, delta.y) > 3 {
+                mouseDidDrag = true
+            }
+            guard mouseDidDrag else { return }
+            let center = CGPoint(
+                x: session.startCenter.x + delta.x,
+                y: session.startCenter.y + delta.y
+            )
+            overlayViews[ObjectIdentifier(session.page)]?.setExternalDragPreview(
+                session.marker,
+                center: center
+            )
+            return
+        }
+
         mouseDidDrag = true
         super.mouseDragged(with: event)
     }
 
     override func mouseUp(with event: NSEvent) {
+        if let session = markerDragSession {
+            let location = convert(event.locationInWindow, from: nil)
+            let pagePoint = convert(location, to: session.page)
+            let delta = CGPoint(
+                x: pagePoint.x - session.startPagePoint.x,
+                y: pagePoint.y - session.startPagePoint.y
+            )
+            if !mouseDidDrag, hypot(delta.x, delta.y) > 3 {
+                mouseDidDrag = true
+            }
+            let moved = mouseDidDrag
+            let destination = CGPoint(
+                x: session.startCenter.x + delta.x,
+                y: session.startCenter.y + delta.y
+            )
+            markerDragSession = nil
+            consumedMouseDown = false
+            mouseDownPoint = nil
+            mouseDidDrag = false
+            overlayViews[ObjectIdentifier(session.page)]?.setExternalDragPreview(nil, center: nil)
+
+            if let note = onNoteHit?(session.startCenter, session.page) {
+                if moved {
+                    onNoteMoved?(note, destination)
+                } else {
+                    onNoteActivated?(
+                        note,
+                        containerRect(forPageRect: note.bounds, on: session.page)
+                    )
+                }
+            }
+            return
+        }
+
         if consumedMouseDown {
             consumedMouseDown = false
             if let pendingNoteActivation {
@@ -445,6 +525,11 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
         overlay.pageIndex = pageIndex
         overlay.page = page
         overlay.pageBounds = page.bounds(for: .cropBox)
+        overlay.pagePointForOverlayPoint = { [weak self, weak overlay, weak page] point in
+            guard let self, let overlay, let page else { return .zero }
+            let pdfViewPoint = self.convert(point, from: overlay)
+            return self.convert(pdfViewPoint, to: page)
+        }
         overlay.selectedMarkup = selectedMarkup
         overlay.markers = noteMarkers.filter { $0.pageIndex == pageIndex }
         overlay.onMarkerActivated = { [weak self] marker in
@@ -494,6 +579,13 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
         CGPoint(x: marker.bounds.midX, y: marker.bounds.midY)
     }
 
+    private func noteMarker(at viewPoint: CGPoint) -> NoteMarker? {
+        noteMarkers.reversed().first { marker in
+            guard let page = document?.page(at: marker.pageIndex) else { return false }
+            return convert(marker.bounds, from: page).contains(viewPoint)
+        }
+    }
+
     func pdfView(
         _ pdfView: PDFView,
         willEndDisplayingOverlayView overlayView: NSView,
@@ -523,6 +615,7 @@ private final class MarkupSelectionOverlayView: NSView {
     var pageIndex = -1
     var page: PDFPage?
     var pageBounds: CGRect = .zero
+    var pagePointForOverlayPoint: ((CGPoint) -> CGPoint)?
     var selectedMarkup: MarkupSelection? {
         didSet { needsDisplay = true }
     }
@@ -546,10 +639,7 @@ private final class MarkupSelectionOverlayView: NSView {
     override var isOpaque: Bool { false }
 
     private func marker(at point: NSPoint) -> NoteMarker? {
-        let pagePoint = CGPoint(
-            x: point.x + pageBounds.minX,
-            y: point.y + pageBounds.minY
-        )
+        let pagePoint = self.pagePoint(for: point)
         return markers.reversed().first {
             displayedBounds(for: $0).contains(pagePoint)
                 || $0.sourceHitBounds.contains { $0.contains(pagePoint) }
@@ -575,22 +665,51 @@ private final class MarkupSelectionOverlayView: NSView {
     }
 
     private func pagePoint(for viewPoint: NSPoint) -> CGPoint {
-        CGPoint(
-            x: viewPoint.x + pageBounds.minX,
-            y: viewPoint.y + pageBounds.minY
-        )
+        pagePointForOverlayPoint?(CGPoint(x: viewPoint.x, y: viewPoint.y))
+            ?? CGPoint(
+                x: viewPoint.x + pageBounds.minX,
+                y: viewPoint.y + pageBounds.minY
+            )
+    }
+
+    func setExternalDragPreview(_ marker: NoteMarker?, center: CGPoint?) {
+        pressedMarker = marker
+        if let marker, let center {
+            previewCenter = clampedCenter(center, for: marker)
+            didDragMarker = true
+        } else {
+            previewCenter = nil
+            didDragMarker = false
+        }
+        needsDisplay = true
+        window?.invalidateCursorRects(for: self)
     }
 
     private func clampedCenter(_ center: CGPoint, for marker: NoteMarker) -> CGPoint {
-        let halfWidth = marker.bounds.width / 2 + 2
-        let halfHeight = marker.bounds.height / 2 + 2
-        let minX = pageBounds.minX + halfWidth
-        let maxX = pageBounds.maxX - halfWidth
-        let minY = pageBounds.minY + halfHeight
-        let maxY = pageBounds.maxY - halfHeight
+        let movingBounds = marker.sourceHitBounds.reduce(marker.bounds) { $0.union($1) }
+        guard movingBounds.width <= pageBounds.width,
+              movingBounds.height <= pageBounds.height
+        else { return CGPoint(x: marker.bounds.midX, y: marker.bounds.midY) }
+
+        let minimumDelta = CGPoint(
+            x: pageBounds.minX - movingBounds.minX,
+            y: pageBounds.minY - movingBounds.minY
+        )
+        let maximumDelta = CGPoint(
+            x: pageBounds.maxX - movingBounds.maxX,
+            y: pageBounds.maxY - movingBounds.maxY
+        )
+        guard minimumDelta.x <= maximumDelta.x,
+              minimumDelta.y <= maximumDelta.y
+        else { return CGPoint(x: marker.bounds.midX, y: marker.bounds.midY) }
+
+        let requestedDelta = CGPoint(
+            x: center.x - marker.bounds.midX,
+            y: center.y - marker.bounds.midY
+        )
         return CGPoint(
-            x: minX <= maxX ? min(max(center.x, minX), maxX) : pageBounds.midX,
-            y: minY <= maxY ? min(max(center.y, minY), maxY) : pageBounds.midY
+            x: marker.bounds.midX + min(max(requestedDelta.x, minimumDelta.x), maximumDelta.x),
+            y: marker.bounds.midY + min(max(requestedDelta.y, minimumDelta.y), maximumDelta.y)
         )
     }
 
@@ -598,7 +717,9 @@ private final class MarkupSelectionOverlayView: NSView {
     /// sticker and a drag can move it. Everywhere else the overlay is
     /// transparent to hit testing, so text selection, links and scrolling work.
     override func hitTest(_ point: NSPoint) -> NSView? {
-        marker(at: point) == nil ? nil : self
+        guard let superview else { return nil }
+        let localPoint = convert(point, from: superview)
+        return marker(at: localPoint) == nil ? nil : self
     }
 
     override func resetCursorRects() {
