@@ -49,9 +49,40 @@ struct NoteComposerView: View {
         status.isReady && !trimmedText.isEmpty && !permissions.isReadOnly
     }
 
+    private var additionalGroupNotes: [String] {
+        guard case let .edit(note) = session.mode, note.groupCount > 1 else { return [] }
+        return Array(note.threadContents.dropFirst())
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
+
+            if !additionalGroupNotes.isEmpty {
+                DisclosureGroup("Other notes in this group (\(additionalGroupNotes.count))") {
+                    ScrollView(.vertical) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(additionalGroupNotes.indices, id: \.self) { index in
+                                HStack(alignment: .top, spacing: 8) {
+                                    Text("\(index + 2)")
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 18, alignment: .trailing)
+                                    Text(additionalGroupNotes[index].isEmpty
+                                        ? "Empty note"
+                                        : additionalGroupNotes[index])
+                                        .font(.system(size: 13))
+                                        .textSelection(.enabled)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                            }
+                        }
+                        .padding(.top, 5)
+                    }
+                    .frame(maxHeight: 220)
+                }
+                .font(.caption)
+            }
 
             if !status.isReady {
                 detachedNotice

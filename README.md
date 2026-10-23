@@ -15,7 +15,7 @@ implemented yet.
 | --- | --- |
 | macOS app (SwiftUI + AppKit + PDFKit) | Reader with editable Highlight/Underline and standard `/Text` notes |
 | Unit tests | 267 logic and PDFKit tests |
-| Annotations | Standard `/Highlight`, `/Underline` and `/Text`: selection, colours, recolour, delete, convert, notes, 20 sticker motifs, six paper tints, Undo/Redo |
+| Annotations | Standard `/Highlight`, `/Underline` and `/Text`: selection, colours, recolour, delete, convert, notes, 20 sticker motifs, six paper tints, ShuaMac thought-group import, Undo/Redo |
 | Windows (WinUI 3 + PDFium) | Feasibility work, not in this repository yet |
 | AI / agent integration | Not started |
 
