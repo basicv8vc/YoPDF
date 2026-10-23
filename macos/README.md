@@ -88,7 +88,7 @@ macos/
 │   ├── ReaderViewSync.swift    # pure page/zoom decisions used by the bridge
 │   └── SecurityScopeAccess.swift
 ├── YoPDF/
-│   ├── Resources/Assets.xcassets # 20 sticker imagesets + catalog metadata
+│   ├── Resources/Assets.xcassets # AppIcon + 20 sticker imagesets + metadata
 │   ├── App/YoPDFApp.swift      # @main, one model per window
 │   ├── App/AppDelegate.swift   # quitting with unsaved edits
 │   ├── App/QuitSession.swift   # the app-wide quit attempt
