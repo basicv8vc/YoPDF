@@ -85,7 +85,9 @@ extension PDFDocumentModel {
         // so a grouped sticker opens its representative note at the shared hit
         // target instead of the last stacked `/Text` icon.
         if let marker = noteMarkers.reversed().first(where: {
-            $0.pageIndex == pageIndex && $0.bounds.contains(point)
+            $0.pageIndex == pageIndex
+                && ($0.bounds.insetBy(dx: -3, dy: -3).contains(point)
+                    || $0.sourceHitBounds.contains { $0.contains(point) })
         }) {
             return NoteService.selection(
                 for: marker.annotation,

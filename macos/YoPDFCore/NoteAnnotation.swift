@@ -90,6 +90,7 @@ struct NoteStyleSnapshot {
     var identity: String?
     var paper: String?
     var style: String?
+    var shuaStyle: String?
     var color: NSColor
 }
 
@@ -114,6 +115,9 @@ public struct NoteMarker: Identifiable, Equatable {
     public let showsCountBadge: Bool
     /// Bodies in group order, so the thread remains readable without ShuaMac's sidecar.
     public let threadContents: [String]
+    /// Original ShuaMac icon rectangles, including portions hidden by the
+    /// grouped sticker overlay. These remain valid hit targets for the group.
+    public let sourceHitBounds: [CGRect]
 
     public var paperColor: NotePaperColor { style.palette }
 
@@ -128,7 +132,8 @@ public struct NoteMarker: Identifiable, Equatable {
         style: NoteStickerStyle,
         count: Int = 1,
         showsCountBadge: Bool = false,
-        threadContents: [String] = []
+        threadContents: [String] = [],
+        sourceHitBounds: [CGRect] = []
     ) {
         self.id = ObjectIdentifier(annotation)
         self.pageIndex = pageIndex
@@ -139,6 +144,7 @@ public struct NoteMarker: Identifiable, Equatable {
         self.count = count
         self.showsCountBadge = showsCountBadge
         self.threadContents = threadContents
+        self.sourceHitBounds = sourceHitBounds
         self.annotation = annotation
     }
 
@@ -152,6 +158,7 @@ public struct NoteMarker: Identifiable, Equatable {
             && lhs.count == rhs.count
             && lhs.showsCountBadge == rhs.showsCountBadge
             && lhs.threadContents == rhs.threadContents
+            && lhs.sourceHitBounds == rhs.sourceHitBounds
     }
 }
 
@@ -438,6 +445,7 @@ public enum NoteService {
             identity: annotation.value(forAnnotationKey: identityKey) as? String,
             paper: annotation.value(forAnnotationKey: paperColorKey) as? String,
             style: annotation.value(forAnnotationKey: styleKey) as? String,
+            shuaStyle: annotation.value(forAnnotationKey: shuaStickerStyleKey) as? String,
             color: annotation.color
         )
     }
@@ -451,6 +459,13 @@ public enum NoteService {
         snapshot.identity = identityValue
         snapshot.paper = style.palette.rawValue
         snapshot.style = style.serialized
+        if isShuaThought(annotation),
+           let data = try? JSONEncoder().encode(style),
+           let shuaStyle = String(data: data, encoding: .utf8) {
+            // ShuaMac decodes this unversioned Codable shape to render imported
+            // thoughts. Keep it in sync when YoPDF explicitly restyles one.
+            snapshot.shuaStyle = shuaStyle
+        }
         snapshot.color = style.palette.color
         return snapshot
     }
@@ -463,6 +478,7 @@ public enum NoteService {
         setRawValue(snapshot.identity, forAnnotationKey: identityKey, on: annotation)
         setRawValue(snapshot.paper, forAnnotationKey: paperColorKey, on: annotation)
         setRawValue(snapshot.style, forAnnotationKey: styleKey, on: annotation)
+        setRawValue(snapshot.shuaStyle, forAnnotationKey: shuaStickerStyleKey, on: annotation)
         annotation.color = snapshot.color
         annotation.modificationDate = Date()
     }
@@ -533,6 +549,12 @@ public enum NoteService {
     public static func style(of annotation: PDFAnnotation) -> NoteStickerStyle {
         let legacyPaper = paperColor(of: annotation)
         if isShuaThought(annotation) {
+            // An explicit YoPDF edit is authoritative for this annotation.
+            // ShuaStickerStyle remains synchronized for ShuaMac's reader.
+            if let raw = annotation.value(forAnnotationKey: styleKey) as? String,
+               let style = NoteStickerStyle(serialized: raw, paletteFallback: legacyPaper) {
+                return style
+            }
             guard let raw = annotation.value(forAnnotationKey: shuaStickerStyleKey) as? String,
                   var style = NoteStickerStyle(serialized: raw, paletteFallback: legacyPaper)
             else { return .newNote }
@@ -767,7 +789,8 @@ public enum NoteService {
                         .intersection(page.bounds(for: .cropBox)),
                     style: style(of: annotation),
                     showsCountBadge: true,
-                    threadContents: [annotation.contents ?? ""]
+                    threadContents: [annotation.contents ?? ""],
+                    sourceHitBounds: [annotation.bounds]
                 ))
             }
 
@@ -814,7 +837,8 @@ public enum NoteService {
                     style: style(of: first),
                     count: notes.count,
                     showsCountBadge: true,
-                    threadContents: notes.map { $0.contents ?? "" }
+                    threadContents: notes.map { $0.contents ?? "" },
+                    sourceHitBounds: notes.map(\.bounds)
                 ))
             }
         }

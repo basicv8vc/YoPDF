@@ -60,23 +60,26 @@ struct NoteComposerView: View {
 
             if !additionalGroupNotes.isEmpty {
                 DisclosureGroup("Other notes in this group (\(additionalGroupNotes.count))") {
-                    VStack(alignment: .leading, spacing: 8) {
-                        ForEach(additionalGroupNotes.indices, id: \.self) { index in
-                            HStack(alignment: .top, spacing: 8) {
-                                Text("\(index + 2)")
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundStyle(.secondary)
-                                    .frame(width: 18, alignment: .trailing)
-                                Text(additionalGroupNotes[index].isEmpty
-                                    ? "Empty note"
-                                    : additionalGroupNotes[index])
-                                    .font(.system(size: 13))
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
+                    ScrollView(.vertical) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(additionalGroupNotes.indices, id: \.self) { index in
+                                HStack(alignment: .top, spacing: 8) {
+                                    Text("\(index + 2)")
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 18, alignment: .trailing)
+                                    Text(additionalGroupNotes[index].isEmpty
+                                        ? "Empty note"
+                                        : additionalGroupNotes[index])
+                                        .font(.system(size: 13))
+                                        .textSelection(.enabled)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
                             }
                         }
+                        .padding(.top, 5)
                     }
-                    .padding(.top, 5)
+                    .frame(maxHeight: 220)
                 }
                 .font(.caption)
             }

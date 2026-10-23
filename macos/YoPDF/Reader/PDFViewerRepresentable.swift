@@ -560,8 +560,9 @@ private final class MarkupSelectionOverlayView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
+        drawNoteMarkerMasks()
         drawSelectedMarkup()
-        drawNoteMarkers()
+        drawNoteStickerArtwork()
     }
 
     private func drawSelectedMarkup() {
@@ -593,7 +594,7 @@ private final class MarkupSelectionOverlayView: NSView {
     /// rect, exactly like ShuaMac's page overlay, so the transparent parts of a
     /// sticker cannot reveal a second icon. There is deliberately no card,
     /// stacked border or palette fill here.
-    private func drawNoteMarkers() {
+    private func drawNoteMarkerMasks() {
         guard let page else { return }
         let pageMarkers = markers.filter { $0.pageIndex == pageIndex }
 
@@ -618,7 +619,12 @@ private final class MarkupSelectionOverlayView: NSView {
             )
             drawPageBackground(in: maskRect, page: page)
         }
+    }
 
+    /// Draw the sticker artwork after selection so the masks cannot erase the
+    /// selected-text outline and the sticker remains the topmost page overlay.
+    private func drawNoteStickerArtwork() {
+        let pageMarkers = markers.filter { $0.pageIndex == pageIndex }
         for marker in pageMarkers {
             let rect = marker.bounds.offsetBy(dx: -pageBounds.minX, dy: -pageBounds.minY)
             guard rect.width > 1, rect.height > 1 else { continue }
