@@ -65,8 +65,11 @@ reproducible and easy to inspect.
 
 The macOS app links Sparkle 2.10.0. It checks the configured signed appcast on
 Sparkle's normal schedule and adds **Check for Updates…** to the YoPDF menu.
-Sparkle shows its standard update dialog and downloads an update after the user
-chooses to install it. Both `SUAutomaticallyUpdate` and
+Scheduled update alerts are represented by a small native titlebar indicator
+in each open PDF window; clicking it opens Sparkle's standard update dialog.
+Dismiss keeps the reminder available, while installing or skipping clears it.
+Sparkle downloads an update only after the user chooses to install it. Both
+`SUAutomaticallyUpdate` and
 `SUAllowsAutomaticUpdates` are false, so Sparkle cannot install an update
 automatically.
 

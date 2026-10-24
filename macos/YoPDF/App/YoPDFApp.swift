@@ -5,11 +5,11 @@ import YoPDFCore
 struct YoPDFApp: App {
 
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var updateController = SparkleUpdateController()
+    @StateObject private var updateController = SparkleUpdateController.shared
 
     var body: some Scene {
         WindowGroup {
-            ReaderWindow()
+            ReaderWindow(updateController: updateController)
         }
         .defaultSize(width: 1100, height: 820)
         .commands {
@@ -31,9 +31,10 @@ struct YoPDFApp: App {
 /// level would call `open` directly and race the prompt.
 private struct ReaderWindow: View {
 
+    @ObservedObject var updateController: SparkleUpdateController
     @StateObject private var model = PDFDocumentModel()
 
     var body: some View {
-        PDFReaderView(model: model)
+        PDFReaderView(model: model, updateController: updateController)
     }
 }
