@@ -1,7 +1,12 @@
-# YoPDF
+<h1 align="center">
+  <img src="macos/YoPDF/Resources/Assets.xcassets/AppIcon.appiconset/YoPDF_512.png" alt="" width="72" height="72"><br>
+  <small><small>YoPDF</small></small>
+</h1>
 
-A free, open-source, local-first PDF reader and annotator for macOS and Windows,
-built natively for each platform. **Your PDF. Your way.**
+<p align="center">
+  A free, open-source, local-first PDF reader and annotator for macOS and Windows,<br>
+  built natively for each platform. <strong>Your PDF. Your way.</strong>
+</p>
 
 YoPDF is in early development. The repository currently contains the macOS
 reader: opening a local PDF, continuous scrolling, page navigation, zoom, and
