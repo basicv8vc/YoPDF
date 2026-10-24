@@ -61,6 +61,28 @@ XcodeGen installed.
 Build products stay under `macos/build/` (git-ignored) so builds are
 reproducible and easy to inspect.
 
+## Sparkle updates
+
+The macOS app links Sparkle 2.10.0. It checks the configured signed appcast on
+Sparkle's normal schedule and adds **Check for Updates…** to the YoPDF menu.
+Sparkle shows its standard update dialog and downloads an update after the user
+chooses to install it. Both `SUAutomaticallyUpdate` and
+`SUAllowsAutomaticUpdates` are false, so Sparkle cannot install an update
+automatically.
+
+An updater starts only when the app is built with both `SPARKLE_FEED_URL` (an
+HTTPS appcast URL) and `SPARKLE_PUBLIC_ED_KEY` (the Base64 EdDSA public key).
+The build script forwards these optional environment variables to Xcode; when
+they are missing or invalid, update checks stay disabled. Set the real values
+in the release environment before running
+`CONFIGURATION=Release ./scripts/build.sh`. The feed and update archives must
+be signed with the matching private key. Keep that key in a secure developer
+key store; never add it to the repository or pass it to the build.
+
+YoPDF currently has no production appcast or Sparkle key configured. Its
+existing ad-hoc signing setup is for local development; public distribution
+still needs Developer ID signing and notarization.
+
 `test.sh` builds with `xcodebuild build-for-testing` and then runs the bundle
 with Apple's `xctest` CLI. On Xcode 26.3 / macOS 26.5.1 the `xcodebuild test`
 action intermittently fails to instantiate a freshly built test bundle
