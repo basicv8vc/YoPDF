@@ -142,6 +142,64 @@ enum PDFFixtureFactory {
         return url
     }
 
+    /// Writes a valid, image-heavy PDF to exercise PDFKit autosave at scale.
+    /// Random pixels keep the embedded image stream large after compression.
+    static func writeTemporaryImagePDF(
+        pixelDimension: Int,
+        named name: String = "large-image"
+    ) throws -> URL {
+        precondition(pixelDimension > 0)
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("YoPDFTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("\(name).pdf")
+
+        let bytesPerRow = pixelDimension * 4
+        let pixelData = NSMutableData(length: bytesPerRow * pixelDimension)!
+        let rawPixels = pixelData.mutableBytes.bindMemory(to: UInt8.self, capacity: bytesPerRow * pixelDimension)
+        var randomState: UInt32 = 0x12A5_BC31
+        for offset in stride(from: 0, to: bytesPerRow * pixelDimension, by: 4) {
+            randomState ^= randomState << 13
+            randomState ^= randomState >> 17
+            randomState ^= randomState << 5
+            rawPixels[offset] = UInt8(truncatingIfNeeded: randomState)
+            rawPixels[offset + 1] = UInt8(truncatingIfNeeded: randomState >> 8)
+            rawPixels[offset + 2] = UInt8(truncatingIfNeeded: randomState >> 16)
+            rawPixels[offset + 3] = 0xFF
+        }
+
+        guard let provider = CGDataProvider(data: pixelData as CFData),
+              let image = CGImage(
+                width: pixelDimension,
+                height: pixelDimension,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: bytesPerRow,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo(
+                    rawValue: CGImageAlphaInfo.noneSkipLast.rawValue
+                        | CGBitmapInfo.byteOrder32Big.rawValue
+                ),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+              ) else {
+            throw Failure.cannotCreateDocument
+        }
+
+        var mediaBox = CGRect(x: 0, y: 0, width: 612, height: 792)
+        guard let context = CGContext(url as CFURL, mediaBox: &mediaBox, nil) else {
+            throw Failure.cannotCreateContext
+        }
+        context.beginPDFPage(nil)
+        context.draw(image, in: mediaBox)
+        context.endPDFPage()
+        context.closePDF()
+        return url
+    }
+
     /// Writes arbitrary bytes with a `.pdf` extension, for corruption tests.
     static func writeTemporaryFile(named name: String, contents: Data) throws -> URL {
         let directory = FileManager.default.temporaryDirectory

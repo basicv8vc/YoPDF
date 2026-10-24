@@ -52,6 +52,12 @@ public final class PDFDocumentModel: ObservableObject {
     /// switching documents or quitting cannot silently drop them; it is not a
     /// general document-modification flag yet.
     @Published public private(set) var hasUnsavedChanges: Bool = false
+    /// State of the most recent automatic save for the current document.
+    @Published public internal(set) var autoSaveStatus: AutoSaveStatus = .idle
+    /// Bumped when an automatic save needs to be surfaced to the reader UI.
+    @Published public internal(set) var autoSaveFailureRevision = 0
+    /// The most recent automatic-save result, when one has completed.
+    public internal(set) var lastAutoSaveOutcome: SaveOutcome?
     /// Monotonic revision of the in-memory edits.
     ///
     /// Bumped whenever edits are made, saved, discarded, or replaced by another
@@ -112,6 +118,27 @@ public final class PDFDocumentModel: ObservableObject {
     var markupUndoStack: [MarkupEdit] = []
     var markupRedoStack: [MarkupEdit] = []
 
+    /// A single cancellable debounce task covers every annotation mutation.
+    var autoSaveTask: Task<Void, Never>?
+    var autoSaveGeneration = 0
+    /// The current snapshot writer, which may outlive its debounce task after a
+    /// later edit reschedules the next automatic checkpoint.
+    var autoSaveWorkTask: Task<SaveOutcome, Never>?
+    var autoSaveWorkGeneration: Int?
+    var autoSaveWorkCompletion: AutoSaveWorkCompletion?
+    /// Nested modal workflows can pause a pending debounce and resume it once
+    /// the panel is dismissed. In-flight writes are allowed to finish.
+    var autoSavePauseDepth = 0
+    var autoSaveShouldResumeAfterPause = false
+    /// The production delay is 750 ms. Tests shorten it to cover debounce
+    /// scheduling without paying the user-facing interval for each scenario.
+    var autoSaveDebounceNanoseconds: UInt64 = 750_000_000
+    /// Injectable so the test suite can hold snapshot serialization while
+    /// checking that the main actor remains responsive.
+    var autoSaveSerializer: @Sendable (PDFDocumentSaveSnapshot) -> Data? = {
+        PDFDocumentSaveSerializer.dataRepresentationPreservingShuaGroups(in: $0.document)
+    }
+
     /// The open file session, or nil when nothing is loaded. Exposed so later
     /// phases can save through the same session that owns the access.
     public private(set) var documentSession: DocumentSession?
@@ -168,12 +195,22 @@ public final class PDFDocumentModel: ObservableObject {
             return false
         }
 
+        let reopeningCurrentFile = fileURL?.standardizedFileURL == url.standardizedFileURL
+        if reopeningCurrentFile {
+            pauseAutoSave()
+        }
+        defer {
+            if reopeningCurrentFile {
+                resumeAutoSave()
+            }
+        }
+
         // Phase 1: acquire access and record the initial version. The store
         // acquires the scope before touching the file: a security-scoped URL
         // must be opened before any access, including an existence check,
         // because in a sandboxed build `fileExists` on an unopened URL can
         // fail even when the file is there.
-        let candidate: DocumentSession
+        var candidate: DocumentSession
         do {
             candidate = try store.open(url)
         } catch let error as DocumentStoreError {
@@ -185,7 +222,7 @@ public final class PDFDocumentModel: ObservableObject {
         }
 
         // Phase 2: validate while the candidate access is still active.
-        guard let opened = PDFDocument(url: url) else {
+        guard var opened = PDFDocument(url: url) else {
             candidate.close()
             lastError = .unreadable
             return false
@@ -196,7 +233,43 @@ public final class PDFDocumentModel: ObservableObject {
             return false
         }
 
-        // Phase 3: commit. Swap first, then release the previous scope, so the
+        // Phase 3: commit. Stop a pending checkpoint before discarding the
+        // previous document, then release its scope only after any already
+        // running file operation has ended.
+        cancelPendingAutoSave(cancelInFlightWork: discardingUnsavedChanges)
+        let automaticWriteWasStarted = autoSaveWorkCompletion?.didStartWrite ?? false
+        waitForAutoSaveWork()
+
+        // If the old worker committed while the candidate was being loaded,
+        // that candidate and its session captured the previous file version.
+        // Reopen both after the worker has stopped so the installed document
+        // and session always describe the same bytes.
+        if reopeningCurrentFile, automaticWriteWasStarted {
+            candidate.close()
+            do {
+                candidate = try store.open(url)
+            } catch let error as DocumentStoreError {
+                lastError = Self.loadError(from: error)
+                return false
+            } catch {
+                lastError = .unreadable
+                return false
+            }
+
+            guard let refreshed = PDFDocument(url: url) else {
+                candidate.close()
+                lastError = .unreadable
+                return false
+            }
+            guard refreshed.pageCount > 0 else {
+                candidate.close()
+                lastError = .emptyDocument
+                return false
+            }
+            opened = refreshed
+        }
+
+        // Swap first, then release the previous scope, so the
         // model is never left without access to the document it displays.
         let previous = documentSession
         documentSession = candidate
@@ -207,6 +280,10 @@ public final class PDFDocumentModel: ObservableObject {
     }
 
     public func close() {
+        cancelPendingAutoSave(cancelInFlightWork: true)
+        waitForAutoSaveWork()
+        autoSavePauseDepth = 0
+        autoSaveShouldResumeAfterPause = false
         documentSession?.close()
         documentSession = nil
         document = nil
@@ -219,6 +296,8 @@ public final class PDFDocumentModel: ObservableObject {
         isAutoScaling = true
         lastError = nil
         hasUnsavedChanges = false
+        autoSaveStatus = .idle
+        lastAutoSaveOutcome = nil
         editRevision &+= 1
         currentSelection = nil
         resetMarkupState()
@@ -231,6 +310,7 @@ public final class PDFDocumentModel: ObservableObject {
     }
 
     private func apply(document: PDFDocument, fileURL: URL?) {
+        cancelPendingAutoSave()
         self.document = document
         self.fileURL = fileURL
         pageCount = document.pageCount
@@ -240,6 +320,8 @@ public final class PDFDocumentModel: ObservableObject {
         isAutoScaling = true
         lastError = nil
         hasUnsavedChanges = false
+        autoSaveStatus = .idle
+        lastAutoSaveOutcome = nil
         editRevision &+= 1
         currentSelection = nil
         resetMarkupState()
@@ -313,23 +395,30 @@ public final class PDFDocumentModel: ObservableObject {
     func markEdited() {
         hasUnsavedChanges = true
         editRevision &+= 1
+        scheduleAutoSave()
     }
 
-    func markSaved() {
+    func markSaved(preservingMarkupHistory: Bool = false) {
+        cancelPendingAutoSave()
         hasUnsavedChanges = false
+        autoSaveStatus = .idle
+        lastAutoSaveOutcome = nil
         editRevision &+= 1
-        // A successful write is the one point where the old undo history stops
-        // describing the file. Failed and conflicting saves never call this, so
-        // their history stays available for a retry.
-        resetMarkupState()
+        // Manual saves replace the PDFDocument below and therefore clear its
+        // annotation-object history. Automatic saves keep the live document,
+        // so the same entries can still undo and redo edits after persistence.
+        if !preservingMarkupHistory {
+            resetMarkupState()
+        }
     }
 
     /// Clears every reference to the annotations of the document being replaced.
     ///
     /// The undo entries hold `PDFAnnotation` objects, and an annotation belongs
     /// to the `PDFDocument` that created it. Keeping them after an open, close,
-    /// save reload or Save As would leave a menu action able to mutate an old
-    /// in-memory document that is no longer on screen.
+    /// manual save reload or Save As would leave a menu action able to mutate
+    /// an old in-memory document that is no longer on screen. Auto-save retains
+    /// the live document and can safely preserve the history.
     func resetMarkupState() {
         markupUndoStack.removeAll()
         markupRedoStack.removeAll()

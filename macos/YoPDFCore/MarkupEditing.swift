@@ -5,9 +5,10 @@ import PDFKit
 ///
 /// The record stores page indices instead of `PDFPage` references so a history
 /// entry can be validated against whatever document is currently loaded. It is
-/// still cleared whenever the document is replaced: an annotation object belongs
-/// to the `PDFDocument` that created it, and replaying an edit after a save
-/// would otherwise mutate an old in-memory document.
+/// cleared whenever the document is replaced: an annotation object belongs to
+/// the `PDFDocument` that created it, and replaying an edit after a document
+/// reload would otherwise mutate an old in-memory document. Auto-save keeps the
+/// live document loaded, so it can retain this history.
 enum MarkupEditChange {
     case insert(annotation: PDFAnnotation, pageIndex: Int)
     case remove(annotation: PDFAnnotation, pageIndex: Int)

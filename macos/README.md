@@ -9,9 +9,9 @@ tracking, external-change detection, and safe in-place saving.
 
 P2a adds the first editing feature on top of it: select text, add a yellow
 highlight, save, reopen. A highlight is a standard PDF `/Highlight` annotation
-with `/QuadPoints`, so other readers see it as their own. Editing introduces a
-minimal dirty state and a manual Save; there is no autosave or annotation sidebar
-yet.
+with `/QuadPoints`, so other readers see it as their own. Editing introduced a
+minimal dirty state and a manual Save; committed annotation edits now auto-save
+after a short quiet period. There is no annotation sidebar yet.
 
 P2b extends that to editable **Highlight** and **Underline** annotations:
 six presets plus a custom `ColorPicker`, click selection, recolouring, deletion,
@@ -21,7 +21,9 @@ P2c adds **notes**: a compact SwiftUI composer writes a standard PDF `/Text`
 annotation, either about the selected text or at a point the user clicks on the
 page. Six paper tints, a marker drawn over the page, editing, deletion and
 Undo/Redo all go through the same model pipeline as Highlight and Underline.
-There is still no autosave and no annotation sidebar.
+Committed annotation edits auto-save after a short quiet period; a note draft
+remains in the composer until the user saves it into the PDF. There is no
+annotation sidebar.
 
 P2d adds the first **sticker** stage: the 20 original ShuaMac illustrations are
 packaged in an Asset Catalog, and a note's motif, paper palette, template title
@@ -50,7 +52,7 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (267)
+./scripts/test.sh                     # unit tests (306)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
@@ -110,6 +112,7 @@ macos/
 │   ├── NoteEditing.swift       # model-owned add/edit/delete notes
 │   ├── PDFDocumentModel.swift
 │   ├── PDFDocumentModel+Editing.swift # dirty state, save, Save As, re-sync
+│   ├── PDFDocumentSaveSerializer.swift # isolated PDF snapshot serialization
 │   ├── QuitCoordinator.swift   # quit-attempt decisions, no AppKit
 │   ├── ReaderViewSync.swift    # pure page/zoom decisions used by the bridge
 │   └── SecurityScopeAccess.swift
@@ -138,6 +141,7 @@ macos/
 │   ├── DocumentStoreFailureTests.swift  # injected staging/commit failures
 │   ├── DocumentStoreRecoveryTests.swift # partial commits, post-commit failures
 │   ├── DocumentStoreSaveAsSafetyTests.swift # Save As target races and aliases
+│   ├── AutoSaveTests.swift               # debounce, undo, failures and responsiveness
 │   ├── DocumentStoreLifecycleTests.swift    # close vs. in-flight operations
 │   ├── DocumentStoreScaleTests.swift    # 200 MB streaming and save
 │   ├── DocumentStoreModelIntegrationTests.swift
@@ -217,10 +221,23 @@ A highlight is built from the `PDFView` selection in `HighlightService`:
   default and a configurable palette; the geometry and saving rules below are
   unchanged.
 
-Editing is manual-save only:
+Committed annotation edits are automatically saved after 750 milliseconds
+without another edit. The pending interval is reset while a change is still in
+progress, so a marker drag or colour-picker gesture is written as one update.
+Note composer text is a draft and is not written until the user commits the
+note. ⌘S and the Save button remain available for an immediate save.
 
-- Adding a highlight marks the document edited. Nothing is written until the user
-  saves, and there is no autosave.
+- Adding or editing a highlight, underline or note marks the document edited and
+  schedules an automatic save through the open `DocumentSession`.
+- Automatic saving copies the live `PDFDocument` on the main actor, then uses a
+  private snapshot on a utility worker for Shua metadata preservation, PDF
+  serialization, the coordinated `DocumentSession` write and reopen check. The
+  displayed document and its annotation objects stay in place for Undo and Redo.
+- The Save As panel pauses a pending 750 ms debounce. Cancelling the panel
+  resumes automatic saving; choosing a destination cancels that checkpoint and
+  writes the current edits to the copy, leaving the source unchanged. If an
+  automatic save has already entered `DocumentSession.save`, it completes first;
+  Save As then writes the same edits to the destination.
 - `PDFDocumentModel.save()` serialises the document with PDFKit and hands the
   bytes to `DocumentSession.save`. It never calls `PDFDocument.write(to:)` on the
   original path: that would bypass the version check that makes a save safe.
@@ -233,12 +250,12 @@ Editing is manual-save only:
   session can confirm the bytes it wrote, the save is a normal success; if it
   cannot, the edits stay marked unsaved and the user is told the result is
   unconfirmed.
-- After a successful write the document is re-opened from the file. The
+- After a successful manual write the document is re-opened from the file. The
   replacement gives the file a new inode, so the `PDFDocument` that was
   memory-mapping the old one no longer describes the file the session owns.
-  Re-opening is also the only end-to-end check that what was written is readable.
-  The page index, the zoom and the `PDFView` instance are preserved, so saving
-  does not jump back to page one.
+  Automatic saves also reopen the file to verify it is readable, but keep the
+  live document so Undo and Redo still target the displayed annotations. A
+  manual save preserves the page index, zoom and `PDFView` instance.
 - Closing the window, opening another document and quitting all check for unsaved
   edits first and offer Save / Don't Save / Cancel. Opening another document is
   also refused by the model itself (`LoadError.unsavedChanges`), so no caller can
@@ -302,13 +319,11 @@ annotation per page.
 - **Undo/Redo is model-owned.** A cross-page add, delete or conversion is one
   history entry, and rapid recolours from the colour picker coalesce into one
   gesture. Every accepted edit bumps `hasUnsavedChanges` and `editRevision`;
-  Undo and Redo count as edits too. A successful save or Save As reload clears
-  the history and the selected annotation, because the `PDFDocument` and its
-  annotation objects have been replaced. Failed, conflicting and
-  uncertain-replacement saves leave the history and the selection in place. A
-  committed write clears them even when the reload could not be verified: the
-  bytes are on disk, so the old in-memory document is no longer the source of
-  truth.
+  Undo and Redo count as edits too. Automatic saves keep the live
+  `PDFDocument`, selected annotation and history, so ⌘Z remains available after
+  each saved checkpoint. A manual save or Save As reload replaces the document
+  and clears that history. Failed, conflicting and uncertain-replacement saves
+  leave the history and selection in place.
 - **Permissions are checked at mutation time — including Undo/Redo.** `/F`
   ReadOnly (bit 7) and Locked (bit 8) annotations can be selected and
   inspected, but recolouring, deleting and converting them are refused. A
@@ -394,9 +409,9 @@ database — the saved PDF is the whole document.
   being silently replaced with an empty one.
 - **Notes share the markup edit pipeline.** `addNote`, `updateNote` and
   `deleteNote` build one `MarkupEdit`, so a body change and a paper change in
-  one Save are a single Undo entry, and a successful save clears the history
-  exactly as it does for highlights. A save reloads the document and rebuilds
-  the markers from the file.
+  one editing gesture are a single Undo entry, and automatic saves preserve
+  that history exactly as they do for highlights. Manual save reloads the
+  document and rebuilds the markers from the file.
 - **Permissions are re-read at execution time.** ReadOnly and Locked refuse
   body, colour and deletion; LockedContents refuses only `/Contents`, so the
   tint can still change and the note can still be deleted. The edit pipeline
@@ -600,9 +615,11 @@ System Events / Preview and `qlmanage -t` are all blocked here):
    follows, one Undo returns the original colour, and the saved PDF reopens with
    the final colour.
 10. Convert a highlight to an underline, undo, redo, delete and undo: the
-    contents and flags set by another app survive, and saving is still a normal
-    manual Save. After a successful save, Undo is disabled because the document
-    was reloaded from disk.
+    contents and flags set by another app survive, and the edit is saved through
+    the normal `DocumentSession` path. After the automatic save, Undo remains
+    available and reverses the last edit; the reverted state is saved as the
+    next automatic checkpoint. A manual save reloads the document and clears
+    Undo history.
 11. Simulate a save conflict (change the file from another app) after recolouring:
     the save is refused, the annotation and the Undo history stay in the window,
     and Save As remains available.
@@ -693,15 +710,16 @@ separate task; see `internal/` notes (not published).
 
 P0 excluded annotations, search, recent documents, tabs, agent integration,
 accounts, sync and PDF editing. P1 added file access and safe persistence. P2a
-adds yellow highlights with a manual save. P2b makes Highlight and Underline
+added yellow highlights with a manual save; committed annotation changes now
+auto-save. P2b makes Highlight and Underline
 editable: selection, six presets plus custom colours, recolour, delete, convert
 and Undo/Redo. P2c adds standard `/Text` notes with a compact composer, six paper
 tints, page markers, editing, deletion and Undo/Redo. P2d adds 20 original
 sticker motifs, a persistent versioned style (v2 with template title and symbol),
 a CropBox-relative marker anchor, twelve built-in templates with a personal
-template library, and ShuaMac's compact composer. There is still no autosave,
-document library, annotation sidebar, StrikeOut support, note threads or agent
-integration.
+template library, and ShuaMac's compact composer. Annotation changes auto-save;
+there is no document library, annotation sidebar, StrikeOut support, note
+threads or agent integration.
 
 Known P1 boundaries:
 
