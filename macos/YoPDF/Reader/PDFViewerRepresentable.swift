@@ -32,7 +32,9 @@ struct PDFViewerRepresentable: NSViewRepresentable {
     @Binding var selection: PDFSelection?
     let autoScales: Bool
     let zoomScale: CGFloat
+    let zoomCommandRevision: Int
     let onScaleChange: (CGFloat) -> Void
+    let onManualMagnification: () -> Void
     let selectedMarkup: MarkupSelection?
     let noteMarkers: [NoteMarker]
     /// While true, the next click on a page places a page note instead of
@@ -65,6 +67,7 @@ struct PDFViewerRepresentable: NSViewRepresentable {
         view.noteMarkers = noteMarkers
         view.isPlacingNote = isPlacingNote
         context.coordinator.attach(to: view)
+        context.coordinator.lastAppliedZoomCommandRevision = zoomCommandRevision
         context.coordinator.updateHandlers(on: view, parent: self)
         anchorResolver.pdfView = view
         return view
@@ -81,13 +84,18 @@ struct PDFViewerRepresentable: NSViewRepresentable {
             if document != nil {
                 view.autoScales = true
             }
+            context.coordinator.lastAppliedZoomCommandRevision = zoomCommandRevision
         }
 
-        view.autoScales = autoScales
-
-        if !autoScales,
-           ReaderViewSync.shouldApplyZoom(current: view.scaleFactor, target: zoomScale) {
-            view.scaleFactor = zoomScale
+        if context.coordinator.lastAppliedZoomCommandRevision != zoomCommandRevision {
+            // Apply only explicit toolbar/menu zoom commands. Scale changes
+            // reported by PDFKit during a pinch also refresh SwiftUI, but
+            // writing those values back here interrupts PDFKit's gesture.
+            view.autoScales = autoScales
+            if !autoScales {
+                view.scaleFactor = zoomScale
+            }
+            context.coordinator.lastAppliedZoomCommandRevision = zoomCommandRevision
         }
 
         // The model cleared the selection: the markup consumed it, or a new
@@ -135,6 +143,7 @@ struct PDFViewerRepresentable: NSViewRepresentable {
     final class Coordinator: NSObject {
         var parent: PDFViewerRepresentable
         var lastAnnotationRevision = -1
+        var lastAppliedZoomCommandRevision: Int?
         private weak var pdfView: MarkupPDFView?
 
         init(parent: PDFViewerRepresentable) {
@@ -183,6 +192,9 @@ struct PDFViewerRepresentable: NSViewRepresentable {
             }
             view.onCancelPlacement = { [weak self] in
                 self?.parent.onCancelPlacement()
+            }
+            view.onManualMagnification = { [weak self] in
+                self?.parent.onManualMagnification()
             }
             view.makeMenuItems = { [weak self] context in
                 self?.parent.makeMenuItems(context) ?? []
@@ -270,6 +282,7 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
     var onNoteMoved: ((NoteSelection, CGPoint) -> Void)?
     var onPlaceNote: ((CGPoint, PDFPage, CGRect) -> Void)?
     var onCancelPlacement: (() -> Void)?
+    var onManualMagnification: (() -> Void)?
     var makeMenuItems: ((PageMenuContext) -> [NSMenuItem])?
 
     private var mouseDownPoint: CGPoint?
@@ -320,6 +333,16 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
         if isPlacingNote {
             addCursorRect(bounds, cursor: .crosshair)
         }
+    }
+
+    override func magnify(with event: NSEvent) {
+        if autoScales {
+            // Keep the fitted scale as the starting point for manual zoom, then
+            // let PDFKit apply the trackpad gesture with auto-scaling disabled.
+            onManualMagnification?()
+            autoScales = false
+        }
+        super.magnify(with: event)
     }
 
     override func mouseDown(with event: NSEvent) {
