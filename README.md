@@ -14,35 +14,6 @@ standard PDF Highlight/Underline/Note annotations, including illustrated
 sticker notes, with automatic saving for committed annotation edits. Search and
 AI-assisted reading are not implemented yet.
 
-## Status
-
-| Area | State |
-| --- | --- |
-| macOS app (SwiftUI + AppKit + PDFKit) | Reader with editable Highlight/Underline and standard `/Text` notes |
-| Unit tests | 267 logic and PDFKit tests |
-| Annotations | Standard `/Highlight`, `/Underline` and `/Text`: selection, colours, recolour, delete, convert, notes, 20 sticker motifs, six paper tints, ShuaMac thought-group import, Undo/Redo |
-| Windows (WinUI 3 + PDFium) | Feasibility work, not in this repository yet |
-| AI / agent integration | Not started |
-
-Nothing here is a release. There is no signed or notarized build.
-
-## Build and run (macOS)
-
-Requirements: macOS 14 or later, Xcode 16 / Swift 6, and
-[XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`).
-
-```bash
-cd macos
-./scripts/build.sh          # Debug build
-./scripts/test.sh           # unit tests
-CONFIGURATION=Release ./scripts/build.sh
-open build/DerivedData/Build/Products/Debug/YoPDF.app
-```
-
-`scripts/build.sh` and `scripts/test.sh` regenerate the Xcode project
-automatically when `project.yml` changes, so a fresh clone needs no extra step
-beyond installing XcodeGen. Build products stay in `macos/build/` (git-ignored).
-
 ## Design constraints
 
 - **Local-first.** Reading and annotating must work without a network, an
