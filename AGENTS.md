@@ -121,6 +121,7 @@ Being publicly accessible on GitHub does not automatically authorize copying sou
 ## 7. Engineering workflow
 
 - Keep changes small, focused, and independently reviewable.
+- Write pull request titles and descriptions, along with commit messages (subjects and bodies), in English.
 - Follow the current task's scope and acceptance criteria.
 - Avoid unrelated refactors, speculative features, and premature abstraction.
 - Prefer official SDKs, reproducible builds, and pinned dependencies where appropriate.
