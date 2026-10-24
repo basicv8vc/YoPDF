@@ -59,7 +59,7 @@ struct PDFReaderView: View {
         }
     }
 
-    private enum Prompt: Identifiable {
+    private enum Prompt: Identifiable, Equatable {
         /// The note has text that is not in the document yet.
         case draftChanges(PendingAction)
         case unsavedChanges(PendingAction)
@@ -153,6 +153,13 @@ struct PDFReaderView: View {
             didOpenScreenshotPDF = true
             requestOpen(URL(fileURLWithPath: path))
             #endif
+        }
+        .onChange(of: model.autoSaveFailureRevision) { _, _ in
+            // Do not replace an action prompt already on screen. The toolbar
+            // keeps the failure visible, and dismissing the current prompt
+            // leaves the user free to retry or save a copy.
+            guard prompt == nil, let outcome = model.lastAutoSaveOutcome else { return }
+            _ = present(outcome)
         }
         .focusedSceneValue(\.documentModel, model)
         .focusedSceneValue(\.openDocument, { isImporterPresented = true })
@@ -380,12 +387,30 @@ struct PDFReaderView: View {
                 .accessibilityLabel("Reopen the unsaved note draft")
             }
 
-            if model.hasUnsavedChanges {
-                Label("Edited", systemImage: "circle.fill")
+            switch model.autoSaveStatus {
+            case .idle:
+                if model.hasUnsavedChanges {
+                    Label("Edited", systemImage: "circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .help("This document has unsaved changes")
+                        .accessibilityLabel("Unsaved changes")
+                }
+            case .pending, .saving:
+                Label("Saving…", systemImage: "arrow.triangle.2.circlepath")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .help("This document has unsaved changes")
-                    .accessibilityLabel("Unsaved changes")
+                    .help("YoPDF will save annotation changes automatically.")
+            case .saved:
+                Label("Saved", systemImage: "checkmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("All annotation changes are saved")
+            case .failed:
+                Label("Auto-save failed", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .help("The edits are still in memory. See the save details and retry or save a copy.")
             }
 
             if let fileURL = model.fileURL {

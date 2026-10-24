@@ -9,9 +9,9 @@ tracking, external-change detection, and safe in-place saving.
 
 P2a adds the first editing feature on top of it: select text, add a yellow
 highlight, save, reopen. A highlight is a standard PDF `/Highlight` annotation
-with `/QuadPoints`, so other readers see it as their own. Editing introduces a
-minimal dirty state and a manual Save; there is no autosave or annotation sidebar
-yet.
+with `/QuadPoints`, so other readers see it as their own. Editing introduced a
+minimal dirty state and a manual Save; committed annotation edits now auto-save
+after a short quiet period. There is no annotation sidebar yet.
 
 P2b extends that to editable **Highlight** and **Underline** annotations:
 six presets plus a custom `ColorPicker`, click selection, recolouring, deletion,
@@ -21,7 +21,9 @@ P2c adds **notes**: a compact SwiftUI composer writes a standard PDF `/Text`
 annotation, either about the selected text or at a point the user clicks on the
 page. Six paper tints, a marker drawn over the page, editing, deletion and
 Undo/Redo all go through the same model pipeline as Highlight and Underline.
-There is still no autosave and no annotation sidebar.
+Committed annotation edits auto-save after a short quiet period; a note draft
+remains in the composer until the user saves it into the PDF. There is no
+annotation sidebar.
 
 P2d adds the first **sticker** stage: the 20 original ShuaMac illustrations are
 packaged in an Asset Catalog, and a note's motif, paper palette, template title
@@ -195,10 +197,14 @@ A highlight is built from the `PDFView` selection in `HighlightService`:
   default and a configurable palette; the geometry and saving rules below are
   unchanged.
 
-Editing is manual-save only:
+Committed annotation edits are automatically saved after 750 milliseconds
+without another edit. The pending interval is reset while a change is still in
+progress, so a marker drag or colour-picker gesture is written as one update.
+Note composer text is a draft and is not written until the user commits the
+note. ⌘S and the Save button remain available for an immediate save.
 
-- Adding a highlight marks the document edited. Nothing is written until the user
-  saves, and there is no autosave.
+- Adding or editing a highlight, underline or note marks the document edited and
+  schedules an automatic save through the open `DocumentSession`.
 - `PDFDocumentModel.save()` serialises the document with PDFKit and hands the
   bytes to `DocumentSession.save`. It never calls `PDFDocument.write(to:)` on the
   original path: that would bypass the version check that makes a save safe.
@@ -578,9 +584,9 @@ System Events / Preview and `qlmanage -t` are all blocked here):
    follows, one Undo returns the original colour, and the saved PDF reopens with
    the final colour.
 10. Convert a highlight to an underline, undo, redo, delete and undo: the
-    contents and flags set by another app survive, and saving is still a normal
-    manual Save. After a successful save, Undo is disabled because the document
-    was reloaded from disk.
+    contents and flags set by another app survive, and the edit is saved through
+    the normal `DocumentSession` path. After a successful save, Undo is disabled
+    because the document was reloaded from disk.
 11. Simulate a save conflict (change the file from another app) after recolouring:
     the save is refused, the annotation and the Undo history stay in the window,
     and Save As remains available.
@@ -671,15 +677,16 @@ separate task; see `internal/` notes (not published).
 
 P0 excluded annotations, search, recent documents, tabs, agent integration,
 accounts, sync and PDF editing. P1 added file access and safe persistence. P2a
-adds yellow highlights with a manual save. P2b makes Highlight and Underline
+added yellow highlights with a manual save; committed annotation changes now
+auto-save. P2b makes Highlight and Underline
 editable: selection, six presets plus custom colours, recolour, delete, convert
 and Undo/Redo. P2c adds standard `/Text` notes with a compact composer, six paper
 tints, page markers, editing, deletion and Undo/Redo. P2d adds 20 original
 sticker motifs, a persistent versioned style (v2 with template title and symbol),
 a CropBox-relative marker anchor, twelve built-in templates with a personal
-template library, and ShuaMac's compact composer. There is still no autosave,
-document library, annotation sidebar, StrikeOut support, note threads or agent
-integration.
+template library, and ShuaMac's compact composer. Annotation changes auto-save;
+there is no document library, annotation sidebar, StrikeOut support, note
+threads or agent integration.
 
 Known P1 boundaries:
 

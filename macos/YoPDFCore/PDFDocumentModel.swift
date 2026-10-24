@@ -52,6 +52,12 @@ public final class PDFDocumentModel: ObservableObject {
     /// switching documents or quitting cannot silently drop them; it is not a
     /// general document-modification flag yet.
     @Published public private(set) var hasUnsavedChanges: Bool = false
+    /// State of the most recent automatic save for the current document.
+    @Published public internal(set) var autoSaveStatus: AutoSaveStatus = .idle
+    /// Bumped when an automatic save needs to be surfaced to the reader UI.
+    @Published public internal(set) var autoSaveFailureRevision = 0
+    /// The most recent automatic-save result, when one has completed.
+    public internal(set) var lastAutoSaveOutcome: SaveOutcome?
     /// Monotonic revision of the in-memory edits.
     ///
     /// Bumped whenever edits are made, saved, discarded, or replaced by another
@@ -111,6 +117,10 @@ public final class PDFDocumentModel: ObservableObject {
     /// the same path.
     var markupUndoStack: [MarkupEdit] = []
     var markupRedoStack: [MarkupEdit] = []
+
+    /// A single cancellable debounce task covers every annotation mutation.
+    var autoSaveTask: Task<Void, Never>?
+    var autoSaveGeneration = 0
 
     /// The open file session, or nil when nothing is loaded. Exposed so later
     /// phases can save through the same session that owns the access.
@@ -207,6 +217,7 @@ public final class PDFDocumentModel: ObservableObject {
     }
 
     public func close() {
+        cancelPendingAutoSave()
         documentSession?.close()
         documentSession = nil
         document = nil
@@ -219,6 +230,8 @@ public final class PDFDocumentModel: ObservableObject {
         isAutoScaling = true
         lastError = nil
         hasUnsavedChanges = false
+        autoSaveStatus = .idle
+        lastAutoSaveOutcome = nil
         editRevision &+= 1
         currentSelection = nil
         resetMarkupState()
@@ -231,6 +244,7 @@ public final class PDFDocumentModel: ObservableObject {
     }
 
     private func apply(document: PDFDocument, fileURL: URL?) {
+        cancelPendingAutoSave()
         self.document = document
         self.fileURL = fileURL
         pageCount = document.pageCount
@@ -240,6 +254,8 @@ public final class PDFDocumentModel: ObservableObject {
         isAutoScaling = true
         lastError = nil
         hasUnsavedChanges = false
+        autoSaveStatus = .idle
+        lastAutoSaveOutcome = nil
         editRevision &+= 1
         currentSelection = nil
         resetMarkupState()
@@ -313,10 +329,14 @@ public final class PDFDocumentModel: ObservableObject {
     func markEdited() {
         hasUnsavedChanges = true
         editRevision &+= 1
+        scheduleAutoSave()
     }
 
     func markSaved() {
+        cancelPendingAutoSave()
         hasUnsavedChanges = false
+        autoSaveStatus = .idle
+        lastAutoSaveOutcome = nil
         editRevision &+= 1
         // A successful write is the one point where the old undo history stops
         // describing the file. Failed and conflicting saves never call this, so

@@ -49,6 +49,17 @@ public enum SaveOutcome: Equatable {
     }
 }
 
+/// The visible state of automatic annotation saving.
+public enum AutoSaveStatus: Equatable {
+    case idle
+    /// An annotation changed and the debounce interval has not elapsed yet.
+    case pending
+    case saving
+    case saved
+    /// The automatic save did not finish as a verified success.
+    case failed(SaveOutcome)
+}
+
 extension PDFDocumentModel {
 
     // MARK: - Highlight
@@ -92,6 +103,9 @@ extension PDFDocumentModel {
     /// that what was written is a readable PDF.
     @discardableResult
     public func save() -> SaveOutcome {
+        // A manual save supersedes the debounce. If it fails, do not run a
+        // second automatic attempt against the same document a moment later.
+        cancelPendingAutoSave()
         guard let document, let session = documentSession else { return .failed(.noDocument) }
         guard hasUnsavedChanges else { return .saved }
         guard let data = NoteService.dataRepresentationPreservingShuaGroups(in: document) else {
@@ -106,6 +120,54 @@ extension PDFDocumentModel {
             return .failed(.store(.stagingFailed(error.localizedDescription)))
         }
         return finishWrite()
+    }
+
+    /// Reschedules a save after each document edit. The short quiet period
+    /// groups related UI changes (for example, dragging a note marker or
+    /// choosing a custom colour) into one safe file replacement.
+    func scheduleAutoSave() {
+        autoSaveTask?.cancel()
+        autoSaveGeneration &+= 1
+        let generation = autoSaveGeneration
+        let scheduledRevision = editRevision
+        autoSaveStatus = .pending
+        lastAutoSaveOutcome = nil
+
+        autoSaveTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: Self.autoSaveDebounceNanoseconds)
+            } catch {
+                return
+            }
+
+            guard let self,
+                  self.autoSaveGeneration == generation,
+                  self.editRevision == scheduledRevision,
+                  self.hasUnsavedChanges
+            else { return }
+
+            self.autoSaveStatus = .saving
+            let outcome = self.save()
+            self.lastAutoSaveOutcome = outcome
+            self.autoSaveTask = nil
+            if case .saved = outcome {
+                self.autoSaveStatus = .saved
+            } else {
+                self.autoSaveStatus = .failed(outcome)
+                self.autoSaveFailureRevision &+= 1
+            }
+        }
+    }
+
+    /// Cancels a pending automatic save when the user saves, discards, closes,
+    /// or successfully replaces the open document.
+    func cancelPendingAutoSave() {
+        autoSaveGeneration &+= 1
+        autoSaveTask?.cancel()
+        autoSaveTask = nil
+        if autoSaveStatus == .pending || autoSaveStatus == .saving {
+            autoSaveStatus = .idle
+        }
     }
 
     /// Writes the document to another file and continues editing there.
@@ -271,6 +333,10 @@ extension PDFDocumentModel {
         guard let current = document, reloaded.pageCount == current.pageCount else { return nil }
         return reloaded
     }
+}
+
+private extension PDFDocumentModel {
+    static var autoSaveDebounceNanoseconds: UInt64 { 750_000_000 }
 }
 
 extension SaveError: LocalizedError {

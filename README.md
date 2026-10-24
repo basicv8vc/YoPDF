@@ -6,8 +6,8 @@ built natively for each platform. **Your PDF. Your way.**
 YoPDF is in early development. The repository currently contains the macOS
 reader: opening a local PDF, continuous scrolling, page navigation, zoom, and
 standard PDF Highlight/Underline/Note annotations, including illustrated
-sticker notes, with manual save. Search and AI-assisted reading are not
-implemented yet.
+sticker notes, with automatic saving for committed annotation edits. Search and
+AI-assisted reading are not implemented yet.
 
 ## Status
 
