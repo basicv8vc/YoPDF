@@ -8,6 +8,7 @@ struct PDFReaderView: View {
 
     @ObservedObject var model: PDFDocumentModel
     @ObservedObject var updateController: SparkleUpdateController
+    @ObservedObject var recentDocuments: RecentDocumentsStore
 
     @State private var isImporterPresented = false
     @State private var isDropTargeted = false
@@ -65,6 +66,7 @@ struct PDFReaderView: View {
         case draftChanges(PendingAction)
         case unsavedChanges(PendingAction)
         case saveProblem(title: String, message: String, offersSaveAs: Bool)
+        case recentDocumentUnavailable(String)
 
         var id: String {
             switch self {
@@ -74,6 +76,8 @@ struct PDFReaderView: View {
                 return "unsaved-\(String(describing: action))"
             case let .saveProblem(title, _, _):
                 return "problem-\(title)"
+            case let .recentDocumentUnavailable(name):
+                return "recent-\(name)"
             }
         }
 
@@ -85,6 +89,8 @@ struct PDFReaderView: View {
                 return "Save changes before continuing?"
             case let .saveProblem(title, _, _):
                 return title
+            case .recentDocumentUnavailable:
+                return "Couldn’t open recent document"
             }
         }
 
@@ -103,6 +109,8 @@ struct PDFReaderView: View {
                 }
             case let .saveProblem(_, message, _):
                 return message
+            case let .recentDocumentUnavailable(name):
+                return "YoPDF can no longer access “\(name)”. Choose the PDF again with Open PDF… to grant access."
             }
         }
 
@@ -164,6 +172,7 @@ struct PDFReaderView: View {
         }
         .focusedSceneValue(\.documentModel, model)
         .focusedSceneValue(\.openDocument, { isImporterPresented = true })
+        .focusedSceneValue(\.openRecentDocument, { requestOpenRecent($0) })
         .focusedSceneValue(\.saveDocument, { requestSave() })
         .focusedSceneValue(\.saveDocumentAs, { requestSaveAs() })
         .focusedSceneValue(\.highlightSelection, { _ = model.addMarkup(.highlight) })
@@ -215,6 +224,8 @@ struct PDFReaderView: View {
                         presentSaveAsPanel()
                     }
                 }
+                Button("OK", role: .cancel) { self.prompt = nil }
+            case .recentDocumentUnavailable:
                 Button("OK", role: .cancel) { self.prompt = nil }
             }
         } message: { prompt in
@@ -576,6 +587,23 @@ struct PDFReaderView: View {
                 isImporterPresented = true
             }
             .keyboardShortcut("o", modifiers: .command)
+
+            if !recentDocuments.items.isEmpty {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Recent Documents")
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(.secondary)
+                    ForEach(Array(recentDocuments.items.prefix(5))) { item in
+                        Button(item.displayName) {
+                            requestOpenRecent(item)
+                        }
+                        .buttonStyle(.plain)
+                        .help(item.lastKnownPath)
+                    }
+                }
+                .frame(maxWidth: 360, alignment: .leading)
+                .padding(.top, 14)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(40)
@@ -611,6 +639,14 @@ struct PDFReaderView: View {
             prompt = .draftChanges(.open(url))
         case .document:
             prompt = .unsavedChanges(.open(url))
+        }
+    }
+
+    private func requestOpenRecent(_ item: RecentDocument) {
+        do {
+            requestOpen(try recentDocuments.resolveURL(for: item))
+        } catch {
+            prompt = .recentDocumentUnavailable(item.displayName)
         }
     }
 
