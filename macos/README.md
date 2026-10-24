@@ -217,12 +217,12 @@ note. ⌘S and the Save button remain available for an immediate save.
   session can confirm the bytes it wrote, the save is a normal success; if it
   cannot, the edits stay marked unsaved and the user is told the result is
   unconfirmed.
-- After a successful write the document is re-opened from the file. The
+- After a successful manual write the document is re-opened from the file. The
   replacement gives the file a new inode, so the `PDFDocument` that was
   memory-mapping the old one no longer describes the file the session owns.
-  Re-opening is also the only end-to-end check that what was written is readable.
-  The page index, the zoom and the `PDFView` instance are preserved, so saving
-  does not jump back to page one.
+  Automatic saves also reopen the file to verify it is readable, but keep the
+  live document so Undo and Redo still target the displayed annotations. A
+  manual save preserves the page index, zoom and `PDFView` instance.
 - Closing the window, opening another document and quitting all check for unsaved
   edits first and offer Save / Don't Save / Cancel. Opening another document is
   also refused by the model itself (`LoadError.unsavedChanges`), so no caller can
@@ -286,13 +286,11 @@ annotation per page.
 - **Undo/Redo is model-owned.** A cross-page add, delete or conversion is one
   history entry, and rapid recolours from the colour picker coalesce into one
   gesture. Every accepted edit bumps `hasUnsavedChanges` and `editRevision`;
-  Undo and Redo count as edits too. A successful save or Save As reload clears
-  the history and the selected annotation, because the `PDFDocument` and its
-  annotation objects have been replaced. Failed, conflicting and
-  uncertain-replacement saves leave the history and the selection in place. A
-  committed write clears them even when the reload could not be verified: the
-  bytes are on disk, so the old in-memory document is no longer the source of
-  truth.
+  Undo and Redo count as edits too. Automatic saves keep the live
+  `PDFDocument`, selected annotation and history, so ⌘Z remains available after
+  each saved checkpoint. A manual save or Save As reload replaces the document
+  and clears that history. Failed, conflicting and uncertain-replacement saves
+  leave the history and selection in place.
 - **Permissions are checked at mutation time — including Undo/Redo.** `/F`
   ReadOnly (bit 7) and Locked (bit 8) annotations can be selected and
   inspected, but recolouring, deleting and converting them are refused. A
@@ -378,9 +376,9 @@ database — the saved PDF is the whole document.
   being silently replaced with an empty one.
 - **Notes share the markup edit pipeline.** `addNote`, `updateNote` and
   `deleteNote` build one `MarkupEdit`, so a body change and a paper change in
-  one Save are a single Undo entry, and a successful save clears the history
-  exactly as it does for highlights. A save reloads the document and rebuilds
-  the markers from the file.
+  one editing gesture are a single Undo entry, and automatic saves preserve
+  that history exactly as they do for highlights. Manual save reloads the
+  document and rebuilds the markers from the file.
 - **Permissions are re-read at execution time.** ReadOnly and Locked refuse
   body, colour and deletion; LockedContents refuses only `/Contents`, so the
   tint can still change and the note can still be deleted. The edit pipeline
@@ -585,8 +583,10 @@ System Events / Preview and `qlmanage -t` are all blocked here):
    the final colour.
 10. Convert a highlight to an underline, undo, redo, delete and undo: the
     contents and flags set by another app survive, and the edit is saved through
-    the normal `DocumentSession` path. After a successful save, Undo is disabled
-    because the document was reloaded from disk.
+    the normal `DocumentSession` path. After the automatic save, Undo remains
+    available and reverses the last edit; the reverted state is saved as the
+    next automatic checkpoint. A manual save reloads the document and clears
+    Undo history.
 11. Simulate a save conflict (change the file from another app) after recolouring:
     the save is refused, the annotation and the Undo history stay in the window,
     and Save As remains available.

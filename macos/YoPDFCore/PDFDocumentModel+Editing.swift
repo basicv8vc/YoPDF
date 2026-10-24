@@ -96,15 +96,26 @@ extension PDFDocumentModel {
     /// replacement. Nothing here writes to the original path directly: doing so
     /// would bypass the external-change check that makes a save safe.
     ///
-    /// After a successful write the document is re-opened from the file. That is
-    /// not cosmetic: the replacement gives the file a new inode, so the
+    /// After a successful manual write the document is re-opened from the file.
+    /// That is not cosmetic: the replacement gives the file a new inode, so the
     /// `PDFDocument` that was memory-mapping the old one no longer describes the
-    /// file the session now owns. Re-opening is also the only end-to-end check
-    /// that what was written is a readable PDF.
+    /// file the session now owns. Automatic saves verify a reopened copy but
+    /// keep the live document so annotation undo history remains usable.
     @discardableResult
     public func save() -> SaveOutcome {
         // A manual save supersedes the debounce. If it fails, do not run a
         // second automatic attempt against the same document a moment later.
+        save(preservingUndoHistory: false)
+    }
+
+    /// Saves an automatic checkpoint without replacing the document whose
+    /// annotation objects are retained by the undo and redo entries.
+    @discardableResult
+    func saveAutomatically() -> SaveOutcome {
+        save(preservingUndoHistory: true)
+    }
+
+    private func save(preservingUndoHistory: Bool) -> SaveOutcome {
         cancelPendingAutoSave()
         guard let document, let session = documentSession else { return .failed(.noDocument) }
         guard hasUnsavedChanges else { return .saved }
@@ -115,11 +126,15 @@ extension PDFDocumentModel {
         do {
             try session.save(data)
         } catch let error as DocumentStoreError {
-            return resolveSaveFailure(error, session: session)
+            return resolveSaveFailure(
+                error,
+                session: session,
+                preservingUndoHistory: preservingUndoHistory
+            )
         } catch {
             return .failed(.store(.stagingFailed(error.localizedDescription)))
         }
-        return finishWrite()
+        return finishWrite(preservingUndoHistory: preservingUndoHistory)
     }
 
     /// Reschedules a save after each document edit. The short quiet period
@@ -147,7 +162,7 @@ extension PDFDocumentModel {
             else { return }
 
             self.autoSaveStatus = .saving
-            let outcome = self.save()
+            let outcome = self.saveAutomatically()
             self.lastAutoSaveOutcome = outcome
             self.autoSaveTask = nil
             if case .saved = outcome {
@@ -217,9 +232,15 @@ extension PDFDocumentModel {
 
     // MARK: - Outcomes
 
-    private func finishWrite() -> SaveOutcome {
-        markSaved()
-        if let reason = resyncDocumentAfterWrite() {
+    private func finishWrite(preservingUndoHistory: Bool = false) -> SaveOutcome {
+        markSaved(preservingMarkupHistory: preservingUndoHistory)
+        let resyncFailure: String?
+        if preservingUndoHistory {
+            resyncFailure = verifyDocumentAfterWrite()
+        } else {
+            resyncFailure = resyncDocumentAfterWrite()
+        }
+        if let reason = resyncFailure {
             return .savedUnverified(reason: reason, editsOnDisk: true)
         }
         return .saved
@@ -227,7 +248,8 @@ extension PDFDocumentModel {
 
     private func resolveSaveFailure(
         _ error: DocumentStoreError,
-        session: DocumentSession
+        session: DocumentSession,
+        preservingUndoHistory: Bool
     ) -> SaveOutcome {
         switch error {
         case let .committedButUnverified(_, reason):
@@ -237,7 +259,7 @@ extension PDFDocumentModel {
             // reporting anything to the user.
             do {
                 _ = try session.refresh()
-                return finishWrite()
+                return finishWrite(preservingUndoHistory: preservingUndoHistory)
             } catch {
                 let detail = (error as? DocumentStoreError)?.localizedDescription
                     ?? error.localizedDescription
@@ -320,6 +342,18 @@ extension PDFDocumentModel {
             return "The file was written, but it could not be reopened."
         }
         swapDocument(reloaded, at: readingPosition)
+        return nil
+    }
+
+    /// Re-opens the saved file to verify it is readable without swapping the
+    /// live document. Automatic-save undo entries retain references to its
+    /// annotation objects, so replacing it here would make ⌘Z edit an offscreen
+    /// document.
+    private func verifyDocumentAfterWrite() -> String? {
+        guard let url = fileURL else { return "The document has no file location." }
+        guard reloadedDocument(at: url) != nil else {
+            return "The file was written, but it could not be reopened."
+        }
         return nil
     }
 

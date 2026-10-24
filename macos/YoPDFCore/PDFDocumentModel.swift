@@ -332,24 +332,27 @@ public final class PDFDocumentModel: ObservableObject {
         scheduleAutoSave()
     }
 
-    func markSaved() {
+    func markSaved(preservingMarkupHistory: Bool = false) {
         cancelPendingAutoSave()
         hasUnsavedChanges = false
         autoSaveStatus = .idle
         lastAutoSaveOutcome = nil
         editRevision &+= 1
-        // A successful write is the one point where the old undo history stops
-        // describing the file. Failed and conflicting saves never call this, so
-        // their history stays available for a retry.
-        resetMarkupState()
+        // Manual saves replace the PDFDocument below and therefore clear its
+        // annotation-object history. Automatic saves keep the live document,
+        // so the same entries can still undo and redo edits after persistence.
+        if !preservingMarkupHistory {
+            resetMarkupState()
+        }
     }
 
     /// Clears every reference to the annotations of the document being replaced.
     ///
     /// The undo entries hold `PDFAnnotation` objects, and an annotation belongs
     /// to the `PDFDocument` that created it. Keeping them after an open, close,
-    /// save reload or Save As would leave a menu action able to mutate an old
-    /// in-memory document that is no longer on screen.
+    /// manual save reload or Save As would leave a menu action able to mutate
+    /// an old in-memory document that is no longer on screen. Auto-save retains
+    /// the live document and can safely preserve the history.
     func resetMarkupState() {
         markupUndoStack.removeAll()
         markupRedoStack.removeAll()
