@@ -366,14 +366,15 @@ final class NoteStickerStyleTests: XCTestCase {
         let page = try XCTUnwrap(model.document?.page(at: 0))
         let marker = try marker(in: model)
 
-        XCTAssertEqual(marker.bounds.width, 32, accuracy: 0.01)
+        XCTAssertEqual(marker.bounds.width, 38, accuracy: 0.01)
         XCTAssertEqual(marker.bounds.height, 32, accuracy: 0.01)
         XCTAssertEqual(NoteService.markerDisplaySize, 32)
-        XCTAssertEqual(NoteService.hitRect(for: added.annotation, on: page).width, 38, accuracy: 0.01)
+        XCTAssertEqual(NoteService.hitRect(for: added.annotation, on: page).width, 44, accuracy: 0.01)
 
         let center = CGPoint(x: marker.bounds.midX, y: marker.bounds.midY)
         XCTAssertNotNil(model.noteSelection(at: CGPoint(x: center.x + 18, y: center.y), on: page))
-        XCTAssertNil(model.noteSelection(at: CGPoint(x: center.x + 21, y: center.y), on: page))
+        XCTAssertNotNil(model.noteSelection(at: CGPoint(x: center.x + 21, y: center.y), on: page))
+        XCTAssertNil(model.noteSelection(at: CGPoint(x: center.x + 27, y: center.y), on: page))
     }
 
     func testTitleOrSymbolChangeIsAnUndoableDraftAndDocumentEdit() throws {
@@ -660,7 +661,7 @@ final class NoteStickerStyleTests: XCTestCase {
             return XCTFail("the explicit style change must succeed")
         }
         XCTAssertTrue(adopted.isYoPDFNote)
-        XCTAssertEqual(adopted.bounds.width, NoteService.markerDisplaySize, accuracy: 0.01)
+        XCTAssertEqual(adopted.bounds.width, 38, accuracy: 0.01)
         XCTAssertEqual(model.noteMarkers.count, 1)
         XCTAssertEqual(
             note.value(forAnnotationKey: NoteService.identityKey) as? String,

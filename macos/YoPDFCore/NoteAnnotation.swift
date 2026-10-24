@@ -94,11 +94,60 @@ struct NoteStyleSnapshot {
     var color: NSColor
 }
 
+/// The identity fields that tie a Shua thought to its group. These are stored
+/// separately from the appearance snapshot so migrating a legacy stack to a
+/// durable group can be undone without changing its sticker style.
+struct ShuaThoughtIdentitySnapshot {
+    var name: Any?
+    var metadata: Any?
+    var persistedIdentity: Any?
+    var persistedAnchorID: Any?
+    var modificationDate: Date?
+}
+
+struct ShuaThoughtIdentityChange {
+    let annotation: PDFAnnotation
+    let from: ShuaThoughtIdentitySnapshot
+    let to: ShuaThoughtIdentitySnapshot
+}
+
+struct GroupedThoughtPlan {
+    let annotation: PDFAnnotation
+    let identityChanges: [ShuaThoughtIdentityChange]
+}
+
+enum ShuaThoughtGroupIdentityStatus: Equatable {
+    case identified(UUID)
+    case legacy
+    case conflicting
+}
+
 /// What the page overlay needs to draw one marker.
 ///
 /// `center` is the persisted anchor in page space; `bounds` is the fixed-size
 /// card the overlay draws around it. The annotation's own `/Rect` is not used
 /// once an anchor exists, because PDFKit may rewrite it on the first save.
+public struct NoteThreadEntry: Identifiable, Equatable {
+    public let id: ObjectIdentifier
+    public let contents: String
+    public let style: NoteStickerStyle
+
+    let annotation: PDFAnnotation
+
+    init(annotation: PDFAnnotation, contents: String, style: NoteStickerStyle) {
+        self.id = ObjectIdentifier(annotation)
+        self.contents = contents
+        self.style = style
+        self.annotation = annotation
+    }
+
+    public static func == (lhs: NoteThreadEntry, rhs: NoteThreadEntry) -> Bool {
+        lhs.annotation === rhs.annotation
+            && lhs.contents == rhs.contents
+            && lhs.style == rhs.style
+    }
+}
+
 public struct NoteMarker: Identifiable, Equatable {
     public let id: ObjectIdentifier
     public let pageIndex: Int
@@ -115,6 +164,8 @@ public struct NoteMarker: Identifiable, Equatable {
     public let showsCountBadge: Bool
     /// Bodies in group order, so the thread remains readable without ShuaMac's sidecar.
     public let threadContents: [String]
+    /// Individual thoughts in group order, with the sticker style of each note.
+    public let threadEntries: [NoteThreadEntry]
     /// Original ShuaMac icon rectangles, including portions hidden by the
     /// grouped sticker overlay. These remain valid hit targets for the group.
     public let sourceHitBounds: [CGRect]
@@ -133,6 +184,7 @@ public struct NoteMarker: Identifiable, Equatable {
         count: Int = 1,
         showsCountBadge: Bool = false,
         threadContents: [String] = [],
+        threadEntries: [NoteThreadEntry] = [],
         sourceHitBounds: [CGRect] = []
     ) {
         self.id = ObjectIdentifier(annotation)
@@ -144,6 +196,13 @@ public struct NoteMarker: Identifiable, Equatable {
         self.count = count
         self.showsCountBadge = showsCountBadge
         self.threadContents = threadContents
+        self.threadEntries = threadEntries.isEmpty
+            ? [NoteThreadEntry(
+                annotation: annotation,
+                contents: annotation.contents ?? "",
+                style: style
+            )]
+            : threadEntries
         self.sourceHitBounds = sourceHitBounds
         self.annotation = annotation
     }
@@ -158,6 +217,7 @@ public struct NoteMarker: Identifiable, Equatable {
             && lhs.count == rhs.count
             && lhs.showsCountBadge == rhs.showsCountBadge
             && lhs.threadContents == rhs.threadContents
+            && lhs.threadEntries == rhs.threadEntries
             && lhs.sourceHitBounds == rhs.sourceHitBounds
     }
 }
@@ -200,8 +260,17 @@ public struct NoteSelection: Identifiable, Equatable {
     public let groupCount: Int
     /// The full body list for a ShuaMac group, ordered as its notes are stacked.
     public let threadContents: [String]
+    /// The notes in the thread, including each note's own motif and palette.
+    public let threadEntries: [NoteThreadEntry]
 
     public var paperColor: NotePaperColor { style.palette }
+
+    /// True when the annotation belongs to a Shua thought thread. A thread can
+    /// contain a single thought after creation or deletion and is still
+    /// eligible for the thread composer.
+    @MainActor public var isShuaThought: Bool {
+        NoteService.isShuaThought(annotation)
+    }
 
     let annotation: PDFAnnotation
 
@@ -222,7 +291,8 @@ public struct NoteSelection: Identifiable, Equatable {
         isYoPDFNote: Bool,
         usesStickerPresentation: Bool,
         groupCount: Int,
-        threadContents: [String]
+        threadContents: [String],
+        threadEntries: [NoteThreadEntry]
     ) {
         self.annotation = annotation
         self.pageIndex = pageIndex
@@ -236,6 +306,7 @@ public struct NoteSelection: Identifiable, Equatable {
         self.usesStickerPresentation = usesStickerPresentation
         self.groupCount = groupCount
         self.threadContents = threadContents
+        self.threadEntries = threadEntries
     }
 
     public static func == (lhs: NoteSelection, rhs: NoteSelection) -> Bool {
@@ -251,6 +322,7 @@ public struct NoteSelection: Identifiable, Equatable {
             && lhs.usesStickerPresentation == rhs.usesStickerPresentation
             && lhs.groupCount == rhs.groupCount
             && lhs.threadContents == rhs.threadContents
+            && lhs.threadEntries == rhs.threadEntries
     }
 }
 
@@ -340,6 +412,11 @@ public enum NoteService {
         }
     }
 
+    private enum ShuaMetadataTimestampPolicy {
+        case fresh(Date)
+        case preserveExisting(fallback: Date)
+    }
+
     /// ShuaMac's unversioned Codable sticker payload. `palette` is required by
     /// ShuaMac; title and symbol are optional here so older/partial payloads
     /// can retain YoPDF's template-only fields when available.
@@ -388,6 +465,72 @@ public enum NoteService {
     /// PDFKit may discard while serializing. Newer PDFs retain their embedded
     /// `ShuaThoughtMetadata` without this extra key.
     private static let shuaAnchorPersistenceKey = PDFAnnotationKey(rawValue: "/YoPDFShuaAnchorID")
+
+    static func shuaIdentitySnapshot(of annotation: PDFAnnotation) -> ShuaThoughtIdentitySnapshot {
+        ShuaThoughtIdentitySnapshot(
+            name: annotation.value(forAnnotationKey: .name),
+            metadata: annotation.value(forAnnotationKey: shuaThoughtMetadataKey),
+            persistedIdentity: annotation.value(forAnnotationKey: shuaIdentityPersistenceKey),
+            persistedAnchorID: annotation.value(forAnnotationKey: shuaAnchorPersistenceKey),
+            modificationDate: annotation.modificationDate
+        )
+    }
+
+    static func applyShuaIdentitySnapshot(
+        _ snapshot: ShuaThoughtIdentitySnapshot,
+        to annotation: PDFAnnotation
+    ) {
+        setRawAnnotationValue(snapshot.name, forAnnotationKey: .name, on: annotation)
+        setRawAnnotationValue(snapshot.metadata, forAnnotationKey: shuaThoughtMetadataKey, on: annotation)
+        setRawAnnotationValue(
+            snapshot.persistedIdentity,
+            forAnnotationKey: shuaIdentityPersistenceKey,
+            on: annotation
+        )
+        setRawAnnotationValue(
+            snapshot.persistedAnchorID,
+            forAnnotationKey: shuaAnchorPersistenceKey,
+            on: annotation
+        )
+        annotation.modificationDate = snapshot.modificationDate
+    }
+
+    static func shuaIdentitySnapshotsDiffer(
+        _ lhs: ShuaThoughtIdentitySnapshot,
+        _ rhs: ShuaThoughtIdentitySnapshot
+    ) -> Bool {
+        !samePDFValue(lhs.name, rhs.name)
+            || !samePDFValue(lhs.metadata, rhs.metadata)
+            || !samePDFValue(lhs.persistedIdentity, rhs.persistedIdentity)
+            || !samePDFValue(lhs.persistedAnchorID, rhs.persistedAnchorID)
+            || lhs.modificationDate != rhs.modificationDate
+    }
+
+    private static func samePDFValue(_ lhs: Any?, _ rhs: Any?) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil):
+            return true
+        case let (left?, right?):
+            guard let leftObject = left as? NSObject,
+                  let rightObject = right as? NSObject
+            else { return false }
+            return leftObject.isEqual(rightObject)
+        default:
+            return false
+        }
+    }
+
+    private static func setRawAnnotationValue(
+        _ value: Any?,
+        forAnnotationKey key: PDFAnnotationKey,
+        on annotation: PDFAnnotation
+    ) {
+        if let value {
+            _ = annotation.setValue(value, forAnnotationKey: key)
+        } else {
+            annotation.removeValue(forAnnotationKey: key)
+        }
+    }
 
     public static func isTextAnnotation(_ annotation: PDFAnnotation) -> Bool {
         guard let type = annotation.type else { return false }
@@ -462,6 +605,94 @@ public enum NoteService {
         ].compactMap { $0 }
         guard Set(anchorIDs).count <= 1 else { return nil }
         return anchorIDs.first
+    }
+
+    /// Distinguishes a genuinely identity-free legacy note from a note whose
+    /// persisted identity is malformed or disagrees across its PDF fields.
+    /// Only the former may be promoted to a new stable group identity.
+    static func shuaThoughtGroupIdentityStatus(
+        of annotation: PDFAnnotation
+    ) -> ShuaThoughtGroupIdentityStatus {
+        guard isTextAnnotation(annotation) else { return .conflicting }
+
+        let rawName = annotation.value(forAnnotationKey: .name)
+        let rawMetadata = annotation.value(forAnnotationKey: shuaThoughtMetadataKey)
+        let rawPersistedIdentity = annotation.value(forAnnotationKey: shuaIdentityPersistenceKey)
+        let rawPersistedAnchorID = annotation.value(forAnnotationKey: shuaAnchorPersistenceKey)
+        guard rawName != nil || rawMetadata != nil
+                || rawPersistedIdentity != nil || rawPersistedAnchorID != nil
+        else { return .legacy }
+
+        let namedIdentity: ShuaThoughtIdentity?
+        if rawName != nil {
+            guard let parsed = shuaThoughtIdentityFromName(of: annotation) else {
+                return .conflicting
+            }
+            namedIdentity = parsed
+        } else {
+            namedIdentity = nil
+        }
+
+        let metadata: ShuaThoughtMetadata?
+        if rawMetadata != nil {
+            guard let parsed = shuaThoughtMetadata(of: annotation) else {
+                return .conflicting
+            }
+            metadata = parsed
+        } else {
+            metadata = nil
+        }
+
+        let persistedIdentity: ShuaThoughtIdentity?
+        if rawPersistedIdentity != nil {
+            guard let parsed = shuaThoughtIdentityFromPersistence(of: annotation) else {
+                return .conflicting
+            }
+            persistedIdentity = parsed
+        } else {
+            persistedIdentity = nil
+        }
+
+        let persistedAnchorID: UUID?
+        if rawPersistedAnchorID != nil {
+            guard let raw = rawPersistedAnchorID as? String,
+                  let parsed = UUID(uuidString: raw)
+            else { return .conflicting }
+            persistedAnchorID = parsed
+        } else {
+            persistedAnchorID = nil
+        }
+
+        let fullIdentities = [namedIdentity, metadata?.identity, persistedIdentity].compactMap { $0 }
+        if fullIdentities.isEmpty {
+            // PDFKit drops `/NM` in some files. YoPDF's anchor-only cache is a
+            // complete group key even though it cannot restore thought order.
+            guard let persistedAnchorID,
+                  shuaAnchorID(of: annotation) == persistedAnchorID
+            else { return .conflicting }
+            return .identified(persistedAnchorID)
+        }
+        guard let firstIdentity = fullIdentities.first,
+              fullIdentities.dropFirst().allSatisfy({ $0 == firstIdentity })
+        else {
+            return .conflicting
+        }
+
+        let anchorIDs = fullIdentities.map(\.anchorID) + [persistedAnchorID].compactMap { $0 }
+        guard Set(anchorIDs).count == 1,
+              let anchorID = anchorIDs.first,
+              shuaAnchorID(of: annotation) == anchorID
+        else { return .conflicting }
+        return .identified(anchorID)
+    }
+
+    static func hasConflictingShuaIdentity(in selection: NoteSelection) -> Bool {
+        selection.threadEntries.contains { entry in
+            if case .conflicting = shuaThoughtGroupIdentityStatus(of: entry.annotation) {
+                return true
+            }
+            return false
+        }
     }
 
     /// Parses ShuaMac's embedded identity without changing the annotation.
@@ -1054,7 +1285,8 @@ public enum NoteService {
     ) -> CGRect {
         displayBounds(
             center: markerCenter(of: annotation, on: page),
-            in: page.bounds(for: .cropBox)
+            in: page.bounds(for: .cropBox),
+            showsCountBadge: true
         )
     }
 
@@ -1081,7 +1313,7 @@ public enum NoteService {
             bounds = displayBounds(
                 center: center,
                 in: page.bounds(for: .cropBox),
-                showsCountBadge: isShuaThought(annotation)
+                showsCountBadge: true
             )
         } else {
             // No overlay is drawn for a third-party note, so the popover and the
@@ -1102,7 +1334,14 @@ public enum NoteService {
             isYoPDFNote: owned,
             usesStickerPresentation: usesSticker,
             groupCount: marker?.count ?? 1,
-            threadContents: marker?.threadContents ?? [annotation.contents ?? ""]
+            threadContents: marker?.threadContents ?? [annotation.contents ?? ""],
+            threadEntries: marker?.threadEntries ?? [
+                NoteThreadEntry(
+                    annotation: annotation,
+                    contents: annotation.contents ?? "",
+                    style: style(of: annotation)
+                ),
+            ]
         )
     }
 
@@ -1133,7 +1372,11 @@ public enum NoteService {
                     && shuaAnchorID(of: annotation) == nil
             {
                 let center = markerCenter(of: annotation, on: page)
-                let bounds = displayBounds(center: center, in: page.bounds(for: .cropBox))
+                let bounds = displayBounds(
+                    center: center,
+                    in: page.bounds(for: .cropBox),
+                    showsCountBadge: true
+                )
                 markers.append(NoteMarker(
                     annotation: annotation,
                     pageIndex: pageIndex,
@@ -1141,6 +1384,7 @@ public enum NoteService {
                     bounds: bounds,
                     maskBounds: bounds,
                     style: style(of: annotation),
+                    showsCountBadge: true,
                     threadContents: [annotation.contents ?? ""]
                 ))
             }
@@ -1207,6 +1451,13 @@ public enum NoteService {
                     count: notes.count,
                     showsCountBadge: true,
                     threadContents: notes.map { $0.contents ?? "" },
+                    threadEntries: notes.map {
+                        NoteThreadEntry(
+                            annotation: $0,
+                            contents: $0.contents ?? "",
+                            style: style(of: $0)
+                        )
+                    },
                     sourceHitBounds: notes.map(\.bounds)
                 ))
             }
@@ -1267,6 +1518,13 @@ public enum NoteService {
                     count: notes.count,
                     showsCountBadge: true,
                     threadContents: notes.map { $0.contents ?? "" },
+                    threadEntries: notes.map {
+                        NoteThreadEntry(
+                            annotation: $0,
+                            contents: $0.contents ?? "",
+                            style: style(of: $0)
+                        )
+                    },
                     sourceHitBounds: notes.map(\.bounds)
                 ))
             }
@@ -1408,6 +1666,299 @@ public enum NoteService {
         setExcerpt(draft.excerpt, on: annotation)
         setPageLevel(draft.isPageLevel, on: annotation)
         return annotation
+    }
+
+    /// Plans one additional thought in a Shua thread.
+    ///
+    /// Legacy geometry stacks and anchor-only groups are promoted to complete
+    /// Shua thought metadata in the same undoable edit as the insertion. An
+    /// existing Anchor ID is retained; only groups with no identity get a new
+    /// one. Fully identified groups are left untouched.
+    static func groupedThoughtPlan(
+        for group: NoteSelection,
+        contents: String,
+        style: NoteStickerStyle,
+        on page: PDFPage
+    ) -> GroupedThoughtPlan? {
+        let text = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty,
+              isShuaThought(group.annotation),
+              group.annotation.page === page,
+              page.document != nil
+        else { return nil }
+
+        let identityStatus = shuaThoughtGroupIdentityStatus(of: group.annotation)
+        let anchorID: UUID
+        let needsNewAnchorID: Bool
+        switch identityStatus {
+        case let .identified(id):
+            anchorID = id
+            needsNewAnchorID = false
+        case .legacy:
+            anchorID = UUID()
+            needsNewAnchorID = true
+        case .conflicting:
+            return nil
+        }
+        guard let members = orderedShuaMembers(for: group, anchorID: anchorID, on: page),
+              !members.isEmpty
+        else { return nil }
+        guard !members.contains(where: { member in
+            if case .conflicting = shuaThoughtGroupIdentityStatus(of: member) { return true }
+            return false
+        }) else { return nil }
+        let needsMetadataMigration = needsNewAnchorID
+            || members.contains { shuaThoughtMetadata(of: $0) == nil }
+
+        let crop = page.bounds(for: .cropBox)
+        guard crop.minX.isFinite, crop.minY.isFinite,
+              crop.width.isFinite, crop.height.isFinite,
+              crop.width > 0, crop.height > 0
+        else { return nil }
+
+        let now = Date()
+        var identityChanges: [ShuaThoughtIdentityChange] = []
+        if needsMetadataMigration {
+            var thoughtIDs = Set<UUID>()
+            for (order, member) in members.enumerated() {
+                let metadata = shuaThoughtMetadata(of: member)
+                let namedIdentity = shuaThoughtIdentityFromName(of: member)
+                let persistedIdentity = shuaThoughtIdentityFromPersistence(of: member)
+                let candidates = [
+                    metadata?.identity.anchorID == anchorID ? metadata?.thoughtID : nil,
+                    namedIdentity?.anchorID == anchorID ? namedIdentity?.thoughtID : nil,
+                    persistedIdentity?.anchorID == anchorID ? persistedIdentity?.thoughtID : nil,
+                ].compactMap { $0 }
+                var thoughtID = candidates.first(where: { !thoughtIDs.contains($0) }) ?? UUID()
+                while thoughtIDs.contains(thoughtID) {
+                    thoughtID = UUID()
+                }
+                thoughtIDs.insert(thoughtID)
+
+                let before = shuaIdentitySnapshot(of: member)
+                guard var after = plannedShuaIdentitySnapshot(
+                    for: member,
+                    before: before,
+                    anchorID: anchorID,
+                    thoughtID: thoughtID,
+                    thoughtOrder: order,
+                    group: group,
+                    markerCenter: group.center,
+                    crop: crop,
+                    modifiedAt: now
+                ) else { return nil }
+                if shuaIdentitySnapshotsDiffer(before, after) {
+                    after.modificationDate = now
+                    identityChanges.append(ShuaThoughtIdentityChange(
+                        annotation: member,
+                        from: before,
+                        to: after
+                    ))
+                }
+            }
+        }
+
+        let size: CGFloat = 20
+        let columnX = members.first?.bounds.midX ?? group.center.x
+        let bottom = members.map(\.bounds.minY).min() ?? (group.center.y - size / 2)
+        let maximumX = max(crop.minX, crop.maxX - size)
+        let maximumY = max(crop.minY, crop.maxY - size)
+        let bounds = CGRect(
+            x: min(max(columnX - size / 2, crop.minX), maximumX),
+            y: min(max(bottom - 23, crop.minY), maximumY),
+            width: size,
+            height: size
+        )
+
+        let annotation = PDFAnnotation(bounds: bounds, forType: .text, withProperties: nil)
+        annotation.iconType = .comment
+        annotation.contents = text
+        annotation.userName = "Shua"
+        annotation.color = style.palette.color
+        annotation.modificationDate = now
+        setStyle(style, on: annotation)
+        setAnchor(group.center, on: annotation, page: page)
+        setExcerpt(group.excerpt, on: annotation)
+        setPageLevel(group.isPageLevel, on: annotation)
+
+        guard let shuaStyleData = try? JSONEncoder().encode(style),
+              let shuaStyle = String(data: shuaStyleData, encoding: .utf8)
+        else { return nil }
+        _ = annotation.setValue(shuaStyle, forAnnotationKey: shuaStickerStyleKey)
+
+        let thoughtID = UUID()
+        let currentMaxOrder = members.compactMap { shuaThoughtMetadata(of: $0)?.thoughtOrder }.max()
+        guard currentMaxOrder != Int.max else { return nil }
+        let nextOrder = currentMaxOrder.map { $0 + 1 } ?? members.count
+        _ = annotation.setValue(
+            "shua-thought:\(anchorID.uuidString):\(thoughtID.uuidString)",
+            forAnnotationKey: .name
+        )
+        guard let metadata = newShuaThoughtMetadata(
+            basedOn: members.first(where: { shuaThoughtMetadata(of: $0) != nil }),
+            anchorID: anchorID,
+            thoughtID: thoughtID,
+            thoughtOrder: nextOrder,
+            group: group,
+            markerCenter: group.center,
+            crop: crop,
+            timestamps: .fresh(now)
+        ) else { return nil }
+        _ = annotation.setValue(metadata, forAnnotationKey: shuaThoughtMetadataKey)
+
+        return GroupedThoughtPlan(annotation: annotation, identityChanges: identityChanges)
+    }
+
+    private static func orderedShuaMembers(
+        for group: NoteSelection,
+        anchorID: UUID,
+        on page: PDFPage
+    ) -> [PDFAnnotation]? {
+        let candidates: [PDFAnnotation]
+        if shuaAnchorID(of: group.annotation) != nil {
+            candidates = page.annotations.filter { shuaAnchorID(of: $0) == anchorID }
+        } else {
+            candidates = shuaStackMembers(of: group.annotation, on: page)
+        }
+        guard candidates.contains(where: { $0 === group.annotation }) else { return nil }
+
+        var ordered: [PDFAnnotation] = []
+        for entry in group.threadEntries {
+            guard candidates.contains(where: { $0 === entry.annotation }),
+                  !ordered.contains(where: { $0 === entry.annotation })
+            else { continue }
+            ordered.append(entry.annotation)
+        }
+
+        let pageOrder = Dictionary(uniqueKeysWithValues: page.annotations.enumerated().map {
+            (ObjectIdentifier($0.element), $0.offset)
+        })
+        let remaining = candidates.filter { candidate in
+            !ordered.contains(where: { $0 === candidate })
+        }.sorted {
+            let leftOrder = shuaThoughtMetadata(of: $0)?.thoughtOrder
+            let rightOrder = shuaThoughtMetadata(of: $1)?.thoughtOrder
+            if let leftOrder, let rightOrder, leftOrder != rightOrder {
+                return leftOrder < rightOrder
+            }
+            if $0.bounds.midY != $1.bounds.midY {
+                return $0.bounds.midY > $1.bounds.midY
+            }
+            return (pageOrder[ObjectIdentifier($0)] ?? 0)
+                < (pageOrder[ObjectIdentifier($1)] ?? 0)
+        }
+        ordered.append(contentsOf: remaining)
+        return ordered
+    }
+
+    private static func plannedShuaIdentitySnapshot(
+        for annotation: PDFAnnotation,
+        before: ShuaThoughtIdentitySnapshot,
+        anchorID: UUID,
+        thoughtID: UUID,
+        thoughtOrder: Int,
+        group: NoteSelection,
+        markerCenter: CGPoint,
+        crop: CGRect,
+        modifiedAt: Date
+    ) -> ShuaThoughtIdentitySnapshot? {
+        let identityName = "shua-thought:\(anchorID.uuidString):\(thoughtID.uuidString)"
+        let metadata: String
+        if let current = shuaThoughtMetadata(of: annotation),
+           current.anchor.id == anchorID,
+           current.thoughtID == thoughtID,
+           current.thoughtOrder == thoughtOrder,
+           before.name as? String == identityName,
+           before.persistedIdentity == nil,
+           before.persistedAnchorID == nil,
+           let raw = before.metadata as? String {
+            metadata = raw
+        } else {
+            guard let updated = newShuaThoughtMetadata(
+                basedOn: annotation,
+                anchorID: anchorID,
+                thoughtID: thoughtID,
+                thoughtOrder: thoughtOrder,
+                group: group,
+                markerCenter: markerCenter,
+                crop: crop,
+                timestamps: .preserveExisting(
+                    fallback: annotation.modificationDate ?? modifiedAt
+                )
+            ) else { return nil }
+            metadata = updated
+        }
+
+        return ShuaThoughtIdentitySnapshot(
+            name: identityName,
+            metadata: metadata,
+            persistedIdentity: nil,
+            persistedAnchorID: nil,
+            modificationDate: before.modificationDate
+        )
+    }
+
+    private static func newShuaThoughtMetadata(
+        basedOn source: PDFAnnotation?,
+        anchorID: UUID,
+        thoughtID: UUID,
+        thoughtOrder: Int,
+        group: NoteSelection,
+        markerCenter: CGPoint,
+        crop: CGRect,
+        timestamps: ShuaMetadataTimestampPolicy
+    ) -> String? {
+        var payload: [String: Any]
+        if let source,
+           let raw = source.value(forAnnotationKey: shuaThoughtMetadataKey) as? String,
+           let data = raw.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            payload = object
+        } else {
+            payload = [:]
+        }
+
+        let x = min(max((markerCenter.x - crop.minX) / crop.width, 0), 1)
+        let y = min(max((markerCenter.y - crop.minY) / crop.height, 0), 1)
+        var anchor = payload["anchor"] as? [String: Any] ?? [:]
+        anchor["id"] = anchorID.uuidString
+        if anchor["excerpt"] == nil { anchor["excerpt"] = group.excerpt ?? "" }
+        if anchor["regions"] == nil || (anchor["regions"] as? [Any])?.isEmpty == true {
+            // Shua's page-level anchors always carry a small region at the
+            // marker point. Legacy geometry-only notes have no selection
+            // geometry to recover, but an empty regions array loses the page
+            // index that Shua uses to place the marker after reopening.
+            anchor["regions"] = [[
+                "pageIndex": group.pageIndex,
+                "x": Double(markerCenter.x - 2),
+                "y": Double(markerCenter.y - 2),
+                "width": 4.0,
+                "height": 4.0,
+            ]]
+        }
+        if anchor["isPageLevel"] == nil { anchor["isPageLevel"] = group.isPageLevel }
+        if anchor["markerPosition"] == nil {
+            anchor["markerPosition"] = ["x": Double(x), "y": Double(y)]
+        }
+        payload["anchor"] = anchor
+        payload["version"] = 1
+        payload["thoughtID"] = thoughtID.uuidString
+        payload["thoughtOrder"] = thoughtOrder
+        switch timestamps {
+        case let .fresh(date):
+            let value = date.timeIntervalSinceReferenceDate
+            payload["createdAt"] = value
+            payload["modifiedAt"] = value
+        case let .preserveExisting(fallback):
+            let value = fallback.timeIntervalSinceReferenceDate
+            if payload["createdAt"] == nil { payload["createdAt"] = value }
+            if payload["modifiedAt"] == nil { payload["modifiedAt"] = value }
+        }
+
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 
     /// Applies the YoPDF paper tint. `/C` is also updated so the standard note

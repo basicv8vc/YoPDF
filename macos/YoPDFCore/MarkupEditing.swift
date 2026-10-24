@@ -40,6 +40,14 @@ enum MarkupEditChange {
         from: NoteStyleSnapshot,
         to: NoteStyleSnapshot
     )
+    /// Promotes a legacy Shua geometry stack to explicit, reversible thought
+    /// identity so later styling or page-edge clamping cannot split the group.
+    case setShuaThoughtIdentity(
+        annotation: PDFAnnotation,
+        pageIndex: Int,
+        from: ShuaThoughtIdentitySnapshot,
+        to: ShuaThoughtIdentitySnapshot
+    )
     /// Moving a note keeps its standard PDF rectangle and YoPDF's normalized
     /// marker anchor in one reversible edit.
     case setNotePosition(
@@ -56,6 +64,7 @@ enum MarkupEditChange {
              let .recolor(_, pageIndex, _, _),
              let .setContents(_, pageIndex, _, _),
              let .setNoteStyle(_, pageIndex, _, _),
+             let .setShuaThoughtIdentity(_, pageIndex, _, _),
              let .setNotePosition(_, pageIndex, _, _):
             return pageIndex
         }
@@ -68,6 +77,7 @@ enum MarkupEditChange {
              let .recolor(annotation, _, _, _),
              let .setContents(annotation, _, _, _),
              let .setNoteStyle(annotation, _, _, _),
+             let .setShuaThoughtIdentity(annotation, _, _, _),
              let .setNotePosition(annotation, _, _, _):
             return annotation
         }
@@ -448,7 +458,7 @@ extension PDFDocumentModel {
                           !page.annotations.contains(where: { $0 === annotation })
                     else { return .invalidHistory }
                 }
-            case .recolor, .setNoteStyle, .setNotePosition:
+            case .recolor, .setNoteStyle, .setShuaThoughtIdentity, .setNotePosition:
                 guard annotation.page === page,
                       page.annotations.contains(where: { $0 === annotation })
                 else { return .invalidHistory }
@@ -469,7 +479,7 @@ extension PDFDocumentModel {
                 guard document.allowsCommenting,
                       MarkupPermissions.allowsContentsChanges(annotation)
                 else { return .permissionDenied }
-            case .insert, .remove, .recolor, .setNoteStyle, .setNotePosition:
+            case .insert, .remove, .recolor, .setNoteStyle, .setShuaThoughtIdentity, .setNotePosition:
                 guard MarkupPermissions.allowsAnnotationChanges(annotation, in: document)
                 else { return .permissionDenied }
             }
@@ -498,6 +508,8 @@ extension PDFDocumentModel {
                 NoteService.setContents(forward ? to : from, on: annotation)
             case let .setNoteStyle(annotation, _, from, to):
                 NoteService.applyStyleSnapshot(forward ? to : from, to: annotation)
+            case let .setShuaThoughtIdentity(annotation, _, from, to):
+                NoteService.applyShuaIdentitySnapshot(forward ? to : from, to: annotation)
             case let .setNotePosition(annotation, _, from, to):
                 NoteService.applyPositionSnapshot(forward ? to : from, to: annotation)
             }

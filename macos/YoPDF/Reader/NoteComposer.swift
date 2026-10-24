@@ -12,6 +12,7 @@ struct NoteComposerView: View {
     @ObservedObject var session: NoteComposerSession
     @ObservedObject var model: PDFDocumentModel
     let onDismiss: () -> Void
+    let onEditGroupEntry: (NoteSelection, NoteThreadEntry) -> Void
 
     /// A failure reported by the last Save. Local on purpose: it describes one
     /// attempt, and the text it failed to save is not local state.
@@ -33,6 +34,10 @@ struct NoteComposerView: View {
                 : .none
         case let .edit(note):
             return model.notePermissions(for: note)
+        case .group:
+            return model.canCreateNote
+                ? NotePermissions(canEditContents: true, canChangeStyle: true, canDelete: false)
+                : .none
         }
     }
 
@@ -54,34 +59,26 @@ struct NoteComposerView: View {
         return Array(note.threadContents.dropFirst())
     }
 
+    private var groupSelection: NoteSelection? {
+        guard case let .group(note) = session.mode else { return nil }
+        return note
+    }
+
+    private var groupEntries: [NoteThreadEntry] {
+        guard let groupSelection else { return [] }
+        return model.noteMarkers.first(where: {
+            $0.id == groupSelection.id && $0.pageIndex == groupSelection.pageIndex
+        })?.threadEntries ?? groupSelection.threadEntries
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
 
-            if !additionalGroupNotes.isEmpty {
-                DisclosureGroup("Other notes in this group (\(additionalGroupNotes.count))") {
-                    ScrollView(.vertical) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            ForEach(additionalGroupNotes.indices, id: \.self) { index in
-                                HStack(alignment: .top, spacing: 8) {
-                                    Text("\(index + 2)")
-                                        .font(.caption.monospacedDigit())
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 18, alignment: .trailing)
-                                    Text(additionalGroupNotes[index].isEmpty
-                                        ? "Empty note"
-                                        : additionalGroupNotes[index])
-                                        .font(.system(size: 13))
-                                        .textSelection(.enabled)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                }
-                            }
-                        }
-                        .padding(.top, 5)
-                    }
-                    .frame(maxHeight: 220)
-                }
-                .font(.caption)
+            if session.isGroupComposer {
+                groupThread
+            } else if !additionalGroupNotes.isEmpty {
+                legacyGroupNotes
             }
 
             if !status.isReady {
@@ -95,7 +92,11 @@ struct NoteComposerView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            if permissions.isReadOnly {
+            if session.isGroupComposer {
+                if status.isReady && !permissions.isReadOnly {
+                    groupComposerRow
+                }
+            } else if permissions.isReadOnly {
                 readOnlyCard
             } else {
                 NoteCompactComposer(
@@ -134,7 +135,7 @@ struct NoteComposerView: View {
             focusRequest += 1
         }) {
             NoteStickerSheetEditor(
-                title: session.isEditing ? "Edit Note" : "New Note",
+                title: session.isEditing ? "Edit Note" : (session.isGroupComposer ? "New Thought" : "New Note"),
                 text: $session.contents,
                 style: $session.style,
                 templateSelection: templateSelectionBinding,
@@ -150,7 +151,7 @@ struct NoteComposerView: View {
 
     private var header: some View {
         HStack(alignment: .top, spacing: 12) {
-            Text(session.excerpt.flatMap { $0.isEmpty ? nil : $0 } ?? "Page note")
+            Text(headerTitle)
                 .font(.callout)
                 .lineLimit(2)
                 .textSelection(.enabled)
@@ -168,7 +169,7 @@ struct NoteComposerView: View {
                     .help("This note’s text is locked. Its sticker and colour can still be changed.")
             }
 
-            if !session.isEditing || permissions.isReadOnly {
+            if (!session.isEditing && !session.isGroupComposer) || permissions.isReadOnly {
                 Button(action: onDismiss) {
                     Image(systemName: "xmark")
                         .frame(width: 22, height: 20)
@@ -178,6 +179,128 @@ struct NoteComposerView: View {
                 .accessibilityLabel(permissions.isReadOnly ? "Close" : "Cancel")
             }
         }
+    }
+
+    private var headerTitle: String {
+        if let excerpt = session.excerpt, !excerpt.isEmpty { return excerpt }
+        if !session.style.displayTitle.isEmpty { return session.style.displayTitle }
+        return "Page note"
+    }
+
+    private var legacyGroupNotes: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("Other notes in this group (\(additionalGroupNotes.count))")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(additionalGroupNotes.indices, id: \.self) { index in
+                        HStack(alignment: .top, spacing: 8) {
+                            Text("\(index + 2)")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                                .frame(width: 18, alignment: .trailing)
+                            Text(additionalGroupNotes[index].isEmpty
+                                ? "Empty note"
+                                : additionalGroupNotes[index])
+                                .font(.system(size: 13))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+                .padding(.top, 5)
+            }
+            .frame(maxHeight: 220)
+        }
+    }
+
+    /// ShuaMac-style thread: one sticker paper card per saved thought, then a
+    /// separate empty composer for the next thought in the group.
+    private var groupThread: some View {
+        VStack(spacing: 11) {
+            Divider()
+
+            ScrollView(.vertical) {
+                VStack(spacing: 9) {
+                    ForEach(groupEntries.indices, id: \.self) { index in
+                        groupEntryRow(groupEntries[index])
+                    }
+                }
+                .padding(.horizontal, 2)
+            }
+            .frame(maxHeight: 320)
+
+            Divider()
+        }
+    }
+
+    private func groupEntryRow(_ entry: NoteThreadEntry) -> some View {
+        let selection = groupSelection.flatMap {
+            model.noteSelection(forThreadEntry: entry, in: $0)
+        }
+        let rowPermissions = selection.map { model.notePermissions(for: $0) } ?? .none
+
+        return HStack(alignment: .top, spacing: 11) {
+            NoteStickerArtwork(motif: entry.style.motif)
+                .frame(width: 31, height: 31)
+
+            Text(entry.contents.isEmpty ? "Empty note" : entry.contents)
+                .font(.system(size: 13))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Menu {
+                Button("Edit Note", systemImage: "pencil") {
+                    guard let groupSelection else { return }
+                    onEditGroupEntry(groupSelection, entry)
+                }
+                .disabled(!rowPermissions.canEditContents && !rowPermissions.canChangeStyle)
+
+                Button("Copy Text", systemImage: "doc.on.doc") {
+                    copy(entry.contents)
+                }
+
+                Divider()
+
+                Button("Delete Note", systemImage: "trash", role: .destructive) {
+                    guard let selection, model.deleteNote(selection) else {
+                        errorMessage = NoteEditError.permissionDenied.errorDescription
+                        return
+                    }
+                    onDismiss()
+                }
+                .disabled(!rowPermissions.canDelete)
+            } label: {
+                Image(systemName: "ellipsis")
+                    .frame(width: 20, height: 24)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .accessibilityLabel("Note actions")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .noteStickerPaper(entry.style, compact: true)
+    }
+
+    private var groupComposerRow: some View {
+        NoteCompactComposer(
+            text: $session.contents,
+            style: styleBinding,
+            templateSelection: templateSelectionBinding,
+            canEditContents: permissions.canEditContents,
+            canChangeStyle: permissions.canChangeStyle,
+            canSubmit: canSave,
+            showsCancel: false,
+            submitSymbol: "arrow.up",
+            submitTitle: "Add",
+            focusRequest: focusRequest,
+            onExpand: { beginExpandedEditor() },
+            onSubmit: { save() }
+        )
     }
 
     /// A read-only note is still readable in the same paper treatment. There is
@@ -305,8 +428,12 @@ struct NoteComposerView: View {
     }
 
     private func copyContents() {
+        copy(session.contents)
+    }
+
+    private func copy(_ contents: String) {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        pasteboard.setString(session.contents, forType: .string)
+        pasteboard.setString(contents, forType: .string)
     }
 }

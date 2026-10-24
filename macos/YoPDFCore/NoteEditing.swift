@@ -16,6 +16,9 @@ public enum NoteEditError: Error, Equatable {
     case pageUnavailable
     /// The annotation is no longer attached to the page it was read from.
     case annotationUnavailable
+    /// Shua's persisted identity fields disagree or cannot be parsed. Appending
+    /// would risk overwriting the original group identity, so the operation is refused.
+    case conflictingIdentity
     /// ReadOnly, Locked, LockedContents or a document that forbids commenting.
     case permissionDenied
 }
@@ -106,6 +109,24 @@ extension PDFDocumentModel {
             return NoteService.selection(for: annotation, on: page, pageIndex: pageIndex)
         }
         return nil
+    }
+
+    /// Resolves one saved thought into a normal single-note selection for the
+    /// row's Edit and Delete actions in the group composer.
+    public func noteSelection(
+        forThreadEntry entry: NoteThreadEntry,
+        in group: NoteSelection
+    ) -> NoteSelection? {
+        guard isAttached(group),
+              let page = document?.page(at: group.pageIndex),
+              entry.annotation.page === page,
+              page.annotations.contains(where: { $0 === entry.annotation })
+        else { return nil }
+        return NoteService.selection(
+            for: entry.annotation,
+            on: page,
+            pageIndex: group.pageIndex
+        )
     }
 
     /// Whether a captured anchor still describes the document on screen.
@@ -299,6 +320,60 @@ extension PDFDocumentModel {
         return .success(selection)
     }
 
+    /// Adds one thought to a Shua thread, including a thread that currently has
+    /// only one visible thought. Legacy geometry stacks are promoted to stable
+    /// embedded identity in the same undoable edit as the new annotation.
+    @discardableResult
+    public func addThought(
+        to group: NoteSelection,
+        contents: String,
+        style: NoteStickerStyle
+    ) -> Result<NoteSelection, NoteEditError> {
+        guard let document else { return .failure(.noDocument) }
+        guard isAttached(group) else { return .failure(.annotationUnavailable) }
+        guard NoteService.isShuaThought(group.annotation),
+              document.allowsCommenting
+        else { return .failure(.permissionDenied) }
+        if case .conflicting = NoteService.shuaThoughtGroupIdentityStatus(of: group.annotation) {
+            return .failure(.conflictingIdentity)
+        }
+        if NoteService.hasConflictingShuaIdentity(in: group) {
+            return .failure(.conflictingIdentity)
+        }
+
+        let text = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return .failure(.emptyContents) }
+        guard let page = document.page(at: group.pageIndex), page.document === document else {
+            return .failure(.pageUnavailable)
+        }
+        guard let plan = NoteService.groupedThoughtPlan(
+            for: group,
+            contents: text,
+            style: style,
+            on: page
+        ) else { return .failure(.annotationUnavailable) }
+
+        let identityChanges = plan.identityChanges.map {
+            MarkupEditChange.setShuaThoughtIdentity(
+                annotation: $0.annotation,
+                pageIndex: group.pageIndex,
+                from: $0.from,
+                to: $0.to
+            )
+        }
+        let edit = MarkupEdit(changes: identityChanges + [
+            .insert(annotation: plan.annotation, pageIndex: group.pageIndex),
+        ])
+        guard performMarkupEdit(edit) else { return .failure(.permissionDenied) }
+
+        selectedMarkup = nil
+        updateSelection(nil)
+        guard let updatedGroup = noteSelection(at: group.center, on: page) else {
+            return .failure(.annotationUnavailable)
+        }
+        return .success(updatedGroup)
+    }
+
     /// Compatibility entry point for callers that only choose a paper tint.
     ///
     /// New UI code uses `addNote(_:contents:style:)`; this keeps the PR #6 API
@@ -455,6 +530,8 @@ extension NoteEditError: LocalizedError {
             return "The page this note was anchored to is no longer available."
         case .annotationUnavailable:
             return "This note is no longer in the document."
+        case .conflictingIdentity:
+            return "This Shua note has conflicting group identity data. No thought was added."
         case .permissionDenied:
             return "This note is protected and cannot be changed."
         }
