@@ -16,6 +16,9 @@ public enum NoteEditError: Error, Equatable {
     case pageUnavailable
     /// The annotation is no longer attached to the page it was read from.
     case annotationUnavailable
+    /// Shua's persisted identity fields disagree or cannot be parsed. Appending
+    /// would risk overwriting the original group identity, so the operation is refused.
+    case conflictingIdentity
     /// ReadOnly, Locked, LockedContents or a document that forbids commenting.
     case permissionDenied
 }
@@ -331,6 +334,12 @@ extension PDFDocumentModel {
         guard NoteService.isShuaThought(group.annotation),
               document.allowsCommenting
         else { return .failure(.permissionDenied) }
+        if case .conflicting = NoteService.shuaThoughtGroupIdentityStatus(of: group.annotation) {
+            return .failure(.conflictingIdentity)
+        }
+        if NoteService.hasConflictingShuaIdentity(in: group) {
+            return .failure(.conflictingIdentity)
+        }
 
         let text = contents.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return .failure(.emptyContents) }
@@ -521,6 +530,8 @@ extension NoteEditError: LocalizedError {
             return "The page this note was anchored to is no longer available."
         case .annotationUnavailable:
             return "This note is no longer in the document."
+        case .conflictingIdentity:
+            return "This Shua note has conflicting group identity data. No thought was added."
         case .permissionDenied:
             return "This note is protected and cannot be changed."
         }

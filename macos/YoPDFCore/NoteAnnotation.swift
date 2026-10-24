@@ -116,6 +116,12 @@ struct GroupedThoughtPlan {
     let identityChanges: [ShuaThoughtIdentityChange]
 }
 
+enum ShuaThoughtGroupIdentityStatus: Equatable {
+    case identified(UUID)
+    case legacy
+    case conflicting
+}
+
 /// What the page overlay needs to draw one marker.
 ///
 /// `center` is the persisted anchor in page space; `bounds` is the fixed-size
@@ -594,6 +600,94 @@ public enum NoteService {
         ].compactMap { $0 }
         guard Set(anchorIDs).count <= 1 else { return nil }
         return anchorIDs.first
+    }
+
+    /// Distinguishes a genuinely identity-free legacy note from a note whose
+    /// persisted identity is malformed or disagrees across its PDF fields.
+    /// Only the former may be promoted to a new stable group identity.
+    static func shuaThoughtGroupIdentityStatus(
+        of annotation: PDFAnnotation
+    ) -> ShuaThoughtGroupIdentityStatus {
+        guard isTextAnnotation(annotation) else { return .conflicting }
+
+        let rawName = annotation.value(forAnnotationKey: .name)
+        let rawMetadata = annotation.value(forAnnotationKey: shuaThoughtMetadataKey)
+        let rawPersistedIdentity = annotation.value(forAnnotationKey: shuaIdentityPersistenceKey)
+        let rawPersistedAnchorID = annotation.value(forAnnotationKey: shuaAnchorPersistenceKey)
+        guard rawName != nil || rawMetadata != nil
+                || rawPersistedIdentity != nil || rawPersistedAnchorID != nil
+        else { return .legacy }
+
+        let namedIdentity: ShuaThoughtIdentity?
+        if rawName != nil {
+            guard let parsed = shuaThoughtIdentityFromName(of: annotation) else {
+                return .conflicting
+            }
+            namedIdentity = parsed
+        } else {
+            namedIdentity = nil
+        }
+
+        let metadata: ShuaThoughtMetadata?
+        if rawMetadata != nil {
+            guard let parsed = shuaThoughtMetadata(of: annotation) else {
+                return .conflicting
+            }
+            metadata = parsed
+        } else {
+            metadata = nil
+        }
+
+        let persistedIdentity: ShuaThoughtIdentity?
+        if rawPersistedIdentity != nil {
+            guard let parsed = shuaThoughtIdentityFromPersistence(of: annotation) else {
+                return .conflicting
+            }
+            persistedIdentity = parsed
+        } else {
+            persistedIdentity = nil
+        }
+
+        let persistedAnchorID: UUID?
+        if rawPersistedAnchorID != nil {
+            guard let raw = rawPersistedAnchorID as? String,
+                  let parsed = UUID(uuidString: raw)
+            else { return .conflicting }
+            persistedAnchorID = parsed
+        } else {
+            persistedAnchorID = nil
+        }
+
+        let fullIdentities = [namedIdentity, metadata?.identity, persistedIdentity].compactMap { $0 }
+        if fullIdentities.isEmpty {
+            // PDFKit drops `/NM` in some files. YoPDF's anchor-only cache is a
+            // complete group key even though it cannot restore thought order.
+            guard let persistedAnchorID,
+                  shuaAnchorID(of: annotation) == persistedAnchorID
+            else { return .conflicting }
+            return .identified(persistedAnchorID)
+        }
+        guard let firstIdentity = fullIdentities.first,
+              fullIdentities.dropFirst().allSatisfy({ $0 == firstIdentity })
+        else {
+            return .conflicting
+        }
+
+        let anchorIDs = fullIdentities.map(\.anchorID) + [persistedAnchorID].compactMap { $0 }
+        guard Set(anchorIDs).count == 1,
+              let anchorID = anchorIDs.first,
+              shuaAnchorID(of: annotation) == anchorID
+        else { return .conflicting }
+        return .identified(anchorID)
+    }
+
+    static func hasConflictingShuaIdentity(in selection: NoteSelection) -> Bool {
+        selection.threadEntries.contains { entry in
+            if case .conflicting = shuaThoughtGroupIdentityStatus(of: entry.annotation) {
+                return true
+            }
+            return false
+        }
     }
 
     /// Parses ShuaMac's embedded identity without changing the annotation.
@@ -1587,10 +1681,26 @@ public enum NoteService {
               page.document != nil
         else { return nil }
 
-        let anchorID = shuaAnchorID(of: group.annotation) ?? UUID()
+        let identityStatus = shuaThoughtGroupIdentityStatus(of: group.annotation)
+        let anchorID: UUID
+        let isLegacyGroup: Bool
+        switch identityStatus {
+        case let .identified(id):
+            anchorID = id
+            isLegacyGroup = false
+        case .legacy:
+            anchorID = UUID()
+            isLegacyGroup = true
+        case .conflicting:
+            return nil
+        }
         guard let members = orderedShuaMembers(for: group, anchorID: anchorID, on: page),
               !members.isEmpty
         else { return nil }
+        guard !members.contains(where: { member in
+            if case .conflicting = shuaThoughtGroupIdentityStatus(of: member) { return true }
+            return false
+        }) else { return nil }
 
         let crop = page.bounds(for: .cropBox)
         guard crop.minX.isFinite, crop.minY.isFinite,
@@ -1600,41 +1710,43 @@ public enum NoteService {
 
         let now = Date()
         var identityChanges: [ShuaThoughtIdentityChange] = []
-        var thoughtIDs = Set<UUID>()
-        for (order, member) in members.enumerated() {
-            let metadata = shuaThoughtMetadata(of: member)
-            let namedIdentity = shuaThoughtIdentityFromName(of: member)
-            let persistedIdentity = shuaThoughtIdentityFromPersistence(of: member)
-            let candidates = [
-                metadata?.identity.anchorID == anchorID ? metadata?.thoughtID : nil,
-                namedIdentity?.anchorID == anchorID ? namedIdentity?.thoughtID : nil,
-                persistedIdentity?.anchorID == anchorID ? persistedIdentity?.thoughtID : nil,
-            ].compactMap { $0 }
-            var thoughtID = candidates.first(where: { !thoughtIDs.contains($0) }) ?? UUID()
-            while thoughtIDs.contains(thoughtID) {
-                thoughtID = UUID()
-            }
-            thoughtIDs.insert(thoughtID)
+        if isLegacyGroup {
+            var thoughtIDs = Set<UUID>()
+            for (order, member) in members.enumerated() {
+                let metadata = shuaThoughtMetadata(of: member)
+                let namedIdentity = shuaThoughtIdentityFromName(of: member)
+                let persistedIdentity = shuaThoughtIdentityFromPersistence(of: member)
+                let candidates = [
+                    metadata?.identity.anchorID == anchorID ? metadata?.thoughtID : nil,
+                    namedIdentity?.anchorID == anchorID ? namedIdentity?.thoughtID : nil,
+                    persistedIdentity?.anchorID == anchorID ? persistedIdentity?.thoughtID : nil,
+                ].compactMap { $0 }
+                var thoughtID = candidates.first(where: { !thoughtIDs.contains($0) }) ?? UUID()
+                while thoughtIDs.contains(thoughtID) {
+                    thoughtID = UUID()
+                }
+                thoughtIDs.insert(thoughtID)
 
-            let before = shuaIdentitySnapshot(of: member)
-            guard var after = plannedShuaIdentitySnapshot(
-                for: member,
-                before: before,
-                anchorID: anchorID,
-                thoughtID: thoughtID,
-                thoughtOrder: order,
-                group: group,
-                markerCenter: group.center,
-                crop: crop,
-                modifiedAt: now
-            ) else { return nil }
-            if shuaIdentitySnapshotsDiffer(before, after) {
-                after.modificationDate = now
-                identityChanges.append(ShuaThoughtIdentityChange(
-                    annotation: member,
-                    from: before,
-                    to: after
-                ))
+                let before = shuaIdentitySnapshot(of: member)
+                guard var after = plannedShuaIdentitySnapshot(
+                    for: member,
+                    before: before,
+                    anchorID: anchorID,
+                    thoughtID: thoughtID,
+                    thoughtOrder: order,
+                    group: group,
+                    markerCenter: group.center,
+                    crop: crop,
+                    modifiedAt: now
+                ) else { return nil }
+                if shuaIdentitySnapshotsDiffer(before, after) {
+                    after.modificationDate = now
+                    identityChanges.append(ShuaThoughtIdentityChange(
+                        annotation: member,
+                        from: before,
+                        to: after
+                    ))
+                }
             }
         }
 
@@ -1655,7 +1767,7 @@ public enum NoteService {
         annotation.contents = text
         annotation.userName = "Shua"
         annotation.color = style.palette.color
-        annotation.modificationDate = Date()
+        annotation.modificationDate = now
         setStyle(style, on: annotation)
         setAnchor(group.center, on: annotation, page: page)
         setExcerpt(group.excerpt, on: annotation)
@@ -1667,7 +1779,9 @@ public enum NoteService {
         _ = annotation.setValue(shuaStyle, forAnnotationKey: shuaStickerStyleKey)
 
         let thoughtID = UUID()
-        let nextOrder = members.count
+        let currentMaxOrder = members.compactMap { shuaThoughtMetadata(of: $0)?.thoughtOrder }.max()
+        guard currentMaxOrder != Int.max else { return nil }
+        let nextOrder = currentMaxOrder.map { $0 + 1 } ?? members.count
         _ = annotation.setValue(
             "shua-thought:\(anchorID.uuidString):\(thoughtID.uuidString)",
             forAnnotationKey: .name
@@ -1679,7 +1793,9 @@ public enum NoteService {
             thoughtOrder: nextOrder,
             group: group,
             markerCenter: group.center,
-            crop: crop
+            crop: crop,
+            createdAt: now,
+            modifiedAt: now
         ) else { return nil }
         _ = annotation.setValue(metadata, forAnnotationKey: shuaThoughtMetadataKey)
 
@@ -1758,7 +1874,9 @@ public enum NoteService {
                 thoughtOrder: thoughtOrder,
                 group: group,
                 markerCenter: markerCenter,
-                crop: crop
+                crop: crop,
+                createdAt: annotation.modificationDate ?? modifiedAt,
+                modifiedAt: annotation.modificationDate ?? modifiedAt
             ) else { return nil }
             metadata = updated
         }
@@ -1779,9 +1897,10 @@ public enum NoteService {
         thoughtOrder: Int,
         group: NoteSelection,
         markerCenter: CGPoint,
-        crop: CGRect
+        crop: CGRect,
+        createdAt: Date,
+        modifiedAt: Date
     ) -> String? {
-        let timestamp = Date().timeIntervalSinceReferenceDate
         var payload: [String: Any]
         if let source,
            let raw = source.value(forAnnotationKey: shuaThoughtMetadataKey) as? String,
@@ -1818,8 +1937,8 @@ public enum NoteService {
         payload["version"] = 1
         payload["thoughtID"] = thoughtID.uuidString
         payload["thoughtOrder"] = thoughtOrder
-        if payload["createdAt"] == nil { payload["createdAt"] = timestamp }
-        payload["modifiedAt"] = timestamp
+        payload["createdAt"] = createdAt.timeIntervalSinceReferenceDate
+        payload["modifiedAt"] = modifiedAt.timeIntervalSinceReferenceDate
 
         guard JSONSerialization.isValidJSONObject(payload),
               let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
