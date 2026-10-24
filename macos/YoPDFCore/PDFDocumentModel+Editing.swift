@@ -68,6 +68,8 @@ final class AutoSaveWorkCompletion: @unchecked Sendable {
     private var writeHasStarted = false
     private var wasCancelledBeforeWrite = false
 
+    var didStartWrite: Bool { lock.withLock { writeHasStarted } }
+
     /// Resolves the Save As/close race at a single boundary: if cancellation
     /// wins before this point, the worker will not touch the original file. If
     /// the write already started, callers wait for its coordinated transaction.
@@ -218,6 +220,16 @@ extension PDFDocumentModel {
     /// groups related UI changes (for example, dragging a note marker or
     /// choosing a custom colour) into one safe file replacement.
     func scheduleAutoSave() {
+        if autoSavePauseDepth > 0 {
+            autoSaveShouldResumeAfterPause = true
+            autoSaveTask?.cancel()
+            autoSaveTask = nil
+            autoSaveGeneration &+= 1
+            autoSaveStatus = .pending
+            lastAutoSaveOutcome = nil
+            return
+        }
+
         autoSaveTask?.cancel()
         autoSaveGeneration &+= 1
         let generation = autoSaveGeneration
@@ -237,6 +249,40 @@ extension PDFDocumentModel {
                 scheduledRevision: scheduledRevision
             )
         }
+    }
+
+    /// Runs a synchronous modal workflow while pausing the pending debounce.
+    /// An in-flight write is allowed to finish; a pending write resumes after
+    /// the workflow only if the document is still dirty.
+    public func withAutoSavePaused<T>(_ operation: () throws -> T) rethrows -> T {
+        pauseAutoSave()
+        defer { resumeAutoSave() }
+        return try operation()
+    }
+
+    func pauseAutoSave() {
+        autoSavePauseDepth += 1
+        guard autoSavePauseDepth == 1 else { return }
+
+        autoSaveShouldResumeAfterPause = autoSaveStatus == .pending
+        if autoSaveStatus == .pending {
+            autoSaveGeneration &+= 1
+            autoSaveTask?.cancel()
+            autoSaveTask = nil
+            autoSaveStatus = .idle
+        }
+    }
+
+    func resumeAutoSave() {
+        guard autoSavePauseDepth > 0 else { return }
+        autoSavePauseDepth -= 1
+        guard autoSavePauseDepth == 0 else { return }
+
+        let shouldResume = autoSaveShouldResumeAfterPause
+        autoSaveShouldResumeAfterPause = false
+        guard shouldResume, hasUnsavedChanges else { return }
+        if case .failed = autoSaveStatus { return }
+        scheduleAutoSave()
     }
 
     private func performAutomaticSave(generation: Int, scheduledRevision: Int) async {

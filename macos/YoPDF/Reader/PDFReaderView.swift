@@ -651,7 +651,8 @@ struct PDFReaderView: View {
         panel.allowedContentTypes = [.pdf]
         panel.canCreateDirectories = true
         panel.nameFieldStringValue = model.fileURL?.lastPathComponent ?? "\(model.title).pdf"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let response = model.withAutoSavePaused { panel.runModal() }
+        guard response == .OK, let url = panel.url else { return }
         present(model.saveAs(to: url, overwrite: true))
     }
 

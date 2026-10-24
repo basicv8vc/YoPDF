@@ -126,6 +126,10 @@ public final class PDFDocumentModel: ObservableObject {
     var autoSaveWorkTask: Task<SaveOutcome, Never>?
     var autoSaveWorkGeneration: Int?
     var autoSaveWorkCompletion: AutoSaveWorkCompletion?
+    /// Nested modal workflows can pause a pending debounce and resume it once
+    /// the panel is dismissed. In-flight writes are allowed to finish.
+    var autoSavePauseDepth = 0
+    var autoSaveShouldResumeAfterPause = false
     /// The production delay is 750 ms. Tests shorten it to cover debounce
     /// scheduling without paying the user-facing interval for each scenario.
     var autoSaveDebounceNanoseconds: UInt64 = 750_000_000
@@ -191,12 +195,22 @@ public final class PDFDocumentModel: ObservableObject {
             return false
         }
 
+        let reopeningCurrentFile = fileURL?.standardizedFileURL == url.standardizedFileURL
+        if reopeningCurrentFile {
+            pauseAutoSave()
+        }
+        defer {
+            if reopeningCurrentFile {
+                resumeAutoSave()
+            }
+        }
+
         // Phase 1: acquire access and record the initial version. The store
         // acquires the scope before touching the file: a security-scoped URL
         // must be opened before any access, including an existence check,
         // because in a sandboxed build `fileExists` on an unopened URL can
         // fail even when the file is there.
-        let candidate: DocumentSession
+        var candidate: DocumentSession
         do {
             candidate = try store.open(url)
         } catch let error as DocumentStoreError {
@@ -208,7 +222,7 @@ public final class PDFDocumentModel: ObservableObject {
         }
 
         // Phase 2: validate while the candidate access is still active.
-        guard let opened = PDFDocument(url: url) else {
+        guard var opened = PDFDocument(url: url) else {
             candidate.close()
             lastError = .unreadable
             return false
@@ -223,7 +237,37 @@ public final class PDFDocumentModel: ObservableObject {
         // previous document, then release its scope only after any already
         // running file operation has ended.
         cancelPendingAutoSave(cancelInFlightWork: discardingUnsavedChanges)
+        let automaticWriteWasStarted = autoSaveWorkCompletion?.didStartWrite ?? false
         waitForAutoSaveWork()
+
+        // If the old worker committed while the candidate was being loaded,
+        // that candidate and its session captured the previous file version.
+        // Reopen both after the worker has stopped so the installed document
+        // and session always describe the same bytes.
+        if reopeningCurrentFile, automaticWriteWasStarted {
+            candidate.close()
+            do {
+                candidate = try store.open(url)
+            } catch let error as DocumentStoreError {
+                lastError = Self.loadError(from: error)
+                return false
+            } catch {
+                lastError = .unreadable
+                return false
+            }
+
+            guard let refreshed = PDFDocument(url: url) else {
+                candidate.close()
+                lastError = .unreadable
+                return false
+            }
+            guard refreshed.pageCount > 0 else {
+                candidate.close()
+                lastError = .emptyDocument
+                return false
+            }
+            opened = refreshed
+        }
 
         // Swap first, then release the previous scope, so the
         // model is never left without access to the document it displays.
@@ -238,6 +282,8 @@ public final class PDFDocumentModel: ObservableObject {
     public func close() {
         cancelPendingAutoSave(cancelInFlightWork: true)
         waitForAutoSaveWork()
+        autoSavePauseDepth = 0
+        autoSaveShouldResumeAfterPause = false
         documentSession?.close()
         documentSession = nil
         document = nil

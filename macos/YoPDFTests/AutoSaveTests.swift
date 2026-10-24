@@ -152,6 +152,76 @@ final class AutoSaveTests: XCTestCase {
         XCTAssertEqual(model.fileURL, copy)
     }
 
+    func testSaveAsPanelPausesPendingAutomaticSaveUntilDismissed() async throws {
+        let url = try makeFixture()
+        let io = ScriptedDocumentStoreIO()
+        let model = makeModel(io: io, debounce: 30_000_000)
+        XCTAssertTrue(model.open(url: url))
+        try addHighlight(to: model)
+
+        let response = model.withAutoSavePaused {
+            let deadline = Date().addingTimeInterval(0.2)
+            while Date() < deadline {
+                _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+            }
+            return NSApplication.ModalResponse.cancel
+        }
+
+        XCTAssertEqual(response, .cancel)
+        XCTAssertEqual(io.replacementCount, 0, "the panel's nested event loop must not write the source")
+        XCTAssertTrue(model.hasUnsavedChanges)
+        await assertSaved(model)
+        XCTAssertEqual(io.replacementCount, 1, "cancelling the panel resumes the pending debounce")
+    }
+
+    func testReopeningSameFileAfterInFlightAutosaveRefreshesSessionVersion() async throws {
+        let url = try makeFixture()
+        let gate = AutoSaveGate()
+        let model = makeModel(io: AutoSaveBlockingIO(gate: gate), debounce: 30_000_000)
+        XCTAssertTrue(model.open(url: url))
+        try addHighlight(to: model)
+        await waitUntilEntered(gate)
+
+        let releaser = Task.detached {
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            gate.release()
+        }
+        XCTAssertTrue(model.open(url: url, discardingUnsavedChanges: true))
+        await releaser.value
+
+        XCTAssertFalse(model.hasUnsavedChanges)
+        XCTAssertEqual(annotationCount(inFileAt: url), 1, "reopen installs the bytes committed by the old worker")
+        try addUnderline(to: model, from: 20, to: 36)
+        await assertSaved(model)
+        XCTAssertEqual(annotationCount(inFileAt: url), 2, "the refreshed session accepts a later save")
+    }
+
+    func testSaveAsWaitsForSlowInFlightAutosaveBeforeCopying() async throws {
+        let original = try makeFixture(named: "slow-original")
+        let copy = original.deletingLastPathComponent().appendingPathComponent("slow-copy.pdf")
+        temporaryFiles.append(copy)
+        let gate = AutoSaveGate()
+        let model = makeModel(io: AutoSaveBlockingIO(gate: gate), debounce: 30_000_000)
+        XCTAssertTrue(model.open(url: original))
+        try addHighlight(to: model)
+        await waitUntilEntered(gate)
+
+        let releaser = Task.detached {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            gate.release()
+        }
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        let outcome = model.saveAs(to: copy)
+        let elapsed = ProcessInfo.processInfo.systemUptime - startedAt
+        await releaser.value
+
+        XCTAssertEqual(outcome, .saved)
+        print(String(format: "[autosave-slow-io] Save As waited %.3fs for the in-flight write", elapsed))
+        XCTAssertGreaterThanOrEqual(elapsed, 0.15, "Save As waits for the blocked coordinated write")
+        XCTAssertEqual(annotationCount(inFileAt: original), 1)
+        XCTAssertEqual(annotationCount(inFileAt: copy), 1)
+    }
+
     func testSwitchAndCloseCancelPendingDebounce() async throws {
         let first = try makeFixture(named: "first")
         let second = try makeFixture(named: "second")
@@ -352,6 +422,18 @@ final class AutoSaveTests: XCTestCase {
         XCTAssertEqual(outcome, .saved, file: file, line: line)
     }
 
+    private func waitUntilEntered(
+        _ gate: AutoSaveGate,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        for _ in 0..<500 {
+            if gate.isEntered { return }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTFail("the automatic save did not enter its blocked I/O operation", file: file, line: line)
+    }
+
     private func annotationCount(inFileAt url: URL) -> Int {
         PDFDocument(url: url)?.page(at: 0)?.annotations.count ?? -1
     }
@@ -363,11 +445,19 @@ private final class AutoSaveGate: @unchecked Sendable {
     private let lock = NSLock()
     private var hasEntered = false
     private var hasReleased = false
+    private var hasBlocked = false
 
+    var isEntered: Bool { lock.withLock { hasEntered } }
     var isReleased: Bool { lock.withLock { hasReleased } }
 
     func pause() {
-        lock.withLock { hasEntered = true }
+        let shouldBlock = lock.withLock {
+            hasEntered = true
+            guard !hasBlocked, !hasReleased else { return false }
+            hasBlocked = true
+            return true
+        }
+        guard shouldBlock else { return }
         entered.signal()
         releaseSignal.wait()
     }
@@ -377,8 +467,12 @@ private final class AutoSaveGate: @unchecked Sendable {
     }
 
     func release() {
-        lock.withLock { hasReleased = true }
-        releaseSignal.signal()
+        let shouldSignal = lock.withLock {
+            guard !hasReleased else { return false }
+            hasReleased = true
+            return true
+        }
+        if shouldSignal { releaseSignal.signal() }
     }
 }
 

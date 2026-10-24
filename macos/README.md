@@ -52,7 +52,7 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (302)
+./scripts/test.sh                     # unit tests (305)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
@@ -211,8 +211,9 @@ note. ⌘S and the Save button remain available for an immediate save.
   private snapshot on a utility worker for Shua metadata preservation, PDF
   serialization, the coordinated `DocumentSession` write and reopen check. The
   displayed document and its annotation objects stay in place for Undo and Redo.
-- Save As during the 750 ms debounce cancels that pending checkpoint and writes
-  the current edits to the chosen copy, leaving the source unchanged. If an
+- The Save As panel pauses a pending 750 ms debounce. Cancelling the panel
+  resumes automatic saving; choosing a destination cancels that checkpoint and
+  writes the current edits to the copy, leaving the source unchanged. If an
   automatic save has already entered `DocumentSession.save`, it completes first;
   Save As then writes the same edits to the destination.
 - `PDFDocumentModel.save()` serialises the document with PDFKit and hands the
