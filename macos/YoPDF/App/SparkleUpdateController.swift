@@ -1,57 +1,152 @@
 import Combine
 import Foundation
 import Sparkle
+import YoPDFCore
 
-/// Owns Sparkle for the lifetime of the app and keeps the menu item in sync
-/// with whether Sparkle can start a user-initiated update check.
+/// Owns Sparkle for the lifetime of the app and keeps the manual menu item and
+/// all window titlebar reminders in sync.
 @MainActor
-final class SparkleUpdateController: ObservableObject {
+final class SparkleUpdateController: NSObject, ObservableObject, SPUUpdaterDelegate,
+    @preconcurrency SPUStandardUserDriverDelegate {
+
+    static let shared = SparkleUpdateController()
 
     @Published private(set) var canCheckForUpdates = false
 
-    private let controller: SPUStandardUpdaterController
+    let reminder = GentleUpdateReminder()
 
-    init() {
-        let isConfigured = Self.hasSignedFeedConfiguration
-        controller = SPUStandardUpdaterController(
-            startingUpdater: isConfigured,
-            updaterDelegate: nil,
-            userDriverDelegate: nil
-        )
+    private let isConfigured: Bool
+    private lazy var controller = SPUStandardUpdaterController(
+        startingUpdater: isConfigured,
+        updaterDelegate: self,
+        userDriverDelegate: self
+    )
 
-        guard isConfigured else { return }
+    var updater: SPUUpdater {
+        controller.updater
+    }
+
+    override private init() {
+        isConfigured = Self.hasSignedFeedConfiguration
+        super.init()
+
+#if DEBUG
+        // Lets a local Debug build preview the titlebar across real windows
+        // without requiring a production Sparkle feed.
+        let previewPrefix = "--yopdf-preview-update="
+        if let argument = ProcessInfo.processInfo.arguments.first(where: {
+            $0.hasPrefix(previewPrefix)
+        }) {
+            let version = String(argument.dropFirst(previewPrefix.count))
+            if !version.isEmpty {
+                reminder.didFindValidUpdate(version: version)
+            }
+        }
+#endif
 
         let updater = controller.updater
+        guard isConfigured else { return }
+
         canCheckForUpdates = updater.canCheckForUpdates
         updater.publisher(for: \.canCheckForUpdates)
             .assign(to: &$canCheckForUpdates)
+
+        scheduleInitialUpdateProbe()
     }
 
     func checkForUpdates() {
-        guard Self.hasSignedFeedConfiguration, canCheckForUpdates else { return }
-        controller.updater.checkForUpdates()
+        SparkleUpdateCheck.runIfAvailable(
+            isConfigured: isConfigured,
+            canCheckForUpdates: canCheckForUpdates
+        ) { [updater] in
+            updater.checkForUpdates()
+        }
+    }
+
+    /// Shows Sparkle's standard UI for an update already represented in the
+    /// titlebar. Sparkle remains responsible for the session and installer.
+    func showUpdate() {
+        SparkleUpdateCheck.runIfAvailable(
+            isConfigured: isConfigured,
+            canCheckForUpdates: updater.canCheckForUpdates
+        ) { [updater] in
+            updater.checkForUpdates()
+        }
     }
 
     private static var hasSignedFeedConfiguration: Bool {
-        guard
-            let feedString = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String,
-            let publicKey = Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") as? String
-        else {
-            return false
-        }
+        SignedSparkleFeedConfiguration.isValid(
+            feedURL: Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String,
+            publicKey: Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") as? String
+        )
+    }
 
-        let feed = feedString.trimmingCharacters(in: .whitespacesAndNewlines)
-        let key = publicKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard
-            let feedURL = URL(string: feed),
-            feedURL.scheme?.lowercased() == "https",
-            feedURL.host != nil,
-            let decodedKey = Data(base64Encoded: key),
-            decodedKey.count == 32
-        else {
-            return false
-        }
+    private func scheduleInitialUpdateProbe(attempt: Int = 0) {
+        guard attempt < 5 else { return }
 
-        return true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+
+            guard let self, self.updater.automaticallyChecksForUpdates else { return }
+
+            if self.updater.sessionInProgress {
+                self.scheduleInitialUpdateProbe(attempt: attempt + 1)
+            } else {
+                self.updater.checkForUpdateInformation()
+            }
+        }
+    }
+
+    // MARK: SPUUpdaterDelegate
+
+    func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
+        reminder.didFindValidUpdate(version: item.displayVersionString)
+    }
+
+    func updaterDidNotFindUpdate(_ updater: SPUUpdater) {
+        reminder.didNotFindUpdate()
+    }
+
+    func updater(
+        _ updater: SPUUpdater,
+        userDidMake choice: SPUUserUpdateChoice,
+        forUpdate item: SUAppcastItem,
+        state: SPUUserUpdateState
+    ) {
+        switch choice {
+        case .install:
+            reminder.userDidMake(.install, forVersion: item.displayVersionString)
+        case .skip:
+            reminder.userDidMake(.skip, forVersion: item.displayVersionString)
+        case .dismiss:
+            reminder.userDidMake(.dismiss, forVersion: item.displayVersionString)
+        @unknown default:
+            reminder.userDidMake(.other, forVersion: item.displayVersionString)
+        }
+    }
+
+    // MARK: SPUStandardUserDriverDelegate
+
+    var supportsGentleScheduledUpdateReminders: Bool {
+        reminder.supportsGentleScheduledUpdateReminders
+    }
+
+    func standardUserDriverShouldHandleShowingScheduledUpdate(
+        _ update: SUAppcastItem,
+        andInImmediateFocus immediateFocus: Bool
+    ) -> Bool {
+        reminder.shouldHandleShowingScheduledUpdate()
+    }
+
+    func standardUserDriverWillHandleShowingUpdate(
+        _ handleShowingUpdate: Bool,
+        forUpdate update: SUAppcastItem,
+        state: SPUUserUpdateState
+    ) {
+        reminder.willHandleShowingUpdate(version: update.displayVersionString)
+    }
+
+    func standardUserDriverWillFinishUpdateSession() {
+        reminder.updateSessionWillFinish()
     }
 }

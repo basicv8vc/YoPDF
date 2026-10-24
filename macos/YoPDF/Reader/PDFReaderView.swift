@@ -7,6 +7,7 @@ import YoPDFCore
 struct PDFReaderView: View {
 
     @ObservedObject var model: PDFDocumentModel
+    @ObservedObject var updateController: SparkleUpdateController
 
     @State private var isImporterPresented = false
     @State private var isDropTargeted = false
@@ -183,6 +184,12 @@ struct PDFReaderView: View {
                 },
                 onUnsavedChanges: handleCloseIntent
             )
+        )
+        .background(
+            TitlebarUpdateIndicatorInstaller(updateController: updateController)
+                .frame(width: 0, height: 0)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
         )
         .alert(
             prompt?.title ?? "",

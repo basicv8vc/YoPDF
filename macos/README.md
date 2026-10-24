@@ -67,8 +67,11 @@ reproducible and easy to inspect.
 
 The macOS app links Sparkle 2.10.0. It checks the configured signed appcast on
 Sparkle's normal schedule and adds **Check for Updates…** to the YoPDF menu.
-Sparkle shows its standard update dialog and downloads an update after the user
-chooses to install it. Both `SUAutomaticallyUpdate` and
+Scheduled update alerts are represented by a small native titlebar indicator
+in each open PDF window; clicking it opens Sparkle's standard update dialog.
+Dismiss keeps the reminder available, while installing or skipping clears it.
+Sparkle downloads an update only after the user chooses to install it. Both
+`SUAutomaticallyUpdate` and
 `SUAllowsAutomaticUpdates` are false, so Sparkle cannot install an update
 automatically.
 
@@ -80,6 +83,10 @@ in the release environment before running
 `CONFIGURATION=Release ./scripts/build.sh`. The feed and update archives must
 be signed with the matching private key. Keep that key in a secure developer
 key store; never add it to the repository or pass it to the build.
+
+A Debug build can preview the titlebar indicator without a feed by launching
+with `--yopdf-preview-update=99.0.0`. The indicator remains disabled until
+Sparkle reports that an update check can start.
 
 YoPDF currently has no production appcast or Sparkle key configured. Its
 existing ad-hoc signing setup is for local development; public distribution
