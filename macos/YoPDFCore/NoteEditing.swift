@@ -317,8 +317,9 @@ extension PDFDocumentModel {
         return .success(selection)
     }
 
-    /// Adds one thought to an existing ShuaMac group at the same sticker
-    /// anchor, preserving the group's identity and ordering for both readers.
+    /// Adds one thought to a Shua thread, including a thread that currently has
+    /// only one visible thought. Legacy geometry stacks are promoted to stable
+    /// embedded identity in the same undoable edit as the new annotation.
     @discardableResult
     public func addThought(
         to group: NoteSelection,
@@ -327,7 +328,7 @@ extension PDFDocumentModel {
     ) -> Result<NoteSelection, NoteEditError> {
         guard let document else { return .failure(.noDocument) }
         guard isAttached(group) else { return .failure(.annotationUnavailable) }
-        guard group.groupCount > 1,
+        guard NoteService.isShuaThought(group.annotation),
               document.allowsCommenting
         else { return .failure(.permissionDenied) }
 
@@ -336,15 +337,23 @@ extension PDFDocumentModel {
         guard let page = document.page(at: group.pageIndex), page.document === document else {
             return .failure(.pageUnavailable)
         }
-        guard let annotation = NoteService.groupedThoughtAnnotation(
+        guard let plan = NoteService.groupedThoughtPlan(
             for: group,
             contents: text,
             style: style,
             on: page
         ) else { return .failure(.annotationUnavailable) }
 
-        let edit = MarkupEdit(changes: [
-            .insert(annotation: annotation, pageIndex: group.pageIndex)
+        let identityChanges = plan.identityChanges.map {
+            MarkupEditChange.setShuaThoughtIdentity(
+                annotation: $0.annotation,
+                pageIndex: group.pageIndex,
+                from: $0.from,
+                to: $0.to
+            )
+        }
+        let edit = MarkupEdit(changes: identityChanges + [
+            .insert(annotation: plan.annotation, pageIndex: group.pageIndex),
         ])
         guard performMarkupEdit(edit) else { return .failure(.permissionDenied) }
 

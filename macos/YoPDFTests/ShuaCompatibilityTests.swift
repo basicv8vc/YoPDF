@@ -13,7 +13,7 @@ final class ShuaCompatibilityTests: XCTestCase {
 
     nonisolated(unsafe) private var temporaryFiles: [URL] = []
 
-    private struct Region: Codable {
+    private struct Region: Codable, Equatable {
         let pageIndex: Int
         let x: Double
         let y: Double
@@ -134,6 +134,49 @@ final class ShuaCompatibilityTests: XCTestCase {
 
     private func textAnnotations(on page: PDFPage) -> [PDFAnnotation] {
         page.annotations.filter { NoteService.isTextAnnotation($0) }
+    }
+
+    @discardableResult
+    private func addLegacyShuaThought(
+        to page: PDFPage,
+        anchorID: UUID,
+        order: Int,
+        x: CGFloat,
+        y: CGFloat,
+        contents: String,
+        style: NoteStickerStyle = NoteStickerStyle(motif: .cat, palette: .honey),
+        size: CGFloat = 20
+    ) throws -> PDFAnnotation {
+        let note = try addShuaThought(
+            to: page,
+            anchorID: anchorID,
+            order: order,
+            x: x,
+            y: y,
+            contents: contents,
+            size: size,
+            style: style
+        )
+        note.removeValue(forAnnotationKey: .name)
+        note.removeValue(forAnnotationKey: Self.shuaThoughtMetadataKey)
+        note.removeValue(forAnnotationKey: Self.yoPDFShuaIdentityKey)
+        note.removeValue(forAnnotationKey: Self.yoPDFShuaAnchorKey)
+        return note
+    }
+
+    private func markerSelection(in model: PDFDocumentModel) throws -> NoteSelection {
+        let marker = try XCTUnwrap(model.noteMarkers.first)
+        let page = try XCTUnwrap(model.document?.page(at: marker.pageIndex))
+        return try XCTUnwrap(model.noteSelection(at: marker.center, on: page))
+    }
+
+    private func thoughtMetadata(on page: PDFPage) throws -> [ThoughtMetadata] {
+        try textAnnotations(on: page).map { annotation in
+            let raw = try XCTUnwrap(
+                annotation.value(forAnnotationKey: Self.shuaThoughtMetadataKey) as? String
+            )
+            return try JSONDecoder().decode(ThoughtMetadata.self, from: Data(raw.utf8))
+        }.sorted { $0.thoughtOrder < $1.thoughtOrder }
     }
 
     private func markerPosition(in annotation: PDFAnnotation) throws -> Point {
@@ -848,5 +891,229 @@ final class ShuaCompatibilityTests: XCTestCase {
             try JSONDecoder().decode(ThoughtMetadata.self, from: Data(persistedMetadata.utf8)).anchor.id,
             anchorID
         )
+    }
+
+    func testSingleIdentityBackedThoughtCanBeAppendedAndRoundTrips() throws {
+        let url = try makeFixture(named: "shua-single-append")
+        let source = try XCTUnwrap(PDFDocument(url: url))
+        let page = try XCTUnwrap(source.page(at: 0))
+        let anchorID = UUID()
+        _ = try addShuaThought(
+            to: page,
+            anchorID: anchorID,
+            order: 0,
+            x: 300,
+            y: 620,
+            contents: "First thought"
+        )
+        try write(source, to: url)
+
+        let model = openModel(at: url)
+        let single = try markerSelection(in: model)
+        XCTAssertEqual(single.groupCount, 1)
+        XCTAssertTrue(NoteService.isShuaThought(single.annotation))
+        let secondStyle = NoteStickerStyle(motif: .shiba, palette: .mint)
+        guard case .success = model.addThought(
+            to: single,
+            contents: "Second thought",
+            style: secondStyle
+        ) else {
+            return XCTFail("a single Shua thought should accept another thought")
+        }
+
+        XCTAssertEqual(model.noteMarkers.map(\.count), [2])
+        XCTAssertEqual(model.noteMarkers.first?.threadContents, ["First thought", "Second thought"])
+        XCTAssertEqual(model.noteMarkers.first?.threadEntries.map(\.style), [
+            NoteStickerStyle(motif: .cat, palette: .honey), secondStyle,
+        ])
+        XCTAssertTrue(model.undoMarkup())
+        XCTAssertEqual(model.noteMarkers.map(\.count), [1])
+        XCTAssertTrue(model.redoMarkup())
+        XCTAssertEqual(model.noteMarkers.map(\.count), [2])
+        XCTAssertEqual(model.save(), .saved)
+
+        let reopened = openModel(at: url)
+        XCTAssertEqual(reopened.noteMarkers.map(\.count), [2])
+        XCTAssertEqual(reopened.noteMarkers.first?.threadContents, ["First thought", "Second thought"])
+        XCTAssertEqual(reopened.noteMarkers.first?.threadEntries.map(\.style), [
+            NoteStickerStyle(motif: .cat, palette: .honey), secondStyle,
+        ])
+        let reopenedPage = try XCTUnwrap(reopened.document?.page(at: 0))
+        let metadata = try thoughtMetadata(on: reopenedPage)
+        XCTAssertEqual(metadata.map(\.anchor.id), [anchorID, anchorID])
+        XCTAssertEqual(metadata.map(\.thoughtOrder), [0, 1])
+        XCTAssertEqual(Set(metadata.map(\.thoughtID)).count, 2)
+    }
+
+    func testLegacyGroupPromotesIdentityBeforeAppendingDifferentStyleAndUndoRedo() throws {
+        let url = try makeFixture(named: "shua-legacy-restyled-append")
+        let source = try XCTUnwrap(PDFDocument(url: url))
+        let page = try XCTUnwrap(source.page(at: 0))
+        let legacyAnchor = UUID()
+        let originalStyle = NoteStickerStyle(motif: .cat, palette: .honey)
+        _ = try addLegacyShuaThought(
+            to: page,
+            anchorID: legacyAnchor,
+            order: 0,
+            x: 300,
+            y: 620,
+            contents: "Legacy one",
+            style: originalStyle
+        )
+        _ = try addLegacyShuaThought(
+            to: page,
+            anchorID: legacyAnchor,
+            order: 1,
+            x: 300,
+            y: 597,
+            contents: "Legacy two",
+            style: originalStyle
+        )
+        try write(source, to: url)
+
+        let model = openModel(at: url)
+        XCTAssertEqual(model.noteMarkers.map(\.count), [2])
+        let group = try markerSelection(in: model)
+        let thirdStyle = NoteStickerStyle(motif: .washi, palette: .rose)
+        guard case .success = model.addThought(
+            to: group,
+            contents: "Newly styled thought",
+            style: thirdStyle
+        ) else {
+            return XCTFail("the legacy Shua stack should accept a differently styled thought")
+        }
+
+        let promoted = try XCTUnwrap(model.noteMarkers.first)
+        XCTAssertEqual(promoted.count, 3)
+        XCTAssertEqual(promoted.threadContents, ["Legacy one", "Legacy two", "Newly styled thought"])
+        XCTAssertEqual(promoted.threadEntries.map(\.style), [originalStyle, originalStyle, thirdStyle])
+        let modelPage = try XCTUnwrap(model.document?.page(at: 0))
+        let promotedNotes = textAnnotations(on: modelPage)
+        let anchorIDs = promotedNotes.compactMap(NoteService.shuaAnchorID(of:))
+        XCTAssertEqual(anchorIDs.count, 3)
+        XCTAssertEqual(Set(anchorIDs).count, 1)
+
+        XCTAssertTrue(model.undoMarkup())
+        XCTAssertEqual(model.noteMarkers.map(\.count), [2])
+        XCTAssertTrue(textAnnotations(on: modelPage).allSatisfy {
+            NoteService.shuaAnchorID(of: $0) == nil
+                && $0.value(forAnnotationKey: Self.shuaThoughtMetadataKey) == nil
+                && $0.value(forAnnotationKey: .name) == nil
+        }, "Undo restores the original geometry-only Shua stack")
+
+        XCTAssertTrue(model.redoMarkup())
+        XCTAssertEqual(model.noteMarkers.map(\.count), [3])
+        XCTAssertEqual(model.save(), .saved)
+
+        let reopened = openModel(at: url)
+        XCTAssertEqual(reopened.noteMarkers.map(\.count), [3])
+        XCTAssertEqual(reopened.noteMarkers.first?.threadContents, [
+            "Legacy one", "Legacy two", "Newly styled thought",
+        ])
+        XCTAssertEqual(reopened.noteMarkers.first?.threadEntries.map(\.style), [
+            originalStyle, originalStyle, thirdStyle,
+        ])
+        let reopenedMetadata = try thoughtMetadata(on: XCTUnwrap(reopened.document?.page(at: 0)))
+        XCTAssertEqual(reopenedMetadata.map(\.thoughtOrder), [0, 1, 2])
+        XCTAssertEqual(Set(reopenedMetadata.map(\.anchor.id)).count, 1)
+        XCTAssertTrue(reopenedMetadata.allSatisfy { $0.anchor.regions.count == 1 })
+        XCTAssertEqual(reopenedMetadata.map { $0.anchor.regions[0].pageIndex }, [0, 0, 0])
+        XCTAssertTrue(reopenedMetadata.allSatisfy { $0.anchor.isPageLevel })
+    }
+
+    func testLegacyGroupAtCropBoxBottomKeepsIdentityAfterAppend() throws {
+        let url = try makeFixture(named: "shua-legacy-bottom-append")
+        let source = try XCTUnwrap(PDFDocument(url: url))
+        let page = try XCTUnwrap(source.page(at: 0))
+        let crop = page.bounds(for: .cropBox)
+        let legacyAnchor = UUID()
+        let originalStyle = NoteStickerStyle(motif: .cat, palette: .honey)
+        _ = try addLegacyShuaThought(
+            to: page,
+            anchorID: legacyAnchor,
+            order: 0,
+            x: 300,
+            y: crop.minY + 23,
+            contents: "Bottom group one",
+            style: originalStyle
+        )
+        _ = try addLegacyShuaThought(
+            to: page,
+            anchorID: legacyAnchor,
+            order: 1,
+            x: 300,
+            y: crop.minY,
+            contents: "Bottom group two",
+            style: originalStyle
+        )
+        try write(source, to: url)
+
+        let model = openModel(at: url)
+        XCTAssertEqual(model.noteMarkers.map(\.count), [2])
+        let group = try markerSelection(in: model)
+        let thirdStyle = NoteStickerStyle(motif: .flower, palette: .sky)
+        guard case .success = model.addThought(
+            to: group,
+            contents: "At the page edge",
+            style: thirdStyle
+        ) else {
+            return XCTFail("a bottom-edge legacy group should accept another thought")
+        }
+
+        XCTAssertEqual(model.noteMarkers.map(\.count), [3])
+        let metadata = try thoughtMetadata(on: XCTUnwrap(model.document?.page(at: 0)))
+        XCTAssertEqual(metadata.map(\.thoughtOrder), [0, 1, 2])
+        XCTAssertEqual(Set(metadata.map(\.anchor.id)).count, 1)
+        XCTAssertEqual(model.save(), .saved)
+
+        let reopened = openModel(at: url)
+        XCTAssertEqual(reopened.noteMarkers.map(\.count), [3])
+        XCTAssertEqual(reopened.noteMarkers.first?.threadContents, [
+            "Bottom group one", "Bottom group two", "At the page edge",
+        ])
+    }
+
+    func testDeletingThreadToOneThoughtStillAllowsAppending() throws {
+        let url = try makeFixture(named: "shua-delete-to-single-append")
+        let source = try XCTUnwrap(PDFDocument(url: url))
+        let page = try XCTUnwrap(source.page(at: 0))
+        let anchorID = UUID()
+        for order in 0..<2 {
+            _ = try addShuaThought(
+                to: page,
+                anchorID: anchorID,
+                order: order,
+                x: 300,
+                y: CGFloat(620 - order * 23),
+                contents: "Thought \(order + 1)"
+            )
+        }
+        try write(source, to: url)
+
+        let model = openModel(at: url)
+        let thread = try markerSelection(in: model)
+        let lastEntry = try XCTUnwrap(thread.threadEntries.last)
+        let lastThought = try XCTUnwrap(model.noteSelection(forThreadEntry: lastEntry, in: thread))
+        XCTAssertTrue(model.deleteNote(lastThought))
+        XCTAssertEqual(model.noteMarkers.map(\.count), [1])
+
+        let single = try markerSelection(in: model)
+        XCTAssertEqual(single.groupCount, 1)
+        XCTAssertTrue(NoteService.isShuaThought(single.annotation))
+        guard case .success = model.addThought(
+            to: single,
+            contents: "A replacement second thought",
+            style: NoteStickerStyle(motif: .shiba, palette: .mint)
+        ) else {
+            return XCTFail("a thread reduced to one thought should accept another thought")
+        }
+
+        XCTAssertEqual(model.noteMarkers.map(\.count), [2])
+        XCTAssertEqual(model.save(), .saved)
+        let reopened = openModel(at: url)
+        XCTAssertEqual(reopened.noteMarkers.map(\.count), [2])
+        let metadata = try thoughtMetadata(on: XCTUnwrap(reopened.document?.page(at: 0)))
+        XCTAssertEqual(metadata.map(\.anchor.id), [anchorID, anchorID])
+        XCTAssertEqual(metadata.map(\.thoughtOrder), [0, 1])
     }
 }

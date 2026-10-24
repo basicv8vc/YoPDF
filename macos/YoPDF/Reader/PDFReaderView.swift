@@ -457,8 +457,7 @@ struct PDFReaderView: View {
                     model.noteSelection(at: point, on: page)
                 },
                 onNoteActivated: { note, anchor in
-                    isPlacingNote = false
-                    requestCompose(note.groupCount > 1 ? .group(note, anchor) : .note(note, anchor))
+                    requestNoteComposer(note, anchor: anchor)
                 },
                 onNoteMoved: { note, center in
                     _ = model.moveNoteMarker(note, to: center)
@@ -732,6 +731,17 @@ struct PDFReaderView: View {
         startComposer(target)
     }
 
+    /// A Shua thought opens its thread composer even when it is currently the
+    /// only member. Mouse activation and the context menu share this route so
+    /// one marker cannot expose two editing experiences.
+    private func requestNoteComposer(_ note: NoteSelection, anchor: CGRect) {
+        isPlacingNote = false
+        let target: PendingAction.ComposerTarget = note.isShuaThought
+            ? .group(note, anchor)
+            : .note(note, anchor)
+        requestCompose(target)
+    }
+
     private func startComposer(_ target: PendingAction.ComposerTarget) {
         switch target {
         case let .draft(draft, anchor):
@@ -775,9 +785,11 @@ struct PDFReaderView: View {
 
         if let note = context.note {
             let anchor = context.anchorRect
-            items.append(MarkupActionMenuItem(title: "Edit Note") { [note] in
-                isPlacingNote = false
-                requestCompose(.note(note, anchor))
+            let title = note.isShuaThought
+                ? "Open Note Thread"
+                : "Edit Note"
+            items.append(MarkupActionMenuItem(title: title) { [note] in
+                requestNoteComposer(note, anchor: anchor)
             })
             if model.notePermissions(for: note).canDelete {
                 items.append(MarkupActionMenuItem(title: "Delete Note") { [note] in
