@@ -66,7 +66,9 @@ reproducible and easy to inspect.
 The macOS app links Sparkle 2.10.0. It checks the configured signed appcast on
 Sparkle's normal schedule and adds **Check for Updates…** to the YoPDF menu.
 Sparkle shows its standard update dialog and downloads an update after the user
-chooses to install it; silent automatic installation is off by default.
+chooses to install it. Both `SUAutomaticallyUpdate` and
+`SUAllowsAutomaticUpdates` are false, so Sparkle cannot install an update
+automatically.
 
 An updater starts only when the app is built with both `SPARKLE_FEED_URL` (an
 HTTPS appcast URL) and `SPARKLE_PUBLIC_ED_KEY` (the Base64 EdDSA public key).

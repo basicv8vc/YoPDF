@@ -94,6 +94,7 @@ targets:
         SUEnableAutomaticChecks: true
         SUShowReleaseNotes: true
         SUAutomaticallyUpdate: false
+        SUAllowsAutomaticUpdates: false
         SUVerifyUpdateBeforeExtraction: true
         SURequireSignedFeed: true
         CFBundleDocumentTypes:
