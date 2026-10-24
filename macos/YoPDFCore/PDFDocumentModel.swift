@@ -121,6 +121,19 @@ public final class PDFDocumentModel: ObservableObject {
     /// A single cancellable debounce task covers every annotation mutation.
     var autoSaveTask: Task<Void, Never>?
     var autoSaveGeneration = 0
+    /// The current snapshot writer, which may outlive its debounce task after a
+    /// later edit reschedules the next automatic checkpoint.
+    var autoSaveWorkTask: Task<SaveOutcome, Never>?
+    var autoSaveWorkGeneration: Int?
+    var autoSaveWorkCompletion: AutoSaveWorkCompletion?
+    /// The production delay is 750 ms. Tests shorten it to cover debounce
+    /// scheduling without paying the user-facing interval for each scenario.
+    var autoSaveDebounceNanoseconds: UInt64 = 750_000_000
+    /// Injectable so the test suite can hold snapshot serialization while
+    /// checking that the main actor remains responsive.
+    var autoSaveSerializer: @Sendable (PDFDocumentSaveSnapshot) -> Data? = {
+        PDFDocumentSaveSerializer.dataRepresentationPreservingShuaGroups(in: $0.document)
+    }
 
     /// The open file session, or nil when nothing is loaded. Exposed so later
     /// phases can save through the same session that owns the access.
@@ -206,7 +219,13 @@ public final class PDFDocumentModel: ObservableObject {
             return false
         }
 
-        // Phase 3: commit. Swap first, then release the previous scope, so the
+        // Phase 3: commit. Stop a pending checkpoint before discarding the
+        // previous document, then release its scope only after any already
+        // running file operation has ended.
+        cancelPendingAutoSave(cancelInFlightWork: discardingUnsavedChanges)
+        waitForAutoSaveWork()
+
+        // Swap first, then release the previous scope, so the
         // model is never left without access to the document it displays.
         let previous = documentSession
         documentSession = candidate
@@ -217,7 +236,8 @@ public final class PDFDocumentModel: ObservableObject {
     }
 
     public func close() {
-        cancelPendingAutoSave()
+        cancelPendingAutoSave(cancelInFlightWork: true)
+        waitForAutoSaveWork()
         documentSession?.close()
         documentSession = nil
         document = nil

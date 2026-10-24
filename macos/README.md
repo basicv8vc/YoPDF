@@ -52,7 +52,7 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (267)
+./scripts/test.sh                     # unit tests (302)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
@@ -90,6 +90,7 @@ macos/
 │   ├── NoteEditing.swift       # model-owned add/edit/delete notes
 │   ├── PDFDocumentModel.swift
 │   ├── PDFDocumentModel+Editing.swift # dirty state, save, Save As, re-sync
+│   ├── PDFDocumentSaveSerializer.swift # isolated PDF snapshot serialization
 │   ├── QuitCoordinator.swift   # quit-attempt decisions, no AppKit
 │   ├── ReaderViewSync.swift    # pure page/zoom decisions used by the bridge
 │   └── SecurityScopeAccess.swift
@@ -118,6 +119,7 @@ macos/
 │   ├── DocumentStoreFailureTests.swift  # injected staging/commit failures
 │   ├── DocumentStoreRecoveryTests.swift # partial commits, post-commit failures
 │   ├── DocumentStoreSaveAsSafetyTests.swift # Save As target races and aliases
+│   ├── AutoSaveTests.swift               # debounce, undo, failures and responsiveness
 │   ├── DocumentStoreLifecycleTests.swift    # close vs. in-flight operations
 │   ├── DocumentStoreScaleTests.swift    # 200 MB streaming and save
 │   ├── DocumentStoreModelIntegrationTests.swift
@@ -205,6 +207,14 @@ note. ⌘S and the Save button remain available for an immediate save.
 
 - Adding or editing a highlight, underline or note marks the document edited and
   schedules an automatic save through the open `DocumentSession`.
+- Automatic saving copies the live `PDFDocument` on the main actor, then uses a
+  private snapshot on a utility worker for Shua metadata preservation, PDF
+  serialization, the coordinated `DocumentSession` write and reopen check. The
+  displayed document and its annotation objects stay in place for Undo and Redo.
+- Save As during the 750 ms debounce cancels that pending checkpoint and writes
+  the current edits to the chosen copy, leaving the source unchanged. If an
+  automatic save has already entered `DocumentSession.save`, it completes first;
+  Save As then writes the same edits to the destination.
 - `PDFDocumentModel.save()` serialises the document with PDFKit and hands the
   bytes to `DocumentSession.save`. It never calls `PDFDocument.write(to:)` on the
   original path: that would bypass the version check that makes a save safe.

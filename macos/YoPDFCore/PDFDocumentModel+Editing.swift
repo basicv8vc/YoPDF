@@ -6,7 +6,7 @@ import PDFKit
 /// Kept apart from `DocumentStoreError` because these happen before the store is
 /// involved at all: there is no file-level outcome to report, and no bytes were
 /// staged.
-public enum SaveError: Error, Equatable {
+public enum SaveError: Error, Equatable, Sendable {
     case noDocument
     /// PDFKit could not serialise the document. Nothing was written.
     case serializationFailed
@@ -21,7 +21,7 @@ public enum SaveError: Error, Equatable {
 /// re-sync the in-memory document is a different situation from a save that
 /// wrote nothing, and telling the user "your work was not saved" in the first
 /// case would be a lie that invites a destructive retry.
-public enum SaveOutcome: Equatable {
+public enum SaveOutcome: Equatable, Sendable {
     /// The file was written and the in-memory document now matches it.
     case saved
     /// The file was written, but the app could not confirm or re-sync it.
@@ -58,6 +58,89 @@ public enum AutoSaveStatus: Equatable {
     case saved
     /// The automatic save did not finish as a verified success.
     case failed(SaveOutcome)
+}
+
+/// A synchronous wait point for lifecycle and manual-save operations that must
+/// not race an automatic write already running on a worker thread.
+final class AutoSaveWorkCompletion: @unchecked Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var writeHasStarted = false
+    private var wasCancelledBeforeWrite = false
+
+    /// Resolves the Save As/close race at a single boundary: if cancellation
+    /// wins before this point, the worker will not touch the original file. If
+    /// the write already started, callers wait for its coordinated transaction.
+    func beginWriteUnlessCancelled() -> Bool {
+        lock.withLock {
+            guard !wasCancelledBeforeWrite else { return false }
+            writeHasStarted = true
+            return true
+        }
+    }
+
+    func cancelBeforeWrite() {
+        lock.withLock {
+            guard !writeHasStarted else { return }
+            wasCancelledBeforeWrite = true
+        }
+    }
+
+    func signal() { semaphore.signal() }
+    func wait() { semaphore.wait() }
+}
+
+private enum AutomaticSaveWorker {
+    static func save(_ data: Data, to session: DocumentSession, pageCount: Int) -> SaveOutcome {
+        do {
+            try session.save(data)
+        } catch let error as DocumentStoreError {
+            return resolve(error, session: session, pageCount: pageCount)
+        } catch {
+            return .failed(.store(.stagingFailed(error.localizedDescription)))
+        }
+        return verifySavedPDF(at: session.url, pageCount: pageCount)
+    }
+
+    private static func resolve(
+        _ error: DocumentStoreError,
+        session: DocumentSession,
+        pageCount: Int
+    ) -> SaveOutcome {
+        switch error {
+        case let .committedButUnverified(_, reason):
+            do {
+                _ = try session.refresh()
+                return verifySavedPDF(at: session.url, pageCount: pageCount)
+            } catch {
+                let detail = (error as? DocumentStoreError)?.localizedDescription
+                    ?? error.localizedDescription
+                return .savedUnverified(reason: "\(reason) \(detail)", editsOnDisk: false)
+            }
+        case let .externalModificationDetected(change):
+            return .conflict(.externalModificationDetected(change))
+        case let .replacementStateUncertain(recovery):
+            return .uncertain(
+                reason: DocumentStoreError.replacementStateUncertain(recovery).localizedDescription,
+                recovery: recovery.recoverableURLs
+            )
+        default:
+            return .failed(.store(error))
+        }
+    }
+
+    private static func verifySavedPDF(at url: URL, pageCount: Int) -> SaveOutcome {
+        guard let reopened = PDFDocument(url: url),
+              reopened.pageCount > 0,
+              reopened.pageCount == pageCount
+        else {
+            return .savedUnverified(
+                reason: "The file was written, but it could not be reopened.",
+                editsOnDisk: true
+            )
+        }
+        return .saved
+    }
 }
 
 extension PDFDocumentModel {
@@ -105,18 +188,12 @@ extension PDFDocumentModel {
     public func save() -> SaveOutcome {
         // A manual save supersedes the debounce. If it fails, do not run a
         // second automatic attempt against the same document a moment later.
-        save(preservingUndoHistory: false)
-    }
-
-    /// Saves an automatic checkpoint without replacing the document whose
-    /// annotation objects are retained by the undo and redo entries.
-    @discardableResult
-    func saveAutomatically() -> SaveOutcome {
-        save(preservingUndoHistory: true)
+        cancelPendingAutoSave(cancelInFlightWork: true)
+        waitForAutoSaveWork()
+        return save(preservingUndoHistory: false)
     }
 
     private func save(preservingUndoHistory: Bool) -> SaveOutcome {
-        cancelPendingAutoSave()
         guard let document, let session = documentSession else { return .failed(.noDocument) }
         guard hasUnsavedChanges else { return .saved }
         guard let data = NoteService.dataRepresentationPreservingShuaGroups(in: document) else {
@@ -150,39 +227,144 @@ extension PDFDocumentModel {
 
         autoSaveTask = Task { [weak self] in
             do {
-                try await Task.sleep(nanoseconds: Self.autoSaveDebounceNanoseconds)
+                guard let delay = self?.autoSaveDebounceNanoseconds else { return }
+                try await Task.sleep(nanoseconds: delay)
             } catch {
                 return
             }
-
-            guard let self,
-                  self.autoSaveGeneration == generation,
-                  self.editRevision == scheduledRevision,
-                  self.hasUnsavedChanges
-            else { return }
-
-            self.autoSaveStatus = .saving
-            let outcome = self.saveAutomatically()
-            self.lastAutoSaveOutcome = outcome
-            self.autoSaveTask = nil
-            if case .saved = outcome {
-                self.autoSaveStatus = .saved
-            } else {
-                self.autoSaveStatus = .failed(outcome)
-                self.autoSaveFailureRevision &+= 1
-            }
+            await self?.performAutomaticSave(
+                generation: generation,
+                scheduledRevision: scheduledRevision
+            )
         }
+    }
+
+    private func performAutomaticSave(generation: Int, scheduledRevision: Int) async {
+        guard autoSaveGeneration == generation,
+              editRevision == scheduledRevision,
+              hasUnsavedChanges
+        else { return }
+
+        autoSaveStatus = .saving
+
+        // A later edit can expire its debounce while an earlier snapshot is
+        // still being written. Wait for that write before capturing the newer
+        // snapshot so an older version can never replace a newer one on disk.
+        if let previousWork = autoSaveWorkTask {
+            let previousGeneration = autoSaveWorkGeneration
+            _ = await previousWork.value
+            clearAutoSaveWork(ifGeneration: previousGeneration)
+        }
+
+        guard autoSaveGeneration == generation,
+              editRevision == scheduledRevision,
+              hasUnsavedChanges,
+              let document,
+              let session = documentSession
+        else { return }
+
+        guard let documentCopy = document.copy() as? PDFDocument else {
+            finishAutomaticSave(
+                .failed(.serializationFailed),
+                generation: generation,
+                scheduledRevision: scheduledRevision,
+                document: document,
+                session: session
+            )
+            return
+        }
+
+        let snapshot = PDFDocumentSaveSnapshot(document: documentCopy)
+        let serializer = autoSaveSerializer
+        let pageCount = document.pageCount
+        let completion = AutoSaveWorkCompletion()
+        let worker = Task.detached(priority: .utility) {
+            defer { completion.signal() }
+            guard let data = serializer(snapshot) else {
+                return SaveOutcome.failed(.serializationFailed)
+            }
+            // Save As, manual Save, close or discard may cancel a worker while
+            // PDFKit is serializing. Atomically claim the file-write phase so
+            // cancellation cannot slip between the check and DocumentSession.
+            guard completion.beginWriteUnlessCancelled() else {
+                return .failed(.sessionUnavailable)
+            }
+            return AutomaticSaveWorker.save(data, to: session, pageCount: pageCount)
+        }
+
+        autoSaveWorkTask = worker
+        autoSaveWorkGeneration = generation
+        autoSaveWorkCompletion = completion
+
+        let outcome = await worker.value
+        clearAutoSaveWork(ifGeneration: generation)
+        finishAutomaticSave(
+            outcome,
+            generation: generation,
+            scheduledRevision: scheduledRevision,
+            document: document,
+            session: session
+        )
+    }
+
+    private func clearAutoSaveWork(ifGeneration generation: Int?) {
+        guard let generation, autoSaveWorkGeneration == generation else { return }
+        autoSaveWorkTask = nil
+        autoSaveWorkGeneration = nil
+        autoSaveWorkCompletion = nil
+    }
+
+    private func finishAutomaticSave(
+        _ outcome: SaveOutcome,
+        generation: Int,
+        scheduledRevision: Int,
+        document savedDocument: PDFDocument,
+        session savedSession: DocumentSession
+    ) {
+        guard autoSaveGeneration == generation,
+              editRevision == scheduledRevision,
+              document === savedDocument,
+              documentSession === savedSession,
+              hasUnsavedChanges
+        else { return }
+
+        if outcome.editsAreOnDisk {
+            markSaved(preservingMarkupHistory: true)
+        }
+        lastAutoSaveOutcome = outcome
+        if case .saved = outcome {
+            autoSaveStatus = .saved
+        } else {
+            autoSaveStatus = .failed(outcome)
+            autoSaveFailureRevision &+= 1
+        }
+        autoSaveTask = nil
     }
 
     /// Cancels a pending automatic save when the user saves, discards, closes,
     /// or successfully replaces the open document.
-    func cancelPendingAutoSave() {
+    func cancelPendingAutoSave(cancelInFlightWork: Bool = false) {
         autoSaveGeneration &+= 1
         autoSaveTask?.cancel()
         autoSaveTask = nil
+        if cancelInFlightWork {
+            autoSaveWorkCompletion?.cancelBeforeWrite()
+            autoSaveWorkTask?.cancel()
+        }
         if autoSaveStatus == .pending || autoSaveStatus == .saving {
             autoSaveStatus = .idle
         }
+    }
+
+    /// Waits only for an already-started snapshot write. Debounce cancellation
+    /// is immediate; this prevents a later manual save, Save As or close from
+    /// racing the file session while its worker is active.
+    func waitForAutoSaveWork() {
+        guard let completion = autoSaveWorkCompletion else { return }
+        completion.wait()
+        autoSaveWorkTask = nil
+        autoSaveWorkGeneration = nil
+        autoSaveWorkCompletion = nil
     }
 
     /// Writes the document to another file and continues editing there.
@@ -191,6 +373,11 @@ extension PDFDocumentModel {
     /// user does not want to resolve in place.
     @discardableResult
     public func saveAs(to destination: URL, overwrite: Bool = false) -> SaveOutcome {
+        // A Save As selected during the debounce captures the edits into the
+        // new file and leaves the original untouched. A worker that has entered
+        // DocumentSession.save is allowed to finish before Save As.
+        cancelPendingAutoSave(cancelInFlightWork: true)
+        waitForAutoSaveWork()
         guard let document, let session = documentSession else { return .failed(.noDocument) }
         guard let data = NoteService.dataRepresentationPreservingShuaGroups(in: document) else {
             return .failed(.serializationFailed)
@@ -227,6 +414,8 @@ extension PDFDocumentModel {
     /// in-memory annotations are still there, so the model must not keep
     /// claiming they are unsaved after the user chose to discard them.
     public func abandonUnsavedChanges() {
+        cancelPendingAutoSave(cancelInFlightWork: true)
+        waitForAutoSaveWork()
         markSaved()
     }
 
@@ -367,10 +556,6 @@ extension PDFDocumentModel {
         guard let current = document, reloaded.pageCount == current.pageCount else { return nil }
         return reloaded
     }
-}
-
-private extension PDFDocumentModel {
-    static var autoSaveDebounceNanoseconds: UInt64 { 750_000_000 }
 }
 
 extension SaveError: LocalizedError {

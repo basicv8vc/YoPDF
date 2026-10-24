@@ -747,77 +747,11 @@ public enum NoteService {
     /// Name-only annotations use a temporary anchor cache. If `/NM` conflicts
     /// with valid embedded metadata, a second temporary key preserves the full
     /// name identity so the conflict remains detectable after serialization.
-    /// Temporary keys are removed from live annotations before returning.
+    /// Temporary keys are removed from the document before returning.
     public static func dataRepresentationPreservingShuaGroups(
         in document: PDFDocument
     ) -> Data? {
-        var previousValues: [(PDFAnnotation, PDFAnnotationKey, Any?)] = []
-        defer {
-            for (annotation, key, value) in previousValues {
-                if let value {
-                    _ = annotation.setValue(value, forAnnotationKey: key)
-                } else {
-                    annotation.removeValue(forAnnotationKey: key)
-                }
-            }
-        }
-
-        func temporarilySet(
-            _ value: String?,
-            for key: PDFAnnotationKey,
-            on annotation: PDFAnnotation
-        ) -> Bool {
-            previousValues.append((annotation, key, annotation.value(forAnnotationKey: key)))
-            if let value {
-                return annotation.setValue(value, forAnnotationKey: key)
-            } else {
-                annotation.removeValue(forAnnotationKey: key)
-                return true
-            }
-        }
-
-        for pageIndex in 0..<document.pageCount {
-            guard let page = document.page(at: pageIndex) else { continue }
-            for annotation in page.annotations {
-                let nameIdentity = shuaThoughtIdentityFromName(of: annotation)
-                let persistedIdentity = shuaThoughtIdentityFromPersistence(of: annotation)
-                let metadata = shuaThoughtMetadata(of: annotation)
-
-                if let metadata {
-                    if let nameIdentity {
-                        if nameIdentity != metadata.identity {
-                            if persistedIdentity != nameIdentity {
-                                guard temporarilySet(
-                                    nameIdentity.persistenceValue,
-                                    for: shuaIdentityPersistenceKey,
-                                    on: annotation
-                                ) else { return nil }
-                            }
-                        } else if annotation.value(forAnnotationKey: shuaIdentityPersistenceKey) != nil {
-                            // Current Shua fields agree; discard any stale conflict cache.
-                            guard temporarilySet(nil, for: shuaIdentityPersistenceKey, on: annotation)
-                            else { return nil }
-                        }
-                    } else if persistedIdentity == metadata.identity,
-                              annotation.value(forAnnotationKey: shuaIdentityPersistenceKey) != nil {
-                        guard temporarilySet(nil, for: shuaIdentityPersistenceKey, on: annotation)
-                        else { return nil }
-                    }
-                }
-
-                guard let nameIdentity,
-                      (annotation.value(forAnnotationKey: shuaAnchorPersistenceKey) as? String)
-                        .flatMap(UUID.init(uuidString:)) != nameIdentity.anchorID
-                else { continue }
-
-                guard temporarilySet(
-                    nameIdentity.anchorID.uuidString,
-                    for: shuaAnchorPersistenceKey,
-                    on: annotation
-                ) else { return nil }
-            }
-        }
-        return document.dataRepresentation()
+        PDFDocumentSaveSerializer.dataRepresentationPreservingShuaGroups(in: document)
     }
 
     private static func shuaThoughtIdentityFromName(of annotation: PDFAnnotation) -> ShuaThoughtIdentity? {
