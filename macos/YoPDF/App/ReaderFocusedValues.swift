@@ -13,6 +13,11 @@ struct OpenDocumentActionKey: FocusedValueKey {
     typealias Value = @MainActor () -> Void
 }
 
+/// Opens a saved recent URL through the focused reader's unsaved-work prompts.
+struct OpenRecentDocumentActionKey: FocusedValueKey {
+    typealias Value = @MainActor (RecentDocument) -> Void
+}
+
 /// Menu-bar counterparts of the toolbar's editing actions.
 ///
 /// They are actions rather than model calls because the reader has to route them
@@ -49,6 +54,11 @@ extension FocusedValues {
     var openDocument: (@MainActor () -> Void)? {
         get { self[OpenDocumentActionKey.self] }
         set { self[OpenDocumentActionKey.self] = newValue }
+    }
+
+    var openRecentDocument: (@MainActor (RecentDocument) -> Void)? {
+        get { self[OpenRecentDocumentActionKey.self] }
+        set { self[OpenRecentDocumentActionKey.self] = newValue }
     }
 
     var saveDocument: (@MainActor () -> Void)? {

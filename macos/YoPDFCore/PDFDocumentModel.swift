@@ -104,6 +104,10 @@ public final class PDFDocumentModel: ObservableObject {
     /// store when a Save As leaves a file on disk without a session.
     let store: DocumentStore
 
+    /// App-level local history shared by reader windows. Tests and callers that
+    /// do not need persistence can leave this nil.
+    private let recentDocuments: RecentDocumentsStore?
+
     /// The persisted colour defaults. Owned by the model so the toolbar and the
     /// annotations created from it read one value, and so tests can point it at
     /// an isolated `UserDefaults` suite.
@@ -146,10 +150,12 @@ public final class PDFDocumentModel: ObservableObject {
     public init(
         access: any SecurityScopeAccessing = SystemSecurityScopeAccess(),
         io: any DocumentStoreIO = SystemDocumentStoreIO(),
-        markupPreferences: MarkupColorPreferences = MarkupColorPreferences()
+        markupPreferences: MarkupColorPreferences = MarkupColorPreferences(),
+        recentDocuments: RecentDocumentsStore? = nil
     ) {
         self.store = DocumentStore(access: access, io: io)
         self.markupPreferences = markupPreferences
+        self.recentDocuments = recentDocuments
     }
 
     public var isLoaded: Bool { document != nil }
@@ -194,6 +200,8 @@ public final class PDFDocumentModel: ObservableObject {
             lastError = .unsupportedType(url.pathExtension)
             return false
         }
+
+        let restoredPosition = recentDocuments?.readingPosition(for: url)
 
         let reopeningCurrentFile = fileURL?.standardizedFileURL == url.standardizedFileURL
         if reopeningCurrentFile {
@@ -275,11 +283,16 @@ public final class PDFDocumentModel: ObservableObject {
         documentSession = candidate
         previous?.close()
 
-        apply(document: opened, fileURL: url)
+        apply(document: opened, fileURL: url, restoring: restoredPosition)
+        if let recentDocuments, !recentDocuments.recordOpened(url) {
+            NSLog("YoPDF could not save a recent-document bookmark for %@", url.lastPathComponent)
+        }
+        persistReadingPosition()
         return true
     }
 
     public func close() {
+        persistReadingPosition()
         cancelPendingAutoSave(cancelInFlightWork: true)
         waitForAutoSaveWork()
         autoSavePauseDepth = 0
@@ -309,15 +322,22 @@ public final class PDFDocumentModel: ObservableObject {
         lastError = nil
     }
 
-    private func apply(document: PDFDocument, fileURL: URL?) {
+    private func apply(
+        document: PDFDocument,
+        fileURL: URL?,
+        restoring position: RecentReadingPosition?
+    ) {
         cancelPendingAutoSave()
         self.document = document
         self.fileURL = fileURL
         pageCount = document.pageCount
-        currentPageIndex = 0
-        zoomScale = 1
-        effectiveScale = 1
-        isAutoScaling = true
+        currentPageIndex = Self.clamped(position?.pageIndex ?? 0, pageCount: document.pageCount)
+        let restoredZoom = CGFloat(position?.zoomScale ?? 1)
+        zoomScale = restoredZoom.isFinite
+            ? min(max(restoredZoom, Self.minimumZoomScale), Self.maximumZoomScale)
+            : 1
+        effectiveScale = zoomScale
+        isAutoScaling = position?.usesAutomaticScaling ?? true
         lastError = nil
         hasUnsavedChanges = false
         autoSaveStatus = .idle
@@ -378,6 +398,10 @@ public final class PDFDocumentModel: ObservableObject {
         if let document {
             title = Self.resolvedTitle(for: document, fileURL: url)
         }
+        if let recentDocuments, !recentDocuments.recordOpened(url) {
+            NSLog("YoPDF could not save a recent-document bookmark for %@", url.lastPathComponent)
+        }
+        persistReadingPosition()
     }
 
     /// Swaps in the session that now owns the file, closing the old one.
@@ -487,7 +511,10 @@ public final class PDFDocumentModel: ObservableObject {
 
     public func goToPage(_ index: Int) {
         guard pageCount > 0 else { return }
-        currentPageIndex = min(max(index, 0), pageCount - 1)
+        let clampedIndex = min(max(index, 0), pageCount - 1)
+        guard clampedIndex != currentPageIndex else { return }
+        currentPageIndex = clampedIndex
+        persistReadingPosition()
     }
 
     public func goToNextPage() {
@@ -506,6 +533,7 @@ public final class PDFDocumentModel: ObservableObject {
         effectiveScale = zoomScale
         isAutoScaling = false
         zoomCommandRevision &+= 1
+        persistReadingPosition()
     }
 
     /// Base for the next zoom step: the live fitted scale while auto-scaling,
@@ -529,6 +557,7 @@ public final class PDFDocumentModel: ObservableObject {
     public func fitToWindow() {
         isAutoScaling = true
         zoomCommandRevision &+= 1
+        persistReadingPosition()
     }
 
     /// Called by the view whenever PDFView's scale changes. Never flips
@@ -538,6 +567,7 @@ public final class PDFDocumentModel: ObservableObject {
         effectiveScale = scale
         if !isAutoScaling {
             zoomScale = min(max(scale, Self.minimumZoomScale), Self.maximumZoomScale)
+            persistReadingPosition()
         }
     }
 
@@ -550,7 +580,20 @@ public final class PDFDocumentModel: ObservableObject {
             // scale command back through NSViewRepresentable.updateNSView.
             isAutoScaling = false
             zoomScale = min(max(effectiveScale, Self.minimumZoomScale), Self.maximumZoomScale)
+            persistReadingPosition()
         }
+    }
+
+    private func persistReadingPosition() {
+        guard let url = fileURL else { return }
+        recentDocuments?.updateReadingPosition(
+            RecentReadingPosition(
+                pageIndex: currentPageIndex,
+                zoomScale: Double(zoomScale),
+                usesAutomaticScaling: isAutoScaling
+            ),
+            for: url
+        )
     }
 }
 
