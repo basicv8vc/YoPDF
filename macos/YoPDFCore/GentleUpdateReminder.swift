@@ -82,9 +82,9 @@ public enum SignedSparkleFeedConfiguration {
     }
 }
 
-/// Keeps the existing manual menu action gated by Sparkle's normal readiness.
+/// Gates user-initiated Sparkle checks on the feed configuration and readiness.
 @MainActor
-public enum ManualUpdateCheck {
+public enum SparkleUpdateCheck {
 
     public static func runIfAvailable(
         isConfigured: Bool,

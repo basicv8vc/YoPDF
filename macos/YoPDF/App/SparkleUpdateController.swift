@@ -30,6 +30,20 @@ final class SparkleUpdateController: NSObject, ObservableObject, SPUUpdaterDeleg
         isConfigured = Self.hasSignedFeedConfiguration
         super.init()
 
+#if DEBUG
+        // Lets a local Debug build preview the titlebar across real windows
+        // without requiring a production Sparkle feed.
+        let previewPrefix = "--yopdf-preview-update="
+        if let argument = ProcessInfo.processInfo.arguments.first(where: {
+            $0.hasPrefix(previewPrefix)
+        }) {
+            let version = String(argument.dropFirst(previewPrefix.count))
+            if !version.isEmpty {
+                reminder.didFindValidUpdate(version: version)
+            }
+        }
+#endif
+
         let updater = controller.updater
         guard isConfigured else { return }
 
@@ -41,7 +55,7 @@ final class SparkleUpdateController: NSObject, ObservableObject, SPUUpdaterDeleg
     }
 
     func checkForUpdates() {
-        ManualUpdateCheck.runIfAvailable(
+        SparkleUpdateCheck.runIfAvailable(
             isConfigured: isConfigured,
             canCheckForUpdates: canCheckForUpdates
         ) { [updater] in
@@ -52,8 +66,12 @@ final class SparkleUpdateController: NSObject, ObservableObject, SPUUpdaterDeleg
     /// Shows Sparkle's standard UI for an update already represented in the
     /// titlebar. Sparkle remains responsible for the session and installer.
     func showUpdate() {
-        guard isConfigured else { return }
-        updater.checkForUpdates()
+        SparkleUpdateCheck.runIfAvailable(
+            isConfigured: isConfigured,
+            canCheckForUpdates: updater.canCheckForUpdates
+        ) { [updater] in
+            updater.checkForUpdates()
+        }
     }
 
     private static var hasSignedFeedConfiguration: Bool {

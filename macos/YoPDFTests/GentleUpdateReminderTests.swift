@@ -130,17 +130,27 @@ final class GentleUpdateReminderTests: XCTestCase {
     func testManualCheckStillRunsOnlyWhenSparkleIsConfiguredAndReady() {
         var checksStarted = 0
 
-        ManualUpdateCheck.runIfAvailable(isConfigured: true, canCheckForUpdates: true) {
+        SparkleUpdateCheck.runIfAvailable(isConfigured: true, canCheckForUpdates: true) {
             checksStarted += 1
         }
-        ManualUpdateCheck.runIfAvailable(isConfigured: false, canCheckForUpdates: true) {
+        SparkleUpdateCheck.runIfAvailable(isConfigured: false, canCheckForUpdates: true) {
             checksStarted += 1
         }
-        ManualUpdateCheck.runIfAvailable(isConfigured: true, canCheckForUpdates: false) {
+        SparkleUpdateCheck.runIfAvailable(isConfigured: true, canCheckForUpdates: false) {
             checksStarted += 1
         }
 
         XCTAssertEqual(checksStarted, 1)
+    }
+
+    func testTitlebarCheckWaitsUntilSparkleIsReady() {
+        var checksStarted = 0
+
+        SparkleUpdateCheck.runIfAvailable(isConfigured: true, canCheckForUpdates: false) {
+            checksStarted += 1
+        }
+
+        XCTAssertEqual(checksStarted, 0)
     }
 
     func testScheduledUpdatePresentationIsHandledByTheReminder() {

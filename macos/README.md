@@ -82,6 +82,10 @@ in the release environment before running
 be signed with the matching private key. Keep that key in a secure developer
 key store; never add it to the repository or pass it to the build.
 
+A Debug build can preview the titlebar indicator without a feed by launching
+with `--yopdf-preview-update=99.0.0`. The indicator remains disabled until
+Sparkle reports that an update check can start.
+
 YoPDF currently has no production appcast or Sparkle key configured. Its
 existing ad-hoc signing setup is for local development; public distribution
 still needs Developer ID signing and notarization.

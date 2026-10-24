@@ -39,10 +39,17 @@ struct TitlebarUpdateIndicatorInstaller: NSViewRepresentable {
         private weak var window: NSWindow?
         private var accessory: UpdateTitlebarAccessoryViewController?
         private var reminderObservation: AnyCancellable?
+        private var checkAvailabilityObservation: AnyCancellable?
 
         init(updateController: SparkleUpdateController) {
             self.updateController = updateController
             reminderObservation = updateController.reminder.$availableUpdateVersion
+                .sink { [weak self] _ in
+                    Task { @MainActor [weak self] in
+                        self?.refresh()
+                    }
+                }
+            checkAvailabilityObservation = updateController.$canCheckForUpdates
                 .sink { [weak self] _ in
                     Task { @MainActor [weak self] in
                         self?.refresh()
@@ -78,7 +85,10 @@ struct TitlebarUpdateIndicatorInstaller: NSViewRepresentable {
                 updateController: updateController
             )
             self.accessory = accessory
-            accessory.update(version: version)
+            accessory.update(
+                version: version,
+                canCheckForUpdates: updateController.canCheckForUpdates
+            )
 
             guard !window.titlebarAccessoryViewControllers.contains(where: { $0 === accessory }) else {
                 return
@@ -161,10 +171,11 @@ private final class UpdateTitlebarAccessoryViewController: NSTitlebarAccessoryVi
         fatalError("init(coder:) is not supported")
     }
 
-    func update(version: String) {
+    func update(version: String, canCheckForUpdates: Bool) {
         let description = "YoPDF \(version) is available"
         button.toolTip = description
         button.setAccessibilityLabel(description)
+        button.isEnabled = canCheckForUpdates
     }
 }
 
