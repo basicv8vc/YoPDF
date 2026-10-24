@@ -7,6 +7,11 @@ options:
   createIntermediateGroups: true
   groupSortPosition: top
 
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: "2.10.0"
+
 settings:
   base:
     SWIFT_VERSION: "6.0"
@@ -44,12 +49,16 @@ targets:
     dependencies:
       - target: YoPDFCore
         embed: true
+      - package: Sparkle
+        product: Sparkle
     settings:
       base:
         PRODUCT_NAME: YoPDF
         PRODUCT_BUNDLE_IDENTIFIER: dev.yopdf.provisional
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
+        SPARKLE_FEED_URL: ""
+        SPARKLE_PUBLIC_ED_KEY: ""
         ENABLE_HARDENED_RUNTIME: NO
         SWIFT_EMIT_LOC_STRINGS: YES
         COMBINE_HIDPI_IMAGES: YES
@@ -80,6 +89,13 @@ targets:
         LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
         NSHighResolutionCapable: true
         NSHumanReadableCopyright: "YoPDF contributors. Apache-2.0. Provisional bundle identifier."
+        SUFeedURL: "$(SPARKLE_FEED_URL)"
+        SUPublicEDKey: "$(SPARKLE_PUBLIC_ED_KEY)"
+        SUEnableAutomaticChecks: true
+        SUShowReleaseNotes: true
+        SUAutomaticallyUpdate: false
+        SUVerifyUpdateBeforeExtraction: true
+        SURequireSignedFeed: true
         CFBundleDocumentTypes:
           - CFBundleTypeName: PDF Document
             CFBundleTypeRole: Viewer

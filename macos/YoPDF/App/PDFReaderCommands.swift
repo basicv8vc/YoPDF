@@ -9,6 +9,8 @@ import YoPDFCore
 /// when no reader window is focused.
 struct PDFReaderCommands: Commands {
 
+    @ObservedObject private var updateController: SparkleUpdateController
+
     @FocusedValue(\.documentModel) private var model
     @FocusedValue(\.openDocument) private var openDocument
     @FocusedValue(\.saveDocument) private var saveDocument
@@ -16,6 +18,10 @@ struct PDFReaderCommands: Commands {
     @FocusedValue(\.highlightSelection) private var highlightSelection
     @FocusedValue(\.underlineSelection) private var underlineSelection
     @FocusedValue(\.addNote) private var addNote
+
+    init(updateController: SparkleUpdateController) {
+        self.updateController = updateController
+    }
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
@@ -141,6 +147,13 @@ struct PDFReaderCommands: Commands {
             }
             .keyboardShortcut("9", modifiers: .command)
             .disabled(model?.isLoaded != true)
+        }
+
+        CommandGroup(after: .appInfo) {
+            Button("Check for Updates…") {
+                updateController.checkForUpdates()
+            }
+            .disabled(!updateController.canCheckForUpdates)
         }
     }
 }

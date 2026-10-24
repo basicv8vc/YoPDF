@@ -5,6 +5,7 @@ import YoPDFCore
 struct YoPDFApp: App {
 
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @StateObject private var updateController = SparkleUpdateController()
 
     var body: some Scene {
         WindowGroup {
@@ -12,7 +13,7 @@ struct YoPDFApp: App {
         }
         .defaultSize(width: 1100, height: 820)
         .commands {
-            PDFReaderCommands()
+            PDFReaderCommands(updateController: updateController)
         }
     }
 }
