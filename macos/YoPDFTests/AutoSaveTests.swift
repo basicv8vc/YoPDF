@@ -174,6 +174,40 @@ final class AutoSaveTests: XCTestCase {
         XCTAssertEqual(io.replacementCount, 1, "cancelling the panel resumes the pending debounce")
     }
 
+    func testSaveAsPanelCancelsSerializationBeforeItCanWriteTheSource() async throws {
+        let url = try makeFixture()
+        let serializerGate = AutoSaveGate()
+        let io = ScriptedDocumentStoreIO()
+        let model = makeModel(io: io, debounce: 30_000_000)
+        model.autoSaveSerializer = { snapshot in
+            serializerGate.pause()
+            return PDFDocumentSaveSerializer.dataRepresentationPreservingShuaGroups(in: snapshot.document)
+        }
+        XCTAssertTrue(model.open(url: url))
+        try addHighlight(to: model)
+        await waitUntilEntered(serializerGate)
+
+        let serializerReleaser = Task.detached {
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            serializerGate.release()
+        }
+        let response = model.withAutoSavePaused {
+            let deadline = Date().addingTimeInterval(0.25)
+            while Date() < deadline {
+                _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+            }
+            XCTAssertEqual(io.replacementCount, 0, "a cancelled serializer must not write during the panel")
+            return NSApplication.ModalResponse.cancel
+        }
+        await serializerReleaser.value
+
+        XCTAssertEqual(response, .cancel)
+        XCTAssertEqual(io.replacementCount, 0, "the worker was cancelled before DocumentSession.save")
+        XCTAssertTrue(model.hasUnsavedChanges)
+        await assertSaved(model)
+        XCTAssertEqual(io.replacementCount, 1, "cancelling the panel schedules a fresh checkpoint")
+    }
+
     func testReopeningSameFileAfterInFlightAutosaveRefreshesSessionVersion() async throws {
         let url = try makeFixture()
         let gate = AutoSaveGate()

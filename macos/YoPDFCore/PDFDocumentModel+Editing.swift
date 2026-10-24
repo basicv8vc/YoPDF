@@ -81,10 +81,12 @@ final class AutoSaveWorkCompletion: @unchecked Sendable {
         }
     }
 
-    func cancelBeforeWrite() {
+    @discardableResult
+    func cancelBeforeWrite() -> Bool {
         lock.withLock {
-            guard !writeHasStarted else { return }
+            guard !writeHasStarted else { return false }
             wasCancelledBeforeWrite = true
+            return true
         }
     }
 
@@ -264,13 +266,32 @@ extension PDFDocumentModel {
         autoSavePauseDepth += 1
         guard autoSavePauseDepth == 1 else { return }
 
-        autoSaveShouldResumeAfterPause = autoSaveStatus == .pending
-        if autoSaveStatus == .pending {
-            autoSaveGeneration &+= 1
-            autoSaveTask?.cancel()
-            autoSaveTask = nil
-            autoSaveStatus = .idle
+        let hasScheduledSave = autoSaveStatus == .pending || autoSaveStatus == .saving
+        guard hasScheduledSave else {
+            autoSaveShouldResumeAfterPause = false
+            return
         }
+
+        // The lock shared with beginWriteUnlessCancelled() decides which side
+        // of the modal-panel boundary this save belongs to.
+        let cancellationWon = autoSaveWorkCompletion?.cancelBeforeWrite()
+        let writeAlreadyStarted = cancellationWon == false
+        // A write that already crossed this boundary owns its transaction and
+        // may finish. Otherwise invalidate the scheduled attempt and close the
+        // same cancellation gate the worker checks after PDF serialization.
+        let currentAttemptHasStartedWriting = autoSaveStatus == .saving
+            && autoSaveWorkGeneration == autoSaveGeneration
+            && writeAlreadyStarted
+        autoSaveShouldResumeAfterPause = hasUnsavedChanges && !currentAttemptHasStartedWriting
+        guard !currentAttemptHasStartedWriting else { return }
+
+        autoSaveGeneration &+= 1
+        autoSaveTask?.cancel()
+        autoSaveTask = nil
+        if cancellationWon == true {
+            autoSaveWorkTask?.cancel()
+        }
+        autoSaveStatus = .idle
     }
 
     func resumeAutoSave() {
