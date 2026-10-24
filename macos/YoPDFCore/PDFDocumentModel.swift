@@ -38,6 +38,10 @@ public final class PDFDocumentModel: ObservableObject {
     /// first manual zoom starts from the fitted scale instead of jumping to 100%.
     @Published public private(set) var effectiveScale: CGFloat = 1
     @Published public private(set) var isAutoScaling: Bool = true
+    /// Changes only when the user explicitly requests a zoom or fit command.
+    /// The PDFView bridge uses this to distinguish commands from scale values
+    /// mirrored back while PDFKit is handling a native trackpad gesture.
+    @Published public private(set) var zoomCommandRevision = 0
     @Published public private(set) var lastError: LoadError?
     /// Bumped on every successful open so the view can re-apply layout.
     @Published public private(set) var loadGeneration: Int = 0
@@ -412,6 +416,7 @@ public final class PDFDocumentModel: ObservableObject {
         zoomScale = min(max(scale, Self.minimumZoomScale), Self.maximumZoomScale)
         effectiveScale = zoomScale
         isAutoScaling = false
+        zoomCommandRevision &+= 1
     }
 
     /// Base for the next zoom step: the live fitted scale while auto-scaling,
@@ -434,6 +439,7 @@ public final class PDFDocumentModel: ObservableObject {
 
     public func fitToWindow() {
         isAutoScaling = true
+        zoomCommandRevision &+= 1
     }
 
     /// Called by the view whenever PDFView's scale changes. Never flips
@@ -447,7 +453,15 @@ public final class PDFDocumentModel: ObservableObject {
     }
 
     public func setAutoScaling(_ enabled: Bool) {
-        isAutoScaling = enabled
+        if enabled {
+            fitToWindow()
+        } else {
+            // PDFKit already owns the live PDFView scale during a magnify
+            // gesture. Record that manual zoom has started without sending a
+            // scale command back through NSViewRepresentable.updateNSView.
+            isAutoScaling = false
+            zoomScale = min(max(effectiveScale, Self.minimumZoomScale), Self.maximumZoomScale)
+        }
     }
 }
 
