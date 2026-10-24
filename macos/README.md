@@ -11,7 +11,7 @@ P2a adds the first editing feature on top of it: select text, add a yellow
 highlight, save, reopen. A highlight is a standard PDF `/Highlight` annotation
 with `/QuadPoints`, so other readers see it as their own. Editing introduced a
 minimal dirty state and a manual Save; committed annotation edits now auto-save
-after a short quiet period. There is no annotation sidebar yet.
+after a short quiet period.
 
 P2b extends that to editable **Highlight** and **Underline** annotations:
 six presets plus a custom `ColorPicker`, click selection, recolouring, deletion,
@@ -22,8 +22,7 @@ annotation, either about the selected text or at a point the user clicks on the
 page. Six paper tints, a marker drawn over the page, editing, deletion and
 Undo/Redo all go through the same model pipeline as Highlight and Underline.
 Committed annotation edits auto-save after a short quiet period; a note draft
-remains in the composer until the user saves it into the PDF. There is no
-annotation sidebar.
+remains in the composer until the user saves it into the PDF.
 
 P2d adds the first **sticker** stage: the 20 original ShuaMac illustrations are
 packaged in an Asset Catalog, and a note's motif, paper palette, template title
@@ -37,6 +36,12 @@ badge. Legacy stacks that lost their group ID are recognized when same-style,
 24pt Shua note rectangles form a continuous 23pt vertical stack. Dragging a
 group marker moves its member notes together. Editing individual thoughts
 within a group remains a later stage.
+
+P2e adds a native, collapsible reading sidebar with the PDF's own outline,
+PDFKit page thumbnails, and an index of standard PDF annotations. The thumbnail
+view stays connected to the reader, outline destinations keep their target
+position, and annotation rows jump to their page location. The sidebar belongs
+to the open document window; it does not manage files or create a PDF library.
 
 ## Requirements
 
@@ -133,6 +138,7 @@ macos/
 │   ├── App/ReaderFocusedValues.swift
 │   └── Reader/
 │       ├── PDFViewerRepresentable.swift # PDFView ↔ SwiftUI bridge
+│       ├── ReaderSidebar.swift          # outline, thumbnails and annotation index
 │       ├── NoteComposer.swift          # compact note popover and paper tints
 │       ├── MarkupColorControls.swift   # presets + custom ColorPicker
 │       ├── MarkupActionMenuItem.swift  # closure-backed context-menu item
@@ -508,8 +514,9 @@ database — the saved PDF is the whole document.
 
 Known P2a/P2b limitations:
 
-- No annotation sidebar, no StrikeOut, free-text or ink annotations, and no
-  annotation search. YoPDF-created notes still store one body per annotation.
+- No StrikeOut, free-text or ink annotation editing, and no annotation search.
+  The sidebar indexes those standard PDF annotations for navigation.
+  YoPDF-created notes still store one body per annotation.
   Imported ShuaMac groups show their count and all bodies, but YoPDF currently
   edits only the first note in the group; adding, editing and deleting other
   group members remains future work. Templates only seed drafts and are not
@@ -724,9 +731,10 @@ and Undo/Redo. P2c adds standard `/Text` notes with a compact composer, six pape
 tints, page markers, editing, deletion and Undo/Redo. P2d adds 20 original
 sticker motifs, a persistent versioned style (v2 with template title and symbol),
 a CropBox-relative marker anchor, twelve built-in templates with a personal
-template library, and ShuaMac's compact composer. Annotation changes auto-save;
-there is no document library, annotation sidebar, StrikeOut support, note
-threads or agent integration.
+template library, and ShuaMac's compact composer. P2e adds Outline, Thumbnails
+and Annotations views to a collapsible sidebar attached to the open PDF window.
+Annotation changes auto-save; there is no document library, StrikeOut support,
+note threads or agent integration.
 
 Known P1 boundaries:
 

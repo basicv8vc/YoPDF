@@ -18,6 +18,23 @@ struct PageMenuContext {
     let anchorRect: CGRect
 }
 
+/// Shares the live PDFView with native PDFKit sidebar controls such as
+/// PDFThumbnailView without giving the sidebar ownership of the view.
+@MainActor
+final class PDFViewHandle: ObservableObject {
+    @Published private(set) var pdfView: PDFView?
+
+    func attach(_ view: PDFView) {
+        guard pdfView !== view else { return }
+        pdfView = view
+    }
+
+    func detach(_ view: PDFView) {
+        guard pdfView === view else { return }
+        pdfView = nil
+    }
+}
+
 /// Bridges PDFView into SwiftUI.
 ///
 /// The wrapper owns no reader state: page index, zoom, annotation selection and
@@ -28,11 +45,14 @@ struct PageMenuContext {
 struct PDFViewerRepresentable: NSViewRepresentable {
 
     let document: PDFDocument?
+    let pdfViewHandle: PDFViewHandle
     @Binding var currentPageIndex: Int
     @Binding var selection: PDFSelection?
     let autoScales: Bool
     let zoomScale: CGFloat
     let zoomCommandRevision: Int
+    let navigationDestination: PDFDestination?
+    let navigationRevision: Int
     let onScaleChange: (CGFloat) -> Void
     let onManualMagnification: () -> Void
     let selectedMarkup: MarkupSelection?
@@ -61,6 +81,7 @@ struct PDFViewerRepresentable: NSViewRepresentable {
         if !autoScales {
             view.scaleFactor = zoomScale
         }
+        pdfViewHandle.attach(view)
         view.displayMode = .singlePageContinuous
         view.displayDirection = .vertical
         view.displaysPageBreaks = true
@@ -77,6 +98,7 @@ struct PDFViewerRepresentable: NSViewRepresentable {
 
     func updateNSView(_ view: MarkupPDFView, context: Context) {
         context.coordinator.parent = self
+        pdfViewHandle.attach(view)
         context.coordinator.updateHandlers(on: view, parent: self)
         anchorResolver.pdfView = view
 
@@ -131,21 +153,37 @@ struct PDFViewerRepresentable: NSViewRepresentable {
         if let target = document.page(at: clamped), view.currentPage !== target {
             view.go(to: target)
         }
+
+        if context.coordinator.lastNavigationRevision != navigationRevision {
+            context.coordinator.lastNavigationRevision = navigationRevision
+            if let navigationDestination,
+               let page = navigationDestination.page,
+               document.index(for: page) != NSNotFound {
+                view.go(to: navigationDestination)
+            }
+        }
     }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
     }
 
+    static func dismantleNSView(_ view: MarkupPDFView, coordinator: Coordinator) {
+        coordinator.pdfViewHandle?.detach(view)
+    }
+
     @MainActor
     final class Coordinator: NSObject {
         var parent: PDFViewerRepresentable
         var lastAnnotationRevision = -1
+        var lastNavigationRevision = -1
         let zoomSynchronizer = PDFViewZoomSynchronizer()
         private weak var pdfView: MarkupPDFView?
+        weak var pdfViewHandle: PDFViewHandle?
 
         init(parent: PDFViewerRepresentable) {
             self.parent = parent
+            self.pdfViewHandle = parent.pdfViewHandle
         }
 
         func attach(to view: MarkupPDFView) {
@@ -898,33 +936,26 @@ private final class MarkupSelectionOverlayView: NSView {
     /// application's note annotations inside the marker rectangle only. The rest
     /// of PDFKit's rendering, text selection and links stay untouched.
     private func drawPageBackground(in rect: CGRect, page: PDFPage) {
-        guard let context = NSGraphicsContext.current?.cgContext,
-              let pageCopy = page.copy() as? PDFPage
-        else { return }
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
 
-        pageCopy.rotation = 0
-        pageCopy.displaysAnnotations = page.displaysAnnotations
-        for annotation in pageCopy.annotations.reversed() {
-            if NoteService.usesStickerPresentation(annotation)
-                || annotation.type == "Popup"
-                || annotation.type == "/Popup"
-            {
-                pageCopy.removeAnnotation(annotation)
-            }
-        }
-
-        let crop = pageCopy.bounds(for: .cropBox)
+        let crop = page.bounds(for: .cropBox)
         guard crop.width > 0, crop.height > 0, bounds.width > 0, bounds.height > 0 else {
             return
         }
 
-        let scale = min(bounds.width / crop.width, bounds.height / crop.height)
+        let rotation = ((page.rotation % 360) + 360) % 360
+        let isQuarterTurn = rotation == 90 || rotation == 270
+        let displayWidth = isQuarterTurn ? crop.height : crop.width
+        let displayHeight = isQuarterTurn ? crop.width : crop.height
+        let scale = min(bounds.width / displayWidth, bounds.height / displayHeight)
         let renderedSize = CGSize(
-            width: crop.width * scale,
-            height: crop.height * scale
+            width: displayWidth * scale,
+            height: displayHeight * scale
         )
+        let maskPageBounds = pageSpaceBounds(forOverlayRect: rect)
 
         context.saveGState()
+        defer { context.restoreGState() }
         context.clip(to: rect)
         // PDF pages are transparent by default. Repainting only their content
         // would leave transparent pixels in this overlay, allowing PDFKit's
@@ -934,12 +965,53 @@ private final class MarkupSelectionOverlayView: NSView {
         context.setFillColor(NSColor.white.cgColor)
         context.fill(rect)
         context.translateBy(
-            x: bounds.midX - renderedSize.width / 2 - crop.minX * scale,
-            y: bounds.midY - renderedSize.height / 2 - crop.minY * scale
+            x: bounds.midX - renderedSize.width / 2,
+            y: bounds.midY - renderedSize.height / 2
         )
         context.scaleBy(x: scale, y: scale)
-        pageCopy.draw(with: .cropBox, to: context)
-        context.restoreGState()
+
+        if let pageRef = page.pageRef {
+            // Draw the immutable PDF page content and its non-sticker
+            // annotations directly. Removing annotations from a PDFPage copy
+            // posts PDFKit page-change notifications while AppKit is drawing;
+            // PDFThumbnailView can then reload an invalid collection index and
+            // crash when a reader navigates from its thumbnail sidebar.
+            page.transform(context, for: .cropBox)
+            context.drawPDFPage(pageRef)
+
+            if page.displaysAnnotations {
+                for annotation in page.annotations where annotation.shouldDisplay {
+                    let type = annotation.type?.lowercased()
+                    guard !NoteService.usesStickerPresentation(annotation),
+                          type != "popup", type != "/popup",
+                          annotation.bounds.intersects(maskPageBounds)
+                    else { continue }
+
+                    annotation.draw(with: .cropBox, in: context)
+                }
+            }
+        } else if let pageCopy = page.copy() as? PDFPage {
+            // Pages created in memory may have no CGPDFPageRef. Keep this
+            // fallback read-only with respect to the source document; the
+            // marker itself is drawn over the result immediately afterward.
+            pageCopy.displaysAnnotations = false
+            pageCopy.draw(with: .cropBox, to: context)
+        }
+    }
+
+    private func pageSpaceBounds(forOverlayRect rect: CGRect) -> CGRect {
+        let points = [
+            CGPoint(x: rect.minX, y: rect.minY),
+            CGPoint(x: rect.maxX, y: rect.minY),
+            CGPoint(x: rect.minX, y: rect.maxY),
+            CGPoint(x: rect.maxX, y: rect.maxY)
+        ].map { pagePoint(for: $0) }
+
+        let minX = points.map(\.x).min() ?? 0
+        let maxX = points.map(\.x).max() ?? minX
+        let minY = points.map(\.y).min() ?? 0
+        let maxY = points.map(\.y).max() ?? minY
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
     }
 
     private func drawSticker(

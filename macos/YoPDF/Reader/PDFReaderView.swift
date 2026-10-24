@@ -12,6 +12,11 @@ struct PDFReaderView: View {
     @State private var isImporterPresented = false
     @State private var isDropTargeted = false
     @State private var prompt: Prompt?
+    @State private var isSidebarVisible = true
+    @State private var sidebarSection: ReaderSidebarSection = .thumbnails
+    @StateObject private var pdfViewHandle = PDFViewHandle()
+    @State private var pendingNavigationDestination: PDFDestination?
+    @State private var navigationRevision = 0
     /// Installed on the window so closing it cannot drop unsaved edits.
     @State private var closeGuard = WindowCloseGuard()
     /// The window's one note composer, and the draft that outlives its popover.
@@ -169,6 +174,13 @@ struct PDFReaderView: View {
         .focusedSceneValue(\.highlightSelection, { _ = model.addMarkup(.highlight) })
         .focusedSceneValue(\.underlineSelection, { _ = model.addMarkup(.underline) })
         .focusedSceneValue(\.addNote, { beginNote() })
+        .focusedSceneValue(
+            \.readerSidebarActions,
+            ReaderSidebarActions(
+                toggle: { toggleSidebar() },
+                select: { showSidebarSection($0) }
+            )
+        )
         .background(
             WindowCloseGuardInstaller(
                 guardObject: closeGuard,
@@ -224,6 +236,31 @@ struct PDFReaderView: View {
 
     // MARK: - Toolbar
 
+    private func toggleSidebar() {
+        withAnimation(.easeInOut(duration: 0.18)) {
+            isSidebarVisible.toggle()
+        }
+    }
+
+    private func showSidebarSection(_ section: ReaderSidebarSection) {
+        withAnimation(.easeInOut(duration: 0.18)) {
+            sidebarSection = section
+            isSidebarVisible = true
+        }
+    }
+
+    private func navigate(to destination: PDFDestination) {
+        guard let document = model.document,
+              let page = destination.page
+        else { return }
+        let pageIndex = document.index(for: page)
+        guard pageIndex != NSNotFound else { return }
+
+        model.goToPage(pageIndex)
+        pendingNavigationDestination = destination
+        navigationRevision &+= 1
+    }
+
     private var toolbar: some View {
         HStack(spacing: 12) {
             Button {
@@ -234,6 +271,15 @@ struct PDFReaderView: View {
             .help("Open a PDF (⌘O)")
 
             Divider().frame(height: 18)
+
+            Button {
+                toggleSidebar()
+            } label: {
+                Image(systemName: "sidebar.left")
+            }
+            .disabled(!model.isLoaded)
+            .help(isSidebarVisible ? "Hide Sidebar" : "Show Sidebar")
+            .accessibilityLabel(isSidebarVisible ? "Hide Sidebar" : "Show Sidebar")
 
             Button {
                 model.goToPreviousPage()
@@ -464,95 +510,115 @@ struct PDFReaderView: View {
     @ViewBuilder
     private var content: some View {
         if model.isLoaded {
-            PDFViewerRepresentable(
-                document: model.document,
-                currentPageIndex: Binding(
-                    get: { model.currentPageIndex },
-                    set: { model.goToPage($0) }
-                ),
-                selection: Binding(
-                    get: { model.currentSelection },
-                    set: { model.updateSelection($0) }
-                ),
-                autoScales: model.isAutoScaling,
-                zoomScale: model.zoomScale,
-                zoomCommandRevision: model.zoomCommandRevision,
-                onScaleChange: { model.updateEffectiveScale($0) },
-                onManualMagnification: { model.setAutoScaling(false) },
-                selectedMarkup: model.selectedMarkup,
-                noteMarkers: model.noteMarkers,
-                isPlacingNote: isPlacingNote,
-                annotationRevision: model.annotationRevision,
-                changedAnnotationPageIndices: model.changedAnnotationPageIndices,
-                onMarkupClick: { point, page in
-                    model.selectMarkup(at: point, on: page)
-                },
-                onNoteHit: { point, page in
-                    model.noteSelection(at: point, on: page)
-                },
-                onNoteActivated: { note, anchor in
-                    requestNoteComposer(note, anchor: anchor)
-                },
-                onNoteMoved: { note, center in
-                    _ = model.moveNoteMarker(note, to: center)
-                },
-                onPlaceNote: { point, page, anchor in
-                    placePageNote(at: point, on: page, anchor: anchor)
-                },
-                onCancelPlacement: { isPlacingNote = false },
-                makeMenuItems: { context in
-                    pageMenuItems(for: context)
-                },
-                anchorResolver: anchorResolver
-            )
-            .id(model.loadGeneration)
-            .popover(
-                isPresented: $composerStore.isPresented,
-                attachmentAnchor: .rect(.rect(composerStore.session?.anchorRect ?? Self.fallbackAnchor)),
-                arrowEdge: .top
-            ) {
-                if let session = composerStore.session {
-                    NoteComposerView(session: session, model: model) {
-                        composerStore.end()
-                    } onEditGroupEntry: { group, entry in
-                        guard let note = model.noteSelection(forThreadEntry: entry, in: group) else {
-                            return
+            HStack(spacing: 0) {
+                if isSidebarVisible {
+                    ReaderSidebar(
+                        model: model,
+                        pdfViewHandle: pdfViewHandle,
+                        selection: $sidebarSection,
+                        onSelectDestination: { navigate(to: $0) }
+                    )
+                    .frame(width: 250)
+
+                    Divider()
+                }
+
+                PDFViewerRepresentable(
+                    document: model.document,
+                    pdfViewHandle: pdfViewHandle,
+                    currentPageIndex: Binding(
+                        get: { model.currentPageIndex },
+                        set: { model.goToPage($0) }
+                    ),
+                    selection: Binding(
+                        get: { model.currentSelection },
+                        set: { model.updateSelection($0) }
+                    ),
+                    autoScales: model.isAutoScaling,
+                    zoomScale: model.zoomScale,
+                    zoomCommandRevision: model.zoomCommandRevision,
+                    navigationDestination: pendingNavigationDestination,
+                    navigationRevision: navigationRevision,
+                    onScaleChange: { model.updateEffectiveScale($0) },
+                    onManualMagnification: { model.setAutoScaling(false) },
+                    selectedMarkup: model.selectedMarkup,
+                    noteMarkers: model.noteMarkers,
+                    isPlacingNote: isPlacingNote,
+                    annotationRevision: model.annotationRevision,
+                    changedAnnotationPageIndices: model.changedAnnotationPageIndices,
+                    onMarkupClick: { point, page in
+                        model.selectMarkup(at: point, on: page)
+                    },
+                    onNoteHit: { point, page in
+                        model.noteSelection(at: point, on: page)
+                    },
+                    onNoteActivated: { note, anchor in
+                        requestNoteComposer(note, anchor: anchor)
+                    },
+                    onNoteMoved: { note, center in
+                        _ = model.moveNoteMarker(note, to: center)
+                    },
+                    onPlaceNote: { point, page, anchor in
+                        placePageNote(at: point, on: page, anchor: anchor)
+                    },
+                    onCancelPlacement: { isPlacingNote = false },
+                    makeMenuItems: { context in
+                        pageMenuItems(for: context)
+                    },
+                    anchorResolver: anchorResolver
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .id(model.loadGeneration)
+                .popover(
+                    isPresented: $composerStore.isPresented,
+                    attachmentAnchor: .rect(.rect(composerStore.session?.anchorRect ?? Self.fallbackAnchor)),
+                    arrowEdge: .top
+                ) {
+                    if let session = composerStore.session {
+                        NoteComposerView(session: session, model: model) {
+                            composerStore.end()
+                        } onEditGroupEntry: { group, entry in
+                            guard let note = model.noteSelection(forThreadEntry: entry, in: group) else {
+                                return
+                            }
+                            let anchor = anchorResolver.containerRect(
+                                forPageBounds: group.bounds,
+                                pageIndex: group.pageIndex
+                            ) ?? Self.fallbackAnchor
+                            requestCompose(.note(note, anchor))
                         }
-                        let anchor = anchorResolver.containerRect(
-                            forPageBounds: group.bounds,
-                            pageIndex: group.pageIndex
-                        ) ?? Self.fallbackAnchor
-                        requestCompose(.note(note, anchor))
+                        .id(session.id)
                     }
-                    .id(session.id)
+                }
+                // A composer describes one anchor in one document, so a new document
+                // or a changed annotation set can invalidate it. It is never closed
+                // on those changes alone: closing a composer that holds text is how
+                // the text gets lost. A composer with nothing to lose is closed when
+                // its target is gone; one with text stays open and explains itself.
+                .onChange(of: model.loadGeneration) { _, _ in
+                    isPlacingNote = false
+                    pendingNavigationDestination = nil
+                    composerStore.reconcile(with: model)
+                }
+                .onChange(of: model.annotationRevision) { _, _ in
+                    composerStore.reconcile(with: model)
+                }
+                .onChange(of: composerStore.isPresented) { _, presented in
+                    if !presented { composerStore.discardIfClean() }
+                }
+                .alert(
+                    "Couldn’t open this document",
+                    isPresented: Binding(
+                        get: { model.lastError != nil },
+                        set: { if !$0 { model.dismissError() } }
+                    )
+                ) {
+                    Button("OK", role: .cancel) { model.dismissError() }
+                } message: {
+                    Text(model.lastError?.errorDescription ?? "Unknown error.")
                 }
             }
-            // A composer describes one anchor in one document, so a new document
-            // or a changed annotation set can invalidate it. It is never closed
-            // on those changes alone: closing a composer that holds text is how
-            // the text gets lost. A composer with nothing to lose is closed when
-            // its target is gone; one with text stays open and explains itself.
-            .onChange(of: model.loadGeneration) { _, _ in
-                isPlacingNote = false
-                composerStore.reconcile(with: model)
-            }
-            .onChange(of: model.annotationRevision) { _, _ in
-                composerStore.reconcile(with: model)
-            }
-            .onChange(of: composerStore.isPresented) { _, presented in
-                if !presented { composerStore.discardIfClean() }
-            }
-            .alert(
-                "Couldn’t open this document",
-                isPresented: Binding(
-                    get: { model.lastError != nil },
-                    set: { if !$0 { model.dismissError() } }
-                )
-            ) {
-                Button("OK", role: .cancel) { model.dismissError() }
-            } message: {
-                Text(model.lastError?.errorDescription ?? "Unknown error.")
-            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             emptyState
         }

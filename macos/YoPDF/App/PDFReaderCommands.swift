@@ -18,6 +18,7 @@ struct PDFReaderCommands: Commands {
     @FocusedValue(\.highlightSelection) private var highlightSelection
     @FocusedValue(\.underlineSelection) private var underlineSelection
     @FocusedValue(\.addNote) private var addNote
+    @FocusedValue(\.readerSidebarActions) private var sidebarActions
 
     init(updateController: SparkleUpdateController) {
         self.updateController = updateController
@@ -124,6 +125,29 @@ struct PDFReaderCommands: Commands {
         }
 
         CommandGroup(after: .toolbar) {
+            Button("Toggle Sidebar") {
+                sidebarActions?.toggle()
+            }
+            .keyboardShortcut("s", modifiers: [.command, .option])
+            .disabled(sidebarActions == nil || model?.isLoaded != true)
+
+            Button("Outline") {
+                sidebarActions?.select(.outline)
+            }
+            .disabled(sidebarActions == nil || model?.isLoaded != true)
+
+            Button("Thumbnails") {
+                sidebarActions?.select(.thumbnails)
+            }
+            .disabled(sidebarActions == nil || model?.isLoaded != true)
+
+            Button("Annotations") {
+                sidebarActions?.select(.annotations)
+            }
+            .disabled(sidebarActions == nil || model?.isLoaded != true)
+
+            Divider()
+
             Button("Zoom In") {
                 model?.zoomIn()
             }
