@@ -945,6 +945,75 @@ final class ShuaCompatibilityTests: XCTestCase {
         XCTAssertEqual(Set(metadata.map(\.thoughtID)).count, 2)
     }
 
+    func testNameOnlyShuaGroupUsesCachedAnchorAndPromotesAllThoughtsForInterop() throws {
+        let url = try makeFixture(named: "shua-name-only-cache-migration")
+        let source = try XCTUnwrap(PDFDocument(url: url))
+        let page = try XCTUnwrap(source.page(at: 0))
+        let anchorID = UUID()
+        let originalStyle = NoteStickerStyle(motif: .cat, palette: .honey)
+        for order in 0..<2 {
+            let note = try addShuaThought(
+                to: page,
+                anchorID: anchorID,
+                order: order,
+                x: 300,
+                y: CGFloat(620 - order * 23),
+                contents: "Name-only thought \(order + 1)",
+                style: originalStyle
+            )
+            note.removeValue(forAnnotationKey: Self.shuaThoughtMetadataKey)
+            note.removeValue(forAnnotationKey: Self.yoPDFShuaIdentityKey)
+            note.removeValue(forAnnotationKey: Self.yoPDFShuaAnchorKey)
+        }
+        try write(source, to: url)
+
+        // This is the PDFKit round trip that drops `/NM`; the save helper
+        // leaves YoPDF's anchor-only cache so both old thoughts still group.
+        let pdfKitReopened = try XCTUnwrap(PDFDocument(url: url))
+        let reopenedPage = try XCTUnwrap(pdfKitReopened.page(at: 0))
+        let oldThoughts = textAnnotations(on: reopenedPage)
+        XCTAssertEqual(oldThoughts.count, 2)
+        XCTAssertTrue(oldThoughts.allSatisfy {
+            $0.value(forAnnotationKey: .name) == nil
+                && $0.value(forAnnotationKey: Self.shuaThoughtMetadataKey) == nil
+                && NoteService.shuaAnchorID(of: $0) == anchorID
+                && NoteService.shuaThoughtGroupIdentityStatus(of: $0) == .identified(anchorID)
+        })
+
+        let model = openModel(at: url)
+        let group = try markerSelection(in: model)
+        XCTAssertEqual(group.groupCount, 2)
+        let newStyle = NoteStickerStyle(motif: .washi, palette: .rose)
+        guard case .success = model.addThought(
+            to: group,
+            contents: "New differently styled thought",
+            style: newStyle
+        ) else {
+            return XCTFail("an anchor-cache-only Shua group should be promoted using its existing Anchor ID")
+        }
+
+        let modelPage = try XCTUnwrap(model.document?.page(at: 0))
+        let promotedMetadata = try thoughtMetadata(on: modelPage)
+        XCTAssertEqual(promotedMetadata.map(\.anchor.id), [anchorID, anchorID, anchorID])
+        XCTAssertEqual(promotedMetadata.map(\.thoughtOrder), [0, 1, 2])
+        XCTAssertEqual(Set(promotedMetadata.map(\.thoughtID)).count, 3)
+        XCTAssertEqual(model.noteMarkers.map(\.count), [3])
+        XCTAssertEqual(model.noteMarkers.first?.threadEntries.map(\.style), [
+            originalStyle, originalStyle, newStyle,
+        ])
+
+        XCTAssertEqual(model.save(), .saved)
+        let reopened = openModel(at: url)
+        XCTAssertEqual(reopened.noteMarkers.map(\.count), [3])
+        XCTAssertEqual(reopened.noteMarkers.first?.threadContents, [
+            "Name-only thought 1", "Name-only thought 2", "New differently styled thought",
+        ])
+        let savedMetadata = try thoughtMetadata(on: XCTUnwrap(reopened.document?.page(at: 0)))
+        XCTAssertEqual(savedMetadata.map(\.anchor.id), [anchorID, anchorID, anchorID])
+        XCTAssertEqual(savedMetadata.map(\.thoughtOrder), [0, 1, 2])
+        XCTAssertEqual(Set(savedMetadata.map(\.thoughtID)).count, 3)
+    }
+
     func testAppendingConflictingShuaIdentityIsRefusedWithoutChangingOriginalData() throws {
         let url = try makeFixture(named: "shua-conflicting-identity-append")
         let source = try XCTUnwrap(PDFDocument(url: url))

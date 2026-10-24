@@ -412,6 +412,11 @@ public enum NoteService {
         }
     }
 
+    private enum ShuaMetadataTimestampPolicy {
+        case fresh(Date)
+        case preserveExisting(fallback: Date)
+    }
+
     /// ShuaMac's unversioned Codable sticker payload. `palette` is required by
     /// ShuaMac; title and symbol are optional here so older/partial payloads
     /// can retain YoPDF's template-only fields when available.
@@ -1665,9 +1670,10 @@ public enum NoteService {
 
     /// Plans one additional thought in a Shua thread.
     ///
-    /// Legacy stacks are promoted to embedded Shua identity in the same undoable
-    /// edit as the insertion. Once promoted, grouping no longer depends on
-    /// sticker style or on keeping 23pt geometry gaps inside the CropBox.
+    /// Legacy geometry stacks and anchor-only groups are promoted to complete
+    /// Shua thought metadata in the same undoable edit as the insertion. An
+    /// existing Anchor ID is retained; only groups with no identity get a new
+    /// one. Fully identified groups are left untouched.
     static func groupedThoughtPlan(
         for group: NoteSelection,
         contents: String,
@@ -1683,14 +1689,14 @@ public enum NoteService {
 
         let identityStatus = shuaThoughtGroupIdentityStatus(of: group.annotation)
         let anchorID: UUID
-        let isLegacyGroup: Bool
+        let needsNewAnchorID: Bool
         switch identityStatus {
         case let .identified(id):
             anchorID = id
-            isLegacyGroup = false
+            needsNewAnchorID = false
         case .legacy:
             anchorID = UUID()
-            isLegacyGroup = true
+            needsNewAnchorID = true
         case .conflicting:
             return nil
         }
@@ -1701,6 +1707,8 @@ public enum NoteService {
             if case .conflicting = shuaThoughtGroupIdentityStatus(of: member) { return true }
             return false
         }) else { return nil }
+        let needsMetadataMigration = needsNewAnchorID
+            || members.contains { shuaThoughtMetadata(of: $0) == nil }
 
         let crop = page.bounds(for: .cropBox)
         guard crop.minX.isFinite, crop.minY.isFinite,
@@ -1710,7 +1718,7 @@ public enum NoteService {
 
         let now = Date()
         var identityChanges: [ShuaThoughtIdentityChange] = []
-        if isLegacyGroup {
+        if needsMetadataMigration {
             var thoughtIDs = Set<UUID>()
             for (order, member) in members.enumerated() {
                 let metadata = shuaThoughtMetadata(of: member)
@@ -1794,8 +1802,7 @@ public enum NoteService {
             group: group,
             markerCenter: group.center,
             crop: crop,
-            createdAt: now,
-            modifiedAt: now
+            timestamps: .fresh(now)
         ) else { return nil }
         _ = annotation.setValue(metadata, forAnnotationKey: shuaThoughtMetadataKey)
 
@@ -1875,8 +1882,9 @@ public enum NoteService {
                 group: group,
                 markerCenter: markerCenter,
                 crop: crop,
-                createdAt: annotation.modificationDate ?? modifiedAt,
-                modifiedAt: annotation.modificationDate ?? modifiedAt
+                timestamps: .preserveExisting(
+                    fallback: annotation.modificationDate ?? modifiedAt
+                )
             ) else { return nil }
             metadata = updated
         }
@@ -1898,8 +1906,7 @@ public enum NoteService {
         group: NoteSelection,
         markerCenter: CGPoint,
         crop: CGRect,
-        createdAt: Date,
-        modifiedAt: Date
+        timestamps: ShuaMetadataTimestampPolicy
     ) -> String? {
         var payload: [String: Any]
         if let source,
@@ -1937,8 +1944,16 @@ public enum NoteService {
         payload["version"] = 1
         payload["thoughtID"] = thoughtID.uuidString
         payload["thoughtOrder"] = thoughtOrder
-        payload["createdAt"] = createdAt.timeIntervalSinceReferenceDate
-        payload["modifiedAt"] = modifiedAt.timeIntervalSinceReferenceDate
+        switch timestamps {
+        case let .fresh(date):
+            let value = date.timeIntervalSinceReferenceDate
+            payload["createdAt"] = value
+            payload["modifiedAt"] = value
+        case let .preserveExisting(fallback):
+            let value = fallback.timeIntervalSinceReferenceDate
+            if payload["createdAt"] == nil { payload["createdAt"] = value }
+            if payload["modifiedAt"] == nil { payload["modifiedAt"] = value }
+        }
 
         guard JSONSerialization.isValidJSONObject(payload),
               let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
