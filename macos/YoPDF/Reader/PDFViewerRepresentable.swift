@@ -57,7 +57,10 @@ struct PDFViewerRepresentable: NSViewRepresentable {
 
     func makeNSView(context: Context) -> MarkupPDFView {
         let view = MarkupPDFView(frame: .zero)
-        view.autoScales = true
+        view.autoScales = autoScales
+        if !autoScales {
+            view.scaleFactor = zoomScale
+        }
         view.displayMode = .singlePageContinuous
         view.displayDirection = .vertical
         view.displaysPageBreaks = true
@@ -67,7 +70,6 @@ struct PDFViewerRepresentable: NSViewRepresentable {
         view.noteMarkers = noteMarkers
         view.isPlacingNote = isPlacingNote
         context.coordinator.attach(to: view)
-        context.coordinator.lastAppliedZoomCommandRevision = zoomCommandRevision
         context.coordinator.updateHandlers(on: view, parent: self)
         anchorResolver.pdfView = view
         return view
@@ -80,23 +82,19 @@ struct PDFViewerRepresentable: NSViewRepresentable {
 
         if view.document !== document {
             view.clearOverlayViews()
-            view.document = document
-            if document != nil {
-                view.autoScales = true
-            }
-            context.coordinator.lastAppliedZoomCommandRevision = zoomCommandRevision
         }
 
-        if context.coordinator.lastAppliedZoomCommandRevision != zoomCommandRevision {
-            // Apply only explicit toolbar/menu zoom commands. Scale changes
-            // reported by PDFKit during a pinch also refresh SwiftUI, but
-            // writing those values back here interrupts PDFKit's gesture.
-            view.autoScales = autoScales
-            if !autoScales {
-                view.scaleFactor = zoomScale
-            }
-            context.coordinator.lastAppliedZoomCommandRevision = zoomCommandRevision
-        }
+        // Apply after document assignment. Replacements (including Save and
+        // Save As) must restore the model's current Fit/manual zoom state.
+        // Ordinary scale notifications still avoid writing back into PDFKit's
+        // active native gesture.
+        context.coordinator.zoomSynchronizer.update(
+            pdfView: view,
+            document: document,
+            autoScales: autoScales,
+            zoomScale: zoomScale,
+            zoomCommandRevision: zoomCommandRevision
+        )
 
         // The model cleared the selection: the markup consumed it, or a new
         // document replaced it. PDFView keeps drawing its own selection until
@@ -143,7 +141,7 @@ struct PDFViewerRepresentable: NSViewRepresentable {
     final class Coordinator: NSObject {
         var parent: PDFViewerRepresentable
         var lastAnnotationRevision = -1
-        var lastAppliedZoomCommandRevision: Int?
+        let zoomSynchronizer = PDFViewZoomSynchronizer()
         private weak var pdfView: MarkupPDFView?
 
         init(parent: PDFViewerRepresentable) {

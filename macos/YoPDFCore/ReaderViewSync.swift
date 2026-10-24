@@ -1,10 +1,7 @@
 import CoreGraphics
+import PDFKit
 
-/// Pure decisions used by the `PDFView` bridge.
-///
-/// They live in `YoPDFCore` (no AppKit) so the page/zoom synchronisation rules
-/// can be tested without a window server. The bridge still owns the actual
-/// `PDFView` calls; this only decides *what* to apply.
+/// Pure value decisions used by the `PDFView` bridge.
 public enum ReaderViewSync {
 
     /// Page index to show, clamped to the document. `nil` when there is nothing
@@ -23,5 +20,39 @@ public enum ReaderViewSync {
     ) -> Bool {
         guard current.isFinite, target.isFinite, target > 0 else { return false }
         return abs(current - target) > tolerance
+    }
+}
+
+/// Keeps PDFView's native gesture state separate from explicit zoom commands.
+/// A document replacement always reapplies the model's current zoom state;
+/// ordinary SwiftUI refreshes only apply when the user issued a new command.
+@MainActor
+public final class PDFViewZoomSynchronizer {
+
+    private var lastAppliedZoomCommandRevision: Int?
+
+    public init() {}
+
+    public func update(
+        pdfView: PDFView,
+        document: PDFDocument?,
+        autoScales: Bool,
+        zoomScale: CGFloat,
+        zoomCommandRevision: Int
+    ) {
+        let documentChanged = pdfView.document !== document
+        if documentChanged {
+            pdfView.document = document
+        }
+
+        guard documentChanged || lastAppliedZoomCommandRevision != zoomCommandRevision else {
+            return
+        }
+
+        pdfView.autoScales = autoScales
+        if !autoScales {
+            pdfView.scaleFactor = zoomScale
+        }
+        lastAppliedZoomCommandRevision = zoomCommandRevision
     }
 }

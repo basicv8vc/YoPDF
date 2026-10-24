@@ -41,6 +41,20 @@ final class DocumentEditingTests: XCTestCase {
         return url
     }
 
+    private func synchronizeZoom(
+        _ model: PDFDocumentModel,
+        with pdfView: PDFView,
+        using synchronizer: PDFViewZoomSynchronizer
+    ) {
+        synchronizer.update(
+            pdfView: pdfView,
+            document: model.document,
+            autoScales: model.isAutoScaling,
+            zoomScale: model.zoomScale,
+            zoomCommandRevision: model.zoomCommandRevision
+        )
+    }
+
     private func selection(
         in model: PDFDocumentModel,
         pageIndex: Int,
@@ -131,8 +145,13 @@ final class DocumentEditingTests: XCTestCase {
         let model = PDFDocumentModel(access: SecurityScopeSpy())
         XCTAssertTrue(model.open(url: url))
 
+        let pdfView = PDFView(frame: NSRect(x: 0, y: 0, width: 600, height: 800))
+        let zoomSynchronizer = PDFViewZoomSynchronizer()
+        synchronizeZoom(model, with: pdfView, using: zoomSynchronizer)
+
         model.goToPage(1)
         model.setZoomScale(1.5)
+        synchronizeZoom(model, with: pdfView, using: zoomSynchronizer)
         let generation = model.loadGeneration
         let documentBefore = try XCTUnwrap(model.document)
         try highlight(model, pageIndex: 1, from: 0, to: 10)
@@ -147,6 +166,10 @@ final class DocumentEditingTests: XCTestCase {
             model.document === documentBefore,
             "the document is re-opened from the file that replaced the original inode"
         )
+        synchronizeZoom(model, with: pdfView, using: zoomSynchronizer)
+        XCTAssertTrue(pdfView.document === model.document)
+        XCTAssertFalse(pdfView.autoScales, "Save must preserve manual zoom in the PDFView")
+        XCTAssertEqual(pdfView.scaleFactor, 1.5, accuracy: 0.0001)
         XCTAssertEqual(model.pageCount, 2)
         XCTAssertEqual(model.document?.page(at: 1)?.annotations.count, 1)
         XCTAssertEqual(annotationCount(inFileAt: url, pageIndex: 1), 1)
@@ -183,9 +206,21 @@ final class DocumentEditingTests: XCTestCase {
 
         let model = PDFDocumentModel(access: SecurityScopeSpy())
         XCTAssertTrue(model.open(url: original))
+        model.setZoomScale(1.5)
+
+        let pdfView = PDFView(frame: NSRect(x: 0, y: 0, width: 600, height: 800))
+        let zoomSynchronizer = PDFViewZoomSynchronizer()
+        synchronizeZoom(model, with: pdfView, using: zoomSynchronizer)
+        XCTAssertFalse(pdfView.autoScales, "a newly synchronized view should honor manual zoom")
+        XCTAssertEqual(pdfView.scaleFactor, 1.5, accuracy: 0.0001)
+
         try highlight(model)
 
         XCTAssertEqual(model.saveAs(to: copy), .saved)
+        synchronizeZoom(model, with: pdfView, using: zoomSynchronizer)
+        XCTAssertTrue(pdfView.document === model.document)
+        XCTAssertFalse(pdfView.autoScales, "Save As must preserve manual zoom in the PDFView")
+        XCTAssertEqual(pdfView.scaleFactor, 1.5, accuracy: 0.0001)
         XCTAssertFalse(model.hasUnsavedChanges)
         XCTAssertEqual(model.fileURL, copy)
         XCTAssertEqual(model.documentSession?.url, copy)
@@ -197,6 +232,60 @@ final class DocumentEditingTests: XCTestCase {
         XCTAssertEqual(model.save(), .saved)
         XCTAssertEqual(annotationCount(inFileAt: copy), 2)
         XCTAssertEqual(annotationCount(inFileAt: original), 0)
+    }
+
+    func testPDFViewZoomSynchronizerLeavesPinchScaleAloneAndAppliesCommands() throws {
+        let url = try makeFixture()
+        let model = PDFDocumentModel(access: SecurityScopeSpy())
+        XCTAssertTrue(model.open(url: url))
+
+        let pdfView = PDFView(frame: NSRect(x: 0, y: 0, width: 600, height: 800))
+        let zoomSynchronizer = PDFViewZoomSynchronizer()
+        synchronizeZoom(model, with: pdfView, using: zoomSynchronizer)
+        XCTAssertTrue(pdfView.autoScales)
+
+        // Simulate the state transitions around PDFKit's native magnify event.
+        model.setAutoScaling(false)
+        pdfView.autoScales = false
+        pdfView.scaleFactor = 1.5
+        model.updateEffectiveScale(pdfView.scaleFactor)
+        synchronizeZoom(model, with: pdfView, using: zoomSynchronizer)
+
+        XCTAssertFalse(pdfView.autoScales)
+        XCTAssertEqual(pdfView.scaleFactor, 1.5, accuracy: 0.0001)
+
+        model.zoomIn()
+        synchronizeZoom(model, with: pdfView, using: zoomSynchronizer)
+        XCTAssertEqual(pdfView.scaleFactor, 1.875, accuracy: 0.0001)
+
+        model.zoomOut()
+        synchronizeZoom(model, with: pdfView, using: zoomSynchronizer)
+        XCTAssertEqual(pdfView.scaleFactor, 1.5, accuracy: 0.0001)
+
+        model.fitToWindow()
+        synchronizeZoom(model, with: pdfView, using: zoomSynchronizer)
+        XCTAssertTrue(pdfView.autoScales)
+    }
+
+    func testOpeningAnotherDocumentRestoresFitInPDFView() throws {
+        let first = try makeFixture(named: "first")
+        let second = try makeFixture(named: "second")
+        let model = PDFDocumentModel(access: SecurityScopeSpy())
+        XCTAssertTrue(model.open(url: first))
+
+        let pdfView = PDFView(frame: NSRect(x: 0, y: 0, width: 600, height: 800))
+        let zoomSynchronizer = PDFViewZoomSynchronizer()
+        synchronizeZoom(model, with: pdfView, using: zoomSynchronizer)
+
+        model.setZoomScale(1.5)
+        synchronizeZoom(model, with: pdfView, using: zoomSynchronizer)
+        XCTAssertFalse(pdfView.autoScales)
+
+        XCTAssertTrue(model.open(url: second))
+        synchronizeZoom(model, with: pdfView, using: zoomSynchronizer)
+
+        XCTAssertTrue(pdfView.document === model.document)
+        XCTAssertTrue(pdfView.autoScales)
     }
 
     // MARK: - Nothing to highlight
