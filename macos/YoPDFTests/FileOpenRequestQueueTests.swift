@@ -45,4 +45,31 @@ final class FileOpenRequestQueueTests: XCTestCase {
         XCTAssertEqual(queue.takeNext(), second)
         queue.finishRequest()
     }
+
+    func testReaderCloseRestoresPendingRequestAndKeepsAdmissionOccupied() {
+        let queue = FileOpenRequestQueue()
+        let first = URL(fileURLWithPath: "/tmp/first.pdf")
+        let second = URL(fileURLWithPath: "/tmp/second.pdf")
+
+        XCTAssertTrue(queue.enqueue(first))
+        XCTAssertTrue(queue.readerWindowDidClose())
+        XCTAssertFalse(queue.enqueue(second), "Closing a reader must not free an accepted request.")
+        XCTAssertEqual(queue.takeNext(), first)
+        queue.finishRequest()
+
+        XCTAssertFalse(queue.readerWindowDidClose(), "A finished request needs no recovery.")
+        XCTAssertTrue(queue.enqueue(second))
+    }
+
+    func testReaderCloseRequeuesARequestAlreadyTakenByThatReader() {
+        let queue = FileOpenRequestQueue()
+        let first = URL(fileURLWithPath: "/tmp/first.pdf")
+
+        XCTAssertTrue(queue.enqueue(first))
+        XCTAssertEqual(queue.takeNext(), first)
+        XCTAssertTrue(queue.readerWindowDidClose())
+        XCTAssertEqual(queue.takeNext(), first, "The next reader must receive the in-flight URL.")
+        queue.finishRequest()
+        XCTAssertNil(queue.takeNext())
+    }
 }

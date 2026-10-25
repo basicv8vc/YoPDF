@@ -46,6 +46,7 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
     private var onDiscardDraft: () -> Void = {}
     private var onDiscardDocumentChanges: () -> Void = {}
     private var onUnsavedChanges: (Intent) -> Void = { _ in }
+    private var onWindowClosed: () -> Void = {}
     /// Set just before the guard closes the window itself, so the close it asked
     /// for is not refused by the same check.
     private var allowsNextClose = false
@@ -86,7 +87,8 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
         unsavedWork: @escaping () -> UnsavedWork,
         discardDraft: @escaping () -> Void,
         discardDocumentChanges: @escaping () -> Void,
-        onUnsavedChanges: @escaping (Intent) -> Void
+        onUnsavedChanges: @escaping (Intent) -> Void,
+        onWindowClosed: @escaping () -> Void
     ) {
         guard !closedWindows.contains(window) else { return }
         // The closures read live state, so they are refreshed on every update.
@@ -94,6 +96,7 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
         self.onDiscardDraft = discardDraft
         self.onDiscardDocumentChanges = discardDocumentChanges
         self.onUnsavedChanges = onUnsavedChanges
+        self.onWindowClosed = onWindowClosed
 
         if self.window !== window {
             detachFromCurrentWindow()
@@ -142,11 +145,14 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
         // Forward first, then let go: the previous delegate is what tears the
         // scene down, and it must still be alive while it runs.
         let previous = previousDelegate
+        let didClose = onWindowClosed
         previousDelegate = nil
+        onWindowClosed = {}
         stopObserving()
         Self.unregister(self)
         window = nil
         previous?.windowWillClose?(notification)
+        didClose()
     }
 
     // MARK: - Delegation
@@ -282,6 +288,7 @@ struct WindowCloseGuardInstaller: NSViewRepresentable {
     let discardDocumentChanges: () -> Void
     let onUnsavedChanges: (WindowCloseGuard.Intent) -> Void
     let onWindowAvailable: () -> Void
+    let onWindowClosed: () -> Void
 
     func makeNSView(context: Context) -> NSView {
         let view = WindowReportingView()
@@ -302,7 +309,8 @@ struct WindowCloseGuardInstaller: NSViewRepresentable {
                 unsavedWork: unsavedWork,
                 discardDraft: discardDraft,
                 discardDocumentChanges: discardDocumentChanges,
-                onUnsavedChanges: onUnsavedChanges
+                onUnsavedChanges: onUnsavedChanges,
+                onWindowClosed: onWindowClosed
             )
             if !wasAlreadyAttached {
                 onWindowAvailable()

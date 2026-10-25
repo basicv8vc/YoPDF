@@ -229,6 +229,12 @@ struct PDFReaderView: View {
                         await Task.yield()
                         openFileRequestIfReady()
                     }
+                },
+                onWindowClosed: {
+                    guard fileOpenRequests.readerWindowDidClose() else { return }
+                    if WindowCloseGuard.installedGuards(among: NSApp.windows).isEmpty {
+                        fileOpenRequests.openReaderWindowIfAvailable()
+                    }
                 }
             )
         )
@@ -307,13 +313,6 @@ struct PDFReaderView: View {
 
     private var urlReader: some View {
         importedReader
-            // SwiftUI URL delivery must use the same admission and unsaved-work
-            // checks as the AppKit file-open callbacks.
-            .onOpenURL { url in
-                guard url.isFileURL else { return }
-                fileOpenRequests.enqueue(url)
-                openFileRequestIfReady()
-            }
             .task {
                 openScreenshotPDFIfConfigured()
                 openFileRequestIfReady()
