@@ -31,6 +31,10 @@ struct SaveDocumentAsActionKey: FocusedValueKey {
     typealias Value = @MainActor () -> Void
 }
 
+struct ExportAnnotationsActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
 struct FindInDocumentActionKey: FocusedValueKey {
     typealias Value = @MainActor () -> Void
 }
@@ -81,6 +85,11 @@ extension FocusedValues {
     var saveDocumentAs: (@MainActor () -> Void)? {
         get { self[SaveDocumentAsActionKey.self] }
         set { self[SaveDocumentAsActionKey.self] = newValue }
+    }
+
+    var exportAnnotations: (@MainActor () -> Void)? {
+        get { self[ExportAnnotationsActionKey.self] }
+        set { self[ExportAnnotationsActionKey.self] = newValue }
     }
 
     var findInDocument: (@MainActor () -> Void)? {
