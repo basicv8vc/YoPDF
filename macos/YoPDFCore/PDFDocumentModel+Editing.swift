@@ -253,6 +253,14 @@ extension PDFDocumentModel {
         }
     }
 
+    /// Restores a debounce that was canceled while preparing to replace the
+    /// current document, when the replacement later fails and the old edits
+    /// are still live.
+    func restoreAutoSaveAfterFailedOpen(wasPending: Bool) {
+        guard wasPending, document != nil, hasUnsavedChanges else { return }
+        scheduleAutoSave()
+    }
+
     /// Runs a synchronous modal workflow while pausing the pending debounce.
     /// An in-flight write is allowed to finish; a pending write resumes after
     /// the workflow only if the document is still dirty.

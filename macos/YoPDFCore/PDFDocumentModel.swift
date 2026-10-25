@@ -259,6 +259,7 @@ public final class PDFDocumentModel: ObservableObject {
         // Phase 3: commit. Stop a pending checkpoint before discarding the
         // previous document, then release its scope only after any already
         // running file operation has ended.
+        let hadPendingAutoSave = autoSaveStatus == .pending && autoSaveTask != nil
         cancelPendingAutoSave(cancelInFlightWork: discardingUnsavedChanges)
         let automaticWriteWasStarted = autoSaveWorkCompletion?.didStartWrite ?? false
         waitForAutoSaveWork()
@@ -298,11 +299,13 @@ public final class PDFDocumentModel: ObservableObject {
                       try recentDocuments.relink(recentDocument, to: url)
                 else {
                     candidate.close()
+                    restoreAutoSaveAfterFailedOpen(wasPending: hadPendingAutoSave)
                     lastError = .couldNotRelinkRecentDocument
                     return false
                 }
             } catch {
                 candidate.close()
+                restoreAutoSaveAfterFailedOpen(wasPending: hadPendingAutoSave)
                 lastError = .couldNotRelinkRecentDocument
                 return false
             }
