@@ -904,15 +904,22 @@ struct PDFReaderView: View {
                     Text("Recent Documents")
                         .font(.callout.weight(.medium))
                         .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     ForEach(Array(recentDocuments.items.prefix(5))) { item in
-                        Button(item.displayName) {
+                        Button {
                             requestOpenRecent(item)
+                        } label: {
+                            Text(item.displayName)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         .buttonStyle(.plain)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         .help(item.lastKnownPath)
                     }
                 }
-                .frame(maxWidth: 360, alignment: .leading)
+                .frame(maxWidth: 360, alignment: .center)
                 .padding(.top, 14)
             }
         }
