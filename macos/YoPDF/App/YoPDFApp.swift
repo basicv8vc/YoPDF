@@ -15,12 +15,12 @@ struct YoPDFApp: App {
                 recentDocuments: recentDocuments,
                 fileOpenRequests: appDelegate.fileOpenRequests
             )
+            .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
         }
         .defaultSize(width: 1100, height: 820)
-        // Leave document-open events to AppKit's application(_:open:) handler.
-        // Without this, WindowGroup claims external file URLs by creating an
-        // empty scene before the PDF reader can consume the request.
-        .handlesExternalEvents(matching: [])
+        // A cold file-open event must be allowed to create a reader. Existing
+        // readers prefer subsequent events, avoiding an extra empty window.
+        .handlesExternalEvents(matching: ["*"])
         .commands {
             PDFReaderCommands(
                 updateController: updateController,

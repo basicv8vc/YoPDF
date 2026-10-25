@@ -9,35 +9,79 @@ import Foundation
 @MainActor
 final class FileOpenRequestQueue: ObservableObject {
 
+    struct Request: Equatable, Identifiable {
+        let id: UUID
+        let url: URL
+        /// `nil` while the URL is waiting for a reader to take it.
+        let readerID: UUID?
+    }
+
     @Published private(set) var revision = 0
-    private var pendingURL: URL?
-    private var requestIsActive = false
+    private var pendingRequest: Request?
+    /// Keep the current owner and request identity until it finishes. If that
+    /// reader closes, the same request can be reassigned without letting a
+    /// different reader's close or a stale completion mutate it.
+    private var inFlightRequest: Request?
     private var readerWindowOpener: (@MainActor () -> Void)?
     private(set) var hasHadReaderWindow = false
 
-    /// Accepts one request. Further events fail until `finishRequest()` is
-    /// called, including while the first request is being confirmed.
+    /// A Finder event need not make a reader key. Ignore non-reader windows
+    /// (such as panels), then fall back to the frontmost available reader.
+    static func preferredReader<ID: Hashable>(key: ID?, main: ID?, orderedReaders: [ID]) -> ID? {
+        if let key, orderedReaders.contains(key) { return key }
+        if let main, orderedReaders.contains(main) { return main }
+        return orderedReaders.first
+    }
+
+    /// Accepts one request. Further events fail until its owner finishes it,
+    /// including while the first request is being confirmed.
     @discardableResult
     func enqueue(_ url: URL) -> Bool {
-        guard !requestIsActive else { return false }
-        pendingURL = url
-        requestIsActive = true
+        guard pendingRequest == nil, inFlightRequest == nil else { return false }
+        pendingRequest = Request(id: UUID(), url: url, readerID: nil)
         revision &+= 1
         return true
     }
 
-    func takeNext() -> URL? {
-        guard let url = pendingURL else { return nil }
-        pendingURL = nil
+    func takeNext(readerID: UUID) -> Request? {
+        guard inFlightRequest == nil, let pendingRequest else { return nil }
+        let request = Request(id: pendingRequest.id, url: pendingRequest.url, readerID: readerID)
+        self.pendingRequest = nil
+        inFlightRequest = request
         revision &+= 1
-        return url
+        return request
     }
 
-    func finishRequest() {
-        guard requestIsActive else { return }
-        pendingURL = nil
-        requestIsActive = false
+    /// Re-queues an in-flight request only when its owner closes. A reader
+    /// closing while a request is still unclaimed also wakes other readers so
+    /// one can take it, or opens a replacement if none remain.
+    @discardableResult
+    func readerWindowDidClose(readerID: UUID) -> Bool {
+        if let inFlightRequest {
+            guard inFlightRequest.readerID == readerID else { return false }
+            pendingRequest = Request(
+                id: inFlightRequest.id,
+                url: inFlightRequest.url,
+                readerID: nil
+            )
+            self.inFlightRequest = nil
+        } else if pendingRequest == nil {
+            return false
+        }
         revision &+= 1
+        return true
+    }
+
+    /// A stale reader cannot finish a request after it has been handed to
+    /// another window.
+    @discardableResult
+    func finishRequest(requestID: UUID, readerID: UUID) -> Bool {
+        guard inFlightRequest?.id == requestID,
+              inFlightRequest?.readerID == readerID
+        else { return false }
+        inFlightRequest = nil
+        revision &+= 1
+        return true
     }
 
     func registerReaderWindowOpener(_ opener: @escaping @MainActor () -> Void) {
@@ -50,5 +94,33 @@ final class FileOpenRequestQueue: ObservableObject {
 
     func openReaderWindowIfAvailable() {
         readerWindowOpener?()
+    }
+
+    /// Debug UI tests use this trace to confirm how LaunchServices routes each
+    /// file-open action. Release builds compile out both the argument and I/O.
+    func recordOpenCallback(_ source: String, urls: [URL]) {
+        #if DEBUG
+        guard let argument = ProcessInfo.processInfo.arguments.first(where: {
+            $0.hasPrefix("--yopdf-open-trace=")
+        }) else { return }
+        let path = String(argument.dropFirst("--yopdf-open-trace=".count))
+        guard !path.isEmpty else { return }
+
+        do {
+            let traceURL = URL(fileURLWithPath: path)
+            let entry: [String: Any] = ["source": source, "paths": urls.map(\.path)]
+            var data = try JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys])
+            data.append(0x0A)
+            if !FileManager.default.fileExists(atPath: path) {
+                FileManager.default.createFile(atPath: path, contents: Data())
+            }
+            let handle = try FileHandle(forWritingTo: traceURL)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+        } catch {
+            NSLog("YoPDF test open trace failed: %@", error.localizedDescription)
+        }
+        #endif
     }
 }

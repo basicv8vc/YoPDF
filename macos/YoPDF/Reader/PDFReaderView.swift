@@ -16,6 +16,7 @@ struct PDFReaderView: View {
     /// A Finder request stays reserved while its Save / Discard / Cancel prompt
     /// is visible, so another event cannot replace the action in that prompt.
     @State private var finderOpenRequestAwaitingResolution = false
+    @State private var finderOpenRequestID: UUID?
     @State private var isDropTargeted = false
     @State private var prompt: Prompt?
     @State private var isSidebarVisible = true
@@ -206,7 +207,8 @@ struct PDFReaderView: View {
     }
 
     private var closeGuardReader: some View {
-        focusedReader.background(
+        let readerID = closeGuard.readerID
+        return focusedReader.background(
             WindowCloseGuardInstaller(
                 guardObject: closeGuard,
                 unsavedWork: { unsavedWork },
@@ -228,6 +230,12 @@ struct PDFReaderView: View {
                     Task { @MainActor in
                         await Task.yield()
                         openFileRequestIfReady()
+                    }
+                },
+                onWindowClosed: {
+                    guard fileOpenRequests.readerWindowDidClose(readerID: readerID) else { return }
+                    if WindowCloseGuard.installedGuards(among: NSApp.windows).isEmpty {
+                        fileOpenRequests.openReaderWindowIfAvailable()
                     }
                 }
             )
@@ -313,31 +321,56 @@ struct PDFReaderView: View {
             }
     }
 
-    /// Only the key reader window consumes Finder requests. On a cold launch,
-    /// the URL may be queued before SwiftUI creates this view; on an already
-    /// running app, the queue revision wakes the active reader. Becoming key
-    /// retries a request that arrived before a window was ready.
+    /// Prefer the key reader, then the main/frontmost reader. Finder can create
+    /// a visible window without making it key; requiring key status strands
+    /// the URL indefinitely. All readers use the same choice so only one takes
+    /// the request, including while the app is inactive.
     private func openFileRequestIfReady() {
-        let window = closeGuard.window
-        let isKeyWindow = window.map { NSApp.keyWindow === $0 } ?? false
+        let readers = WindowCloseGuard.installedGuards(among: NSApp.windows).compactMap(\.window)
+        let readerIDs = Set(readers.map(ObjectIdentifier.init))
+        let orderedReaders = (NSApp.orderedWindows + readers).filter {
+            readerIDs.contains(ObjectIdentifier($0))
+        }
+        let target = FileOpenRequestQueue.preferredReader(
+            key: NSApp.keyWindow.map(ObjectIdentifier.init),
+            main: NSApp.mainWindow.map(ObjectIdentifier.init),
+            orderedReaders: orderedReaders.map(ObjectIdentifier.init)
+        )
         guard prompt == nil,
               !isImporterPresented,
-              window != nil,
-              isKeyWindow,
-              let url = fileOpenRequests.takeNext()
+              let window = closeGuard.window,
+              target == ObjectIdentifier(window),
+              let request = fileOpenRequests.takeNext(readerID: closeGuard.readerID)
         else { return }
 
-        finderOpenRequestAwaitingResolution = promptKind(for: .open(url)) != .none
-        requestOpen(url)
+        // Finder may deliver a file while the application is inactive or a
+        // recreated reader has not become key. Taking the URL first prevents
+        // the ensuing key notification from delivering the same request twice.
+        window.deminiaturize(nil)
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        finderOpenRequestID = request.id
+        finderOpenRequestAwaitingResolution = promptKind(for: .open(request.url)) != .none
+        requestOpen(request.url)
         if !finderOpenRequestAwaitingResolution {
-            fileOpenRequests.finishRequest()
+            finishFinderOpenRequest(requestID: request.id)
         }
     }
 
     private func finishFinderOpenRequestIfResolved() {
-        guard finderOpenRequestAwaitingResolution, prompt == nil else { return }
+        guard finderOpenRequestAwaitingResolution,
+              prompt == nil,
+              let requestID = finderOpenRequestID
+        else { return }
         finderOpenRequestAwaitingResolution = false
-        fileOpenRequests.finishRequest()
+        finishFinderOpenRequest(requestID: requestID)
+    }
+
+    private func finishFinderOpenRequest(requestID: UUID) {
+        guard finderOpenRequestID == requestID else { return }
+        finderOpenRequestID = nil
+        fileOpenRequests.finishRequest(requestID: requestID, readerID: closeGuard.readerID)
     }
 
     private var importedReader: some View {

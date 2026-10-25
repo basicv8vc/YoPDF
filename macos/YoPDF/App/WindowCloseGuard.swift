@@ -23,6 +23,9 @@ import YoPDFCore
 @MainActor
 final class WindowCloseGuard: NSObject, NSWindowDelegate {
 
+    /// Stable ownership identity for a reader window's Finder open request.
+    let readerID = UUID()
+
     enum Intent {
         /// The window's close button, ⌘W, or `performClose:`.
         case windowClose
@@ -31,6 +34,10 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
     }
 
     private(set) weak var window: NSWindow?
+    /// SwiftUI can update a representable after its windowWillClose callback.
+    /// Never re-register that closed window as an available reader. Keep only
+    /// weak references so this does not extend any window's lifetime.
+    private let closedWindows = NSHashTable<NSWindow>.weakObjects()
     private var work: () -> UnsavedWork = {
         UnsavedWork(
             documentRevision: 0,
@@ -42,6 +49,7 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
     private var onDiscardDraft: () -> Void = {}
     private var onDiscardDocumentChanges: () -> Void = {}
     private var onUnsavedChanges: (Intent) -> Void = { _ in }
+    private var onWindowClosed: () -> Void = {}
     /// Set just before the guard closes the window itself, so the close it asked
     /// for is not refused by the same check.
     private var allowsNextClose = false
@@ -82,13 +90,16 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
         unsavedWork: @escaping () -> UnsavedWork,
         discardDraft: @escaping () -> Void,
         discardDocumentChanges: @escaping () -> Void,
-        onUnsavedChanges: @escaping (Intent) -> Void
+        onUnsavedChanges: @escaping (Intent) -> Void,
+        onWindowClosed: @escaping () -> Void
     ) {
+        guard !closedWindows.contains(window) else { return }
         // The closures read live state, so they are refreshed on every update.
         self.work = unsavedWork
         self.onDiscardDraft = discardDraft
         self.onDiscardDocumentChanges = discardDocumentChanges
         self.onUnsavedChanges = onUnsavedChanges
+        self.onWindowClosed = onWindowClosed
 
         if self.window !== window {
             detachFromCurrentWindow()
@@ -131,14 +142,20 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        if let closingWindow = notification.object as? NSWindow {
+            closedWindows.add(closingWindow)
+        }
         // Forward first, then let go: the previous delegate is what tears the
         // scene down, and it must still be alive while it runs.
         let previous = previousDelegate
+        let didClose = onWindowClosed
         previousDelegate = nil
+        onWindowClosed = {}
         stopObserving()
         Self.unregister(self)
         window = nil
         previous?.windowWillClose?(notification)
+        didClose()
     }
 
     // MARK: - Delegation
@@ -274,6 +291,7 @@ struct WindowCloseGuardInstaller: NSViewRepresentable {
     let discardDocumentChanges: () -> Void
     let onUnsavedChanges: (WindowCloseGuard.Intent) -> Void
     let onWindowAvailable: () -> Void
+    let onWindowClosed: () -> Void
 
     func makeNSView(context: Context) -> NSView {
         let view = WindowReportingView()
@@ -294,7 +312,8 @@ struct WindowCloseGuardInstaller: NSViewRepresentable {
                 unsavedWork: unsavedWork,
                 discardDraft: discardDraft,
                 discardDocumentChanges: discardDocumentChanges,
-                onUnsavedChanges: onUnsavedChanges
+                onUnsavedChanges: onUnsavedChanges,
+                onWindowClosed: onWindowClosed
             )
             if !wasAlreadyAttached {
                 onWindowAvailable()
