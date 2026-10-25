@@ -16,6 +16,7 @@ public final class PDFDocumentModel: ObservableObject {
         case permissionDenied
         case unreadable
         case emptyDocument
+        case couldNotRelinkRecentDocument
         case unsupportedFileSituation(UnsupportedFileSituation)
         /// The current document has edits that are not on disk. Replacing it
         /// would discard them, so the caller has to save or discard first.
@@ -186,8 +187,16 @@ public final class PDFDocumentModel: ObservableObject {
     /// document is known to be readable would clear the flag on a document that
     /// is still on screen, and the next close would drop its edits without
     /// asking.
+    ///
+    /// When `relinking` is supplied, the saved recent entry is updated only
+    /// after the selected PDF and its security-scoped session have both opened
+    /// successfully. A failed candidate leaves that entry intact.
     @discardableResult
-    public func open(url: URL, discardingUnsavedChanges: Bool = false) -> Bool {
+    public func open(
+        url: URL,
+        discardingUnsavedChanges: Bool = false,
+        relinking recentDocument: RecentDocument? = nil
+    ) -> Bool {
         guard discardingUnsavedChanges || !hasUnsavedChanges else {
             lastError = .unsavedChanges
             return false
@@ -201,7 +210,13 @@ public final class PDFDocumentModel: ObservableObject {
             return false
         }
 
-        let restoredPosition = recentDocuments?.readingPosition(for: url)
+        let restoredPosition: RecentReadingPosition?
+        if let recentDocument {
+            restoredPosition = recentDocuments?.readingPosition(for: recentDocument)
+                ?? recentDocument.readingPosition
+        } else {
+            restoredPosition = recentDocuments?.readingPosition(for: url)
+        }
 
         let reopeningCurrentFile = fileURL?.standardizedFileURL == url.standardizedFileURL
         if reopeningCurrentFile {
@@ -277,6 +292,22 @@ public final class PDFDocumentModel: ObservableObject {
             opened = refreshed
         }
 
+        if let recentDocument {
+            do {
+                guard let recentDocuments,
+                      try recentDocuments.relink(recentDocument, to: url)
+                else {
+                    candidate.close()
+                    lastError = .couldNotRelinkRecentDocument
+                    return false
+                }
+            } catch {
+                candidate.close()
+                lastError = .couldNotRelinkRecentDocument
+                return false
+            }
+        }
+
         // Swap first, then release the previous scope, so the
         // model is never left without access to the document it displays.
         let previous = documentSession
@@ -284,7 +315,7 @@ public final class PDFDocumentModel: ObservableObject {
         previous?.close()
 
         apply(document: opened, fileURL: url, restoring: restoredPosition)
-        if let recentDocuments, !recentDocuments.recordOpened(url) {
+        if recentDocument == nil, let recentDocuments, !recentDocuments.recordOpened(url) {
             NSLog("YoPDF could not save a recent-document bookmark for %@", url.lastPathComponent)
         }
         persistReadingPosition()
@@ -613,6 +644,8 @@ extension PDFDocumentModel.LoadError: LocalizedError {
             return "This file is not a readable PDF. It may be damaged or password protected."
         case .emptyDocument:
             return "This PDF contains no pages."
+        case .couldNotRelinkRecentDocument:
+            return "YoPDF could not relink this recent document. The existing recent entry was left unchanged."
         case .unsavedChanges:
             return "Save or discard your changes before opening another document."
         case let .unsupportedFileSituation(situation):

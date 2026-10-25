@@ -94,6 +94,105 @@ final class RecentDocumentsStoreTests: XCTestCase {
         XCTAssertEqual(resolvedURL.standardizedFileURL, movedURL.standardizedFileURL)
     }
 
+    func testRelinkAfterBrokenBookmarkUpdatesOriginalEntryAndRemovesDuplicate() throws {
+        let originalURL = try makePDF(named: "relink-original")
+        let targetDirectory = try TemporaryDirectory("recent-relink-target")
+        defer { targetDirectory.remove() }
+        let targetURL = try targetDirectory.write(
+            "relinked.pdf",
+            PDFFixtureFactory.makePDFData(pageCount: 4)
+        )
+        let store = RecentDocumentsStore(
+            defaults: defaults,
+            bookmarkDataProvider: { url in
+                if url.standardizedFileURL == originalURL.standardizedFileURL {
+                    return Data([0x01, 0x02, 0x03])
+                }
+                return try url.bookmarkData(options: [.withSecurityScope])
+            }
+        )
+        XCTAssertTrue(store.recordOpened(originalURL))
+        let originalID = try XCTUnwrap(store.items.first?.id)
+        let position = RecentReadingPosition(pageIndex: 2, zoomScale: 1.6, usesAutomaticScaling: false)
+        store.updateReadingPosition(position, for: originalURL)
+        let originalItem = try XCTUnwrap(store.items.first { $0.id == originalID })
+
+        XCTAssertThrowsError(try store.resolveURL(for: originalItem))
+
+        // Simulate the same PDF having appeared under its new path before the
+        // user relinks the older, now-unresolvable entry.
+        XCTAssertTrue(store.recordOpened(targetURL))
+        let duplicateID = try XCTUnwrap(store.items.first { $0.lastKnownPath == targetURL.path }?.id)
+        let model = PDFDocumentModel(recentDocuments: store)
+
+        XCTAssertTrue(model.open(url: targetURL, relinking: originalItem))
+
+        XCTAssertEqual(model.currentPageIndex, position.pageIndex)
+        XCTAssertEqual(model.zoomScale, CGFloat(position.zoomScale), accuracy: 0.0001)
+        XCTAssertEqual(store.items.count, 1)
+        let relinked = try XCTUnwrap(store.items.first)
+        XCTAssertEqual(relinked.id, originalID)
+        XCTAssertNotEqual(relinked.id, duplicateID)
+        XCTAssertEqual(relinked.lastKnownPath, targetURL.standardizedFileURL.path)
+        XCTAssertEqual(relinked.displayName, targetURL.lastPathComponent)
+        XCTAssertNotEqual(relinked.bookmarkData, originalItem.bookmarkData)
+        XCTAssertEqual(relinked.readingPosition, position)
+        let relaunchedStore = RecentDocumentsStore(defaults: defaults)
+        XCTAssertEqual(relaunchedStore.items.count, 1)
+        let relaunchedItem = try XCTUnwrap(relaunchedStore.items.first)
+        XCTAssertEqual(relaunchedItem.id, originalID)
+        XCTAssertEqual(relaunchedItem.readingPosition, position)
+        XCTAssertEqual(
+            try relaunchedStore.resolveURL(for: relaunchedItem).standardizedFileURL,
+            targetURL.standardizedFileURL
+        )
+        model.close()
+    }
+
+    func testFailedRelinkOpenLeavesOriginalEntryUnchanged() throws {
+        let originalURL = try makePDF(named: "relink-failure-original")
+        let targetDirectory = try TemporaryDirectory("recent-relink-failure")
+        defer { targetDirectory.remove() }
+        let brokenURL = try targetDirectory.write("broken.pdf", Data("not a PDF".utf8))
+        let store = RecentDocumentsStore(
+            defaults: defaults,
+            bookmarkDataProvider: { url in
+                if url.standardizedFileURL == originalURL.standardizedFileURL {
+                    return Data([0x01, 0x02, 0x03])
+                }
+                return try url.bookmarkData(options: [.withSecurityScope])
+            }
+        )
+        XCTAssertTrue(store.recordOpened(originalURL))
+        let position = RecentReadingPosition(pageIndex: 1, zoomScale: 1.4, usesAutomaticScaling: false)
+        store.updateReadingPosition(position, for: originalURL)
+        let originalItem = try XCTUnwrap(store.items.first)
+        let originalEntries = store.items
+        let model = PDFDocumentModel(recentDocuments: store)
+
+        XCTAssertFalse(model.open(url: brokenURL, relinking: originalItem))
+
+        XCTAssertEqual(model.lastError, .unreadable)
+        XCTAssertEqual(store.items, originalEntries)
+        XCTAssertEqual(store.items.first?.readingPosition, position)
+        model.close()
+    }
+
+    func testCancelledRelinkSelectionLeavesOriginalEntryUnchanged() throws {
+        let originalURL = try makePDF(named: "relink-cancel")
+        let store = RecentDocumentsStore(
+            defaults: defaults,
+            bookmarkDataProvider: { _ in Data([0x01, 0x02, 0x03]) }
+        )
+        XCTAssertTrue(store.recordOpened(originalURL))
+        let originalItem = try XCTUnwrap(store.items.first)
+        let originalEntries = store.items
+
+        XCTAssertFalse(try store.relink(originalItem, to: nil))
+
+        XCTAssertEqual(store.items, originalEntries)
+    }
+
     func testModelRestoresPageAndManualZoomAndClampsPageAfterDocumentChanges() throws {
         let url = try makePDF(pageCount: 4, named: "position")
         let store = RecentDocumentsStore(defaults: defaults)

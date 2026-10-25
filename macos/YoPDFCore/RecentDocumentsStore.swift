@@ -47,6 +47,8 @@ public enum RecentDocumentsError: Error, Equatable {
     case itemNoLongerAvailable
     case bookmarkCouldNotBeResolved
     case bookmarkDidNotResolveToFile
+    case bookmarkCouldNotBeCreated
+    case storageUnavailable
 }
 
 /// Stores recent PDFs and reading positions in UserDefaults, using security-
@@ -173,12 +175,77 @@ public final class RecentDocumentsStore: ObservableObject {
         return true
     }
 
+    /// Replaces a broken recent bookmark after the selected PDF has been
+    /// validated and opened by `PDFDocumentModel`. A nil URL represents a
+    /// cancelled file selection and leaves the stored entry untouched.
+    ///
+    /// The bookmark is created before any stored state changes. Callers must
+    /// keep the selected URL's security scope active until this method returns.
+    @discardableResult
+    public func relink(_ item: RecentDocument, to selectedURL: URL?) throws -> Bool {
+        guard let selectedURL else { return false }
+        guard !hasUnreadableStoredValue else { throw RecentDocumentsError.storageUnavailable }
+        guard selectedURL.isFileURL else { throw RecentDocumentsError.bookmarkDidNotResolveToFile }
+        guard let previous = items.first(where: { $0.id == item.id }) else {
+            throw RecentDocumentsError.itemNoLongerAvailable
+        }
+
+        let url = selectedURL.standardizedFileURL
+        let bookmark: Data
+        do {
+            bookmark = try bookmarkDataProvider(selectedURL)
+        } catch {
+            throw RecentDocumentsError.bookmarkCouldNotBeCreated
+        }
+
+        let path = url.path
+        let duplicateIDs = Set(items.compactMap { candidate -> UUID? in
+            guard candidate.id != previous.id else { return nil }
+            guard candidate.lastKnownPath == path || resolvedURLs[candidate.id]?.path == path else {
+                return nil
+            }
+            return candidate.id
+        })
+        let updated = RecentDocument(
+            id: previous.id,
+            displayName: url.lastPathComponent,
+            bookmarkData: bookmark,
+            lastOpenedAt: .now,
+            lastKnownPath: path,
+            readingPosition: previous.readingPosition
+        )
+
+        items.removeAll { $0.id == previous.id || duplicateIDs.contains($0.id) }
+        items.insert(updated, at: 0)
+        if items.count > Self.maximumCount {
+            items = Array(items.prefix(Self.maximumCount))
+        }
+
+        resolvedURLs[previous.id] = url
+        for id in duplicateIDs {
+            resolvedURLs[id] = nil
+        }
+        let retainedIDs = Set(items.map(\.id))
+        resolvedURLs = resolvedURLs.filter { retainedIDs.contains($0.key) }
+        staleBookmarkIDs.remove(previous.id)
+        staleBookmarkIDs.subtract(duplicateIDs)
+        staleBookmarkIDs.formIntersection(retainedIDs)
+        persist()
+        return true
+    }
+
     /// The saved position for a file, including a bookmark-resolved moved file.
     public func readingPosition(for url: URL) -> RecentReadingPosition? {
         let path = url.standardizedFileURL.path
         return items.first { item in
             item.lastKnownPath == path || resolvedURLs[item.id]?.path == path
         }?.readingPosition
+    }
+
+    /// The current position for an entry, even when the selected relink target
+    /// has a different path from the bookmark that originally pointed to it.
+    public func readingPosition(for item: RecentDocument) -> RecentReadingPosition? {
+        items.first { $0.id == item.id }?.readingPosition
     }
 
     /// Saves the latest page and zoom values for an already-open recent item.

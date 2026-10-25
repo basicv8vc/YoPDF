@@ -56,8 +56,11 @@ go through the usual unsaved-document and note-draft prompts. YoPDF does not
 automatically reopen every window at launch.
 
 If macOS can no longer resolve a saved bookmark, YoPDF keeps the recent entry
-and asks the user to choose the PDF again, which grants access to its current
-location.
+and offers **Relink…**. Choosing the moved PDF validates and opens it before
+YoPDF replaces that entry's bookmark and path. The entry keeps its identity and
+reading position, and any duplicate for the selected path is removed. Canceling
+the picker or choosing a file that cannot be opened leaves the recent entry
+unchanged.
 
 ## Requirements
 
@@ -73,7 +76,7 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (326)
+./scripts/test.sh                     # unit tests (329)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
@@ -723,7 +726,9 @@ System Events / Preview and `qlmanage -t` are all blocked here):
     the fit for its own size.
 34. Open a recent file after moving it: the bookmark follows it and the restored
     page stays associated with that document. If the bookmark cannot resolve,
-    the entry remains listed and choosing the file again restores access.
+    choose Relink… and select the moved PDF. The original recent entry keeps its
+    page and zoom, and no duplicate appears. Cancel the picker and try a corrupt
+    PDF; neither operation changes the original entry.
 35. With unsaved document edits or a note draft, choose a recent file. Save,
     Don't Save and Cancel must follow the same prompts and preserve the same
     edits and draft state as Open PDF….
