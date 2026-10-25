@@ -43,6 +43,40 @@ view stays connected to the reader, outline destinations keep their target
 position, and annotation rows jump to their page location. The sidebar belongs
 to the open document window; it does not manage files or create a PDF library.
 
+## Recent Documents and reading position
+
+The File menu's **Open Recent** list and the empty reader window make the last
+10 PDFs easy to find. The app stores one versioned property list in
+`UserDefaults`; each entry contains a security-scoped bookmark, a display name,
+and the last page and zoom mode. This is a small preference value, not a
+document database or managed library.
+
+Opening a recent item resolves its bookmark and then uses the normal
+`DocumentStore` path, which acquires and holds the security scope for the open
+window. Stale bookmarks are refreshed after that session has acquired access.
+The reader saves the current page and either Fit mode or the manual zoom factor
+as navigation changes. Reopened page indices are clamped to the PDF's current
+page count; Fit is recalculated for the current window size. Recent items still
+go through the usual unsaved-document and note-draft prompts. YoPDF does not
+automatically reopen every window at launch.
+
+If macOS can no longer resolve a saved bookmark, YoPDF keeps the recent entry
+and offers **Relink…**. Choosing the moved PDF validates and opens it before
+YoPDF replaces that entry's bookmark and path. The entry keeps its identity and
+reading position, and any duplicate for the selected path is removed. Canceling
+the picker or choosing a file that cannot be opened leaves the recent entry
+unchanged.
+
+## Full-text PDF search
+
+P3 adds **full-text PDF search**. Press ⌘F to open the find bar, type a literal
+phrase, and use the result count and previous/next controls to move through the
+matches. Search is case-insensitive and highlights every match on the pages;
+Return or ⌘G moves forward, ⇧⌘G moves backward, and results wrap at either end.
+Esc closes the find bar and removes the temporary search highlights. The
+search covers text extractable by PDFKit; image-only scans require OCR and are
+not included. Search uses PDFKit and does not require network access.
+
 ## Requirements
 
 - macOS 14.0 or later (deployment target)
@@ -57,7 +91,8 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (306)
+./scripts/test.sh                     # unit tests (354)
+./scripts/test-ui.sh                  # GUI tests (interactive logged-in desktop session)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
@@ -103,7 +138,13 @@ action intermittently fails to instantiate a freshly built test bundle
 (`Failed to create a bundle instance ...`) even though the same bundle runs
 fine through `xctest`; see the header of `scripts/test.sh`. Set
 `XCODEBUILD_TEST=1` to force the xcodebuild path when you need an `.xcresult`
-or coverage data.
+or coverage data. This path filters to `YoPDFTests`, so it remains usable
+without a desktop session; run `test-ui.sh` separately for GUI tests.
+
+`test-ui.sh` runs `YoPDFUITests` through Xcode's UI testing runner. It launches
+the built app and sends real keyboard input, so it requires an interactive,
+logged-in macOS desktop session. The UI regression tests use PDFs generated in
+temporary directories and remove them after each test.
 
 ## Layout
 
@@ -123,6 +164,7 @@ macos/
 │   ├── NoteStickerStyle.swift  # 21 motif IDs, collections, versioned style
 │   ├── NoteEditing.swift       # model-owned add/edit/delete notes
 │   ├── PDFDocumentModel.swift
+│   ├── RecentDocumentsStore.swift # bookmarks and reading positions in UserDefaults
 │   ├── PDFDocumentModel+Editing.swift # dirty state, save, Save As, re-sync
 │   ├── PDFDocumentSaveSerializer.swift # isolated PDF snapshot serialization
 │   ├── QuitCoordinator.swift   # quit-attempt decisions, no AppKit
@@ -158,6 +200,7 @@ macos/
 │   ├── DocumentStoreLifecycleTests.swift    # close vs. in-flight operations
 │   ├── DocumentStoreScaleTests.swift    # 200 MB streaming and save
 │   ├── DocumentStoreModelIntegrationTests.swift
+│   ├── RecentDocumentsStoreTests.swift # bookmarks and page/zoom restoration
 │   ├── HighlightAnnotationTests.swift   # real PDFKit highlight geometry
 │   ├── MarkupEditingTests.swift         # select, edit, undo, save integration
 │   ├── NoteAnnotationTests.swift        # real PDFKit /Text notes end to end
@@ -515,8 +558,8 @@ database — the saved PDF is the whole document.
 Known P2a/P2b limitations:
 
 - No StrikeOut, free-text or ink annotation editing, and no annotation search.
-  The sidebar indexes those standard PDF annotations for navigation.
-  YoPDF-created notes still store one body per annotation.
+  The sidebar indexes standard PDF annotations for navigation. YoPDF-created
+  notes still store one body per annotation.
   Imported ShuaMac groups show their count and all bodies, but YoPDF currently
   edits only the first note in the group; adding, editing and deleting other
   group members remains future work. Templates only seed drafts and are not
@@ -701,6 +744,18 @@ System Events / Preview and `qlmanage -t` are all blocked here):
     is used, the hidden native icon stack does not show through, and the disclosure
     lists the remaining note bodies. Save, close and reopen; the group count must
     survive PDFKit serialization via `/YoPDFShuaAnchorID`.
+33. Open a PDF, navigate to a later page and choose a manual zoom. Quit and
+    relaunch: the file appears at the top of File → Open Recent, and reopening it
+    restores the page and zoom. Repeat with Fit mode; the new window recalculates
+    the fit for its own size.
+34. Open a recent file after moving it: the bookmark follows it and the restored
+    page stays associated with that document. If the bookmark cannot resolve,
+    choose Relink… and select the moved PDF. The original recent entry keeps its
+    page and zoom, and no duplicate appears. Cancel the picker and try a corrupt
+    PDF; neither operation changes the original entry.
+35. With unsaved document edits or a note draft, choose a recent file. Save,
+    Don't Save and Cancel must follow the same prompts and preserve the same
+    edits and draft state as Open PDF….
 
 `YoPDFCore` is a framework so tests are pure logic tests: they link the module
 and never launch the app, so no window server or accessibility permission is
@@ -734,12 +789,13 @@ a CropBox-relative marker anchor, twelve built-in templates with a personal
 template library, and ShuaMac's compact composer. P2e adds Outline, Thumbnails
 and Annotations views to a collapsible sidebar attached to the open PDF window.
 Annotation changes auto-save; there is no document library, StrikeOut support,
-note threads or agent integration.
+note threads or agent integration. Recent files and reading-position restoration
+have since been added without introducing a managed library.
 
 Known P1 boundaries:
 
-- Security-scoped bookmarks are not created. Nothing needs to survive a window
-  restoration yet, so a session holds a runtime scope only.
+- A recent entry is a file-access bookmark and a reading position; it is not a
+  saved multi-window session. The user chooses which recent PDF to reopen.
 - Symlinks, hard links and undownloaded cloud placeholders are refused by
   `save` rather than written through; `saveAs` is the escape hatch.
 - Crash durability is not claimed; the save-path notes above list exactly which

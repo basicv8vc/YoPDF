@@ -9,10 +9,11 @@
 </p>
 
 YoPDF is in early development. The repository currently contains the macOS
-reader: opening a local PDF, continuous scrolling, page navigation, zoom, and
-standard PDF Highlight/Underline/Note annotations, including illustrated
-sticker notes, with automatic saving for committed annotation edits. Search and
-AI-assisted reading are not implemented yet.
+reader: opening local PDFs, continuous scrolling, page navigation, zoom, a
+recent-document list with reading-position restoration, and standard PDF
+Highlight/Underline/Note annotations, including illustrated sticker notes,
+with automatic saving for committed annotation edits. Full-text search is
+available; AI-assisted reading is not implemented yet.
 
 ## Design constraints
 
@@ -33,7 +34,8 @@ macos/
 ├── YoPDFCore/         # reader logic, no UI, unit-tested
 ├── YoPDF/             # SwiftUI app + sticker Asset Catalog
 ├── YoPDFTests/        # logic tests
-└── scripts/           # generate / build / test
+├── YoPDFUITests/      # macOS GUI regression tests
+└── scripts/           # generate / build / test / test-ui
 ```
 
 ## License

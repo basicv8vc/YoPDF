@@ -8,8 +8,10 @@ struct PDFReaderView: View {
 
     @ObservedObject var model: PDFDocumentModel
     @ObservedObject var updateController: SparkleUpdateController
+    @ObservedObject var recentDocuments: RecentDocumentsStore
 
     @State private var isImporterPresented = false
+    @State private var pendingRecentRelink: RecentDocument?
     @State private var isDropTargeted = false
     @State private var prompt: Prompt?
     @State private var isSidebarVisible = true
@@ -17,6 +19,9 @@ struct PDFReaderView: View {
     @StateObject private var readerNavigationState = ReaderNavigationState()
     @State private var pendingNavigationDestination: PDFDestination?
     @State private var navigationRevision = 0
+    @State private var isSearchPresented = false
+    @State private var searchQuery = ""
+    @FocusState private var isSearchFieldFocused: Bool
     /// Installed on the window so closing it cannot drop unsaved edits.
     @State private var closeGuard = WindowCloseGuard()
     /// The window's one note composer, and the draft that outlives its popover.
@@ -25,21 +30,23 @@ struct PDFReaderView: View {
     /// enough — a save, another annotation edit, a click outside — that either
     /// would throw typed text away.
     @StateObject private var composerStore = NoteComposerStore()
+    @StateObject private var searchSession = PDFSearchSession()
     /// True while the next page click places a page note.
     @State private var isPlacingNote = false
     /// Converts page rectangles into popover anchors through the live PDFView.
     @State private var anchorResolver = PageAnchorResolver()
 
     #if DEBUG
-    /// Test-only launch hook for deterministic screenshot runs. It is compiled
-    /// out of Release builds and does nothing unless the environment variable is
-    /// present.
+    /// Test-only launch hook for deterministic screenshot and GUI runs. It is
+    /// compiled out of Release builds and does nothing unless the environment
+    /// variable is present.
     @State private var didOpenScreenshotPDF = false
     #endif
 
     /// Something the reader was asked to do that could discard work.
     private enum PendingAction: Equatable {
         case open(URL)
+        case relink(URL, RecentDocument)
         case save
         case saveAs
         case closeWindow
@@ -56,6 +63,7 @@ struct PDFReaderView: View {
         var readerAction: ReaderAction {
             switch self {
             case let .open(url): return .open(url)
+            case let .relink(url, _): return .open(url)
             case .save: return .save
             case .saveAs: return .saveAs
             case .closeWindow: return .closeWindow
@@ -70,6 +78,7 @@ struct PDFReaderView: View {
         case draftChanges(PendingAction)
         case unsavedChanges(PendingAction)
         case saveProblem(title: String, message: String, offersSaveAs: Bool)
+        case recentDocumentUnavailable(RecentDocument)
 
         var id: String {
             switch self {
@@ -79,6 +88,8 @@ struct PDFReaderView: View {
                 return "unsaved-\(String(describing: action))"
             case let .saveProblem(title, _, _):
                 return "problem-\(title)"
+            case let .recentDocumentUnavailable(item):
+                return "recent-\(item.id)"
             }
         }
 
@@ -90,6 +101,8 @@ struct PDFReaderView: View {
                 return "Save changes before continuing?"
             case let .saveProblem(title, _, _):
                 return title
+            case .recentDocumentUnavailable:
+                return "Couldn’t open recent document"
             }
         }
 
@@ -101,6 +114,8 @@ struct PDFReaderView: View {
                 switch action {
                 case let .open(url):
                     return "“\(url.lastPathComponent)” cannot be opened while this document has unsaved changes."
+                case let .relink(url, _):
+                    return "“\(url.lastPathComponent)” cannot be opened while this document has unsaved changes."
                 case .closeWindow, .quit:
                     return "This document has changes that are not in the file yet."
                 case .save, .saveAs, .compose:
@@ -108,6 +123,8 @@ struct PDFReaderView: View {
                 }
             case let .saveProblem(_, message, _):
                 return message
+            case let .recentDocumentUnavailable(item):
+                return "YoPDF can no longer resolve the saved location for “\(item.displayName)”. Locate the PDF to reconnect this recent item."
             }
         }
 
@@ -122,6 +139,8 @@ struct PDFReaderView: View {
                 return base + " Save the note, or discard it, before saving a copy of the file."
             case let .open(url):
                 return base + " “\(url.lastPathComponent)” cannot be opened until you save or discard it."
+            case let .relink(url, _):
+                return base + " “\(url.lastPathComponent)” cannot be opened until you save or discard it."
             case .closeWindow, .quit:
                 return base + " Saving it puts the note in the document; the file itself still has to be saved."
             case .compose:
@@ -131,84 +150,13 @@ struct PDFReaderView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            toolbar
-            Divider()
-            content
-        }
-        .frame(minWidth: 900, minHeight: 520)
-        .background(Color(nsColor: .windowBackgroundColor))
-        .fileImporter(
-            isPresented: $isImporterPresented,
-            allowedContentTypes: [.pdf],
-            allowsMultipleSelection: false
-        ) { result in
-            guard case let .success(urls) = result, let url = urls.first else { return }
-            requestOpen(url)
-        }
-        .onOpenURL { url in
-            requestOpen(url)
-        }
-        .task {
-            #if DEBUG
-            let environmentPath = ProcessInfo.processInfo.environment["YOPDF_SCREENSHOT_PDF"]
-            let preferencePath = UserDefaults.standard.string(forKey: "YOPDF_SCREENSHOT_PDF")
-            guard !didOpenScreenshotPDF,
-                  let path = environmentPath ?? preferencePath
-            else { return }
-            didOpenScreenshotPDF = true
-            requestOpen(URL(fileURLWithPath: path))
-            #endif
-        }
-        .onChange(of: model.autoSaveFailureRevision) { _, _ in
-            // Do not replace an action prompt already on screen. The toolbar
-            // keeps the failure visible, and dismissing the current prompt
-            // leaves the user free to retry or save a copy.
-            guard prompt == nil, let outcome = model.lastAutoSaveOutcome else { return }
-            _ = present(outcome)
-        }
-        .focusedSceneValue(\.documentModel, model)
-        .focusedSceneValue(\.openDocument, { isImporterPresented = true })
-        .focusedSceneValue(\.saveDocument, { requestSave() })
-        .focusedSceneValue(\.saveDocumentAs, { requestSaveAs() })
-        .focusedSceneValue(\.highlightSelection, { _ = model.addMarkup(.highlight) })
-        .focusedSceneValue(\.underlineSelection, { _ = model.addMarkup(.underline) })
-        .focusedSceneValue(\.addNote, { beginNote() })
-        .focusedSceneValue(
-            \.readerSidebarActions,
-            ReaderSidebarActions(
-                toggle: { toggleSidebar() },
-                select: { showSidebarSection($0) }
-            )
-        )
-        .background(
-            WindowCloseGuardInstaller(
-                guardObject: closeGuard,
-                unsavedWork: { unsavedWork },
-                discardDraft: {
-                    // Termination is committed, so the draft goes with the
-                    // document's edits. Until this point a "Discard Draft" is
-                    // only an intent for the quit attempt.
-                    composerStore.end()
-                },
-                discardDocumentChanges: {
-                    model.abandonUnsavedChanges()
-                },
-                onUnsavedChanges: handleCloseIntent
-            )
-        )
-        .background(
-            TitlebarUpdateIndicatorInstaller(updateController: updateController)
-                .frame(width: 0, height: 0)
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
-        )
-        .alert(
+        alertReader
+    }
+
+    private var alertReader: some View {
+        titlebarReader.alert(
             prompt?.title ?? "",
-            isPresented: Binding(
-                get: { prompt != nil },
-                set: { if !$0 { prompt = nil } }
-            ),
+            isPresented: promptPresentation,
             presenting: prompt
         ) { prompt in
             switch prompt {
@@ -228,9 +176,153 @@ struct PDFReaderView: View {
                     }
                 }
                 Button("OK", role: .cancel) { self.prompt = nil }
+            case let .recentDocumentUnavailable(item):
+                Button("Relink…") { beginRecentRelink(item) }
+                Button("Cancel", role: .cancel) { self.prompt = nil }
             }
         } message: { prompt in
             Text(prompt.message)
+        }
+    }
+
+    private var titlebarReader: some View {
+        closeGuardReader.background(
+            TitlebarUpdateIndicatorInstaller(updateController: updateController)
+                .frame(width: 0, height: 0)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        )
+    }
+
+    private var closeGuardReader: some View {
+        focusedReader.background(
+            WindowCloseGuardInstaller(
+                guardObject: closeGuard,
+                unsavedWork: { unsavedWork },
+                discardDraft: {
+                    // Termination is committed, so the draft goes with the
+                    // document's edits. Until this point a "Discard Draft" is
+                    // only an intent for the quit attempt.
+                    composerStore.end()
+                },
+                discardDocumentChanges: {
+                    model.abandonUnsavedChanges()
+                },
+                onUnsavedChanges: handleCloseIntent
+            )
+        )
+    }
+
+    private var focusedReader: some View {
+        lifecycleReader
+            .focusedSceneValue(\.documentModel, model)
+            .focusedSceneValue(\.openDocument, { isImporterPresented = true })
+            .focusedSceneValue(\.openRecentDocument, { requestOpenRecent($0) })
+            .focusedSceneValue(\.saveDocument, { requestSave() })
+            .focusedSceneValue(\.saveDocumentAs, { requestSaveAs() })
+            .focusedSceneValue(\.findInDocument, { showSearch() })
+            .focusedSceneValue(\.findNextSearchResult, findNextSearchResultAction)
+            .focusedSceneValue(\.findPreviousSearchResult, findPreviousSearchResultAction)
+            .focusedSceneValue(\.highlightSelection, { _ = model.addMarkup(.highlight) })
+            .focusedSceneValue(\.underlineSelection, { _ = model.addMarkup(.underline) })
+            .focusedSceneValue(\.addNote, { beginNote() })
+            .focusedSceneValue(
+                \.readerSidebarActions,
+                ReaderSidebarActions(
+                    toggle: { toggleSidebar() },
+                    select: { showSidebarSection($0) }
+                )
+            )
+    }
+
+    private var lifecycleReader: some View {
+        urlReader
+            .onChange(of: model.autoSaveFailureRevision) { _, _ in
+                presentLatestAutoSaveFailure()
+            }
+            .onChange(of: model.loadGeneration) { _, _ in
+                closeSearch()
+                pendingNavigationDestination = nil
+            }
+            .onChange(of: model.isLoaded) { _, isLoaded in
+                if !isLoaded { closeSearch() }
+            }
+            .onChange(of: model.document.map(ObjectIdentifier.init)) { _, _ in
+                searchSession.documentWasReplaced(with: model.document)
+            }
+            .onChange(of: searchQuery) { _, query in
+                guard isSearchPresented else { return }
+                searchSession.search(query, in: model.document)
+            }
+            .onDisappear(perform: closeSearch)
+    }
+
+    private var urlReader: some View {
+        importedReader
+            .onOpenURL { url in requestOpen(url) }
+            .task { openScreenshotPDFIfConfigured() }
+    }
+
+    private var importedReader: some View {
+        readerLayout
+            .frame(minWidth: 900, minHeight: 520)
+            .background(Color(nsColor: .windowBackgroundColor))
+            .fileImporter(
+                isPresented: $isImporterPresented,
+                allowedContentTypes: [.pdf],
+                allowsMultipleSelection: false
+            ) { result in
+                handleImportResult(result)
+            }
+    }
+
+    private func handleImportResult(_ result: Result<[URL], Error>) {
+        if let item = pendingRecentRelink {
+            pendingRecentRelink = nil
+            guard case let .success(urls) = result, let url = urls.first else { return }
+            requestOpen(url, relinking: item)
+            return
+        }
+        guard case let .success(urls) = result, let url = urls.first else { return }
+        requestOpen(url)
+    }
+
+    private func presentLatestAutoSaveFailure() {
+        // Do not replace an action prompt already on screen. The toolbar keeps
+        // the failure visible; dismissing the current prompt leaves the user
+        // free to retry or save a copy.
+        guard prompt == nil, let outcome = model.lastAutoSaveOutcome else { return }
+        _ = present(outcome)
+    }
+
+    private var promptPresentation: Binding<Bool> {
+        Binding(
+            get: { prompt != nil },
+            set: { if !$0 { prompt = nil } }
+        )
+    }
+
+    private func openScreenshotPDFIfConfigured() {
+        #if DEBUG
+        let environmentPath = ProcessInfo.processInfo.environment["YOPDF_SCREENSHOT_PDF"]
+        let preferencePath = UserDefaults.standard.string(forKey: "YOPDF_SCREENSHOT_PDF")
+        guard !didOpenScreenshotPDF,
+              let path = environmentPath ?? preferencePath
+        else { return }
+        didOpenScreenshotPDF = true
+        requestOpen(URL(fileURLWithPath: path))
+        #endif
+    }
+
+    private var readerLayout: some View {
+        VStack(spacing: 0) {
+            toolbar
+            Divider()
+            if isSearchPresented {
+                searchBar
+                Divider()
+            }
+            content
         }
     }
 
@@ -481,6 +573,154 @@ struct PDFReaderView: View {
         .background(.bar)
     }
 
+    private var searchBar: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+
+            TextField("Find in PDF", text: $searchQuery)
+                .textFieldStyle(.plain)
+                .focused($isSearchFieldFocused)
+                .accessibilityIdentifier("pdf-search-field")
+                .onSubmit(showNextSearchResult)
+                .onExitCommand(perform: closeSearch)
+                .frame(minWidth: 220, maxWidth: 360)
+
+            if !searchQuery.isEmpty {
+                Button {
+                    searchQuery = ""
+                    isSearchFieldFocused = true
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Clear search")
+                .help("Clear search")
+            }
+
+            Text(searchResultSummary)
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 84, alignment: .leading)
+                .accessibilityIdentifier("pdf-search-result-summary")
+                .accessibilityLabel(searchResultAccessibilityLabel)
+
+            Button(action: showPreviousSearchResult) {
+                Image(systemName: "chevron.up")
+            }
+            .disabled(searchSession.results.isEmpty)
+            .accessibilityLabel("Previous search result")
+            .help("Previous result (⇧⌘G)")
+
+            Button(action: showNextSearchResult) {
+                Image(systemName: "chevron.down")
+            }
+            .disabled(searchSession.results.isEmpty)
+            .accessibilityLabel("Next search result")
+            .help("Next result (⌘G)")
+
+            Button(action: closeSearch) {
+                Image(systemName: "xmark")
+            }
+            .accessibilityLabel("Close search")
+            .help("Close search (Esc)")
+        }
+        .buttonStyle(.borderless)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(.bar)
+    }
+
+    private var findNextSearchResultAction: (@MainActor () -> Void)? {
+        guard !searchSession.results.isEmpty || searchSession.isSearching else { return nil }
+        return { showNextSearchResult() }
+    }
+
+    private var findPreviousSearchResultAction: (@MainActor () -> Void)? {
+        guard !searchSession.results.isEmpty || searchSession.isSearching else { return nil }
+        return { showPreviousSearchResult() }
+    }
+
+    private var searchResultSummary: String {
+        guard !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return ""
+        }
+        if searchSession.isSearching {
+            return "Searching…"
+        }
+        guard let currentResultIndex = searchSession.currentResultIndex,
+              !searchSession.results.isEmpty
+        else {
+            return "No matches"
+        }
+        return "\(currentResultIndex + 1) of \(searchSession.results.count)"
+    }
+
+    private var searchResultAccessibilityLabel: String {
+        if searchSession.isSearching {
+            return "Searching"
+        }
+        guard let currentResultIndex = searchSession.currentResultIndex,
+              !searchSession.results.isEmpty
+        else {
+            return searchResultSummary.isEmpty ? "No search results" : searchResultSummary
+        }
+        return "Result \(currentResultIndex + 1) of \(searchSession.results.count)"
+    }
+
+    private func showSearch() {
+        guard model.isLoaded else { return }
+        if isSearchPresented {
+            focusSearchField(selectingQuery: true)
+            return
+        }
+        isSearchPresented = true
+        searchSession.search(searchQuery, in: model.document)
+        focusSearchField(selectingQuery: false)
+    }
+
+    private func closeSearch() {
+        if let pdfView = anchorResolver.pdfView {
+            if isSearchPresented {
+                pdfView.window?.makeFirstResponder(pdfView)
+            }
+        }
+        searchSession.clear()
+        searchQuery = ""
+        isSearchPresented = false
+        isSearchFieldFocused = false
+    }
+
+    private func focusSearchField(selectingQuery: Bool) {
+        isSearchFieldFocused = true
+        guard selectingQuery else { return }
+        Task { @MainActor in
+            await Task.yield()
+            (anchorResolver.pdfView?.window?.firstResponder as? NSTextView)?.selectAll(nil)
+        }
+    }
+
+    private func showNextSearchResult() {
+        moveSearchResult(by: 1)
+    }
+
+    private func showPreviousSearchResult() {
+        moveSearchResult(by: -1)
+    }
+
+    private func moveSearchResult(by offset: Int) {
+        guard !searchSession.results.isEmpty || searchSession.isSearching,
+              let pdfView = anchorResolver.pdfView,
+              pdfView.document === model.document
+        else { return }
+
+        searchSession.move(by: offset)
+        guard let nextSelection = searchSession.currentSelection else { return }
+        pdfView.activeSearchSelection = nextSelection
+        pdfView.go(to: nextSelection)
+    }
+
     private var pageIndicator: some View {
         Text(model.pageCount == 0 ? "– / –" : "\(model.displayPageNumber) / \(model.pageCount)")
             .font(.callout.monospacedDigit())
@@ -510,6 +750,7 @@ struct PDFReaderView: View {
     @ViewBuilder
     private var content: some View {
         if model.isLoaded {
+            let searchBelongsToDisplayedDocument = searchSession.document === model.document
             HStack(spacing: 0) {
                 if isSidebarVisible {
                     ReaderSidebar(
@@ -561,6 +802,11 @@ struct PDFReaderView: View {
                         placePageNote(at: point, on: page, anchor: anchor)
                     },
                     onCancelPlacement: { isPlacingNote = false },
+                    searchSelections: searchBelongsToDisplayedDocument ? searchSession.results : [],
+                    activeSearchSelection: searchBelongsToDisplayedDocument
+                        ? searchSession.currentSelection
+                        : nil,
+                    searchResultsRevision: searchSession.resultsRevision,
                     makeMenuItems: { context in
                         pageMenuItems(for: context)
                     },
@@ -589,22 +835,36 @@ struct PDFReaderView: View {
                         .id(session.id)
                     }
                 }
-                // A composer describes one anchor in one document, so a new document
-                // or a changed annotation set can invalidate it. It is never closed
-                // on those changes alone: closing a composer that holds text is how
-                // the text gets lost. A composer with nothing to lose is closed when
-                // its target is gone; one with text stays open and explains itself.
-                .onChange(of: model.loadGeneration) { _, _ in
-                    isPlacingNote = false
-                    pendingNavigationDestination = nil
-                    composerStore.reconcile(with: model)
-                }
-                .onChange(of: model.annotationRevision) { _, _ in
-                    composerStore.reconcile(with: model)
-                }
-                .onChange(of: composerStore.isPresented) { _, presented in
-                    if !presented { composerStore.discardIfClean() }
-                }
+            }
+            // A composer describes one anchor in one document, so a new document
+            // or a changed annotation set can invalidate it. It is never closed
+            // on those changes alone: closing a composer that holds text is how
+            // the text gets lost. A composer with nothing to lose is closed when
+            // its target is gone; one with text stays open and explains itself.
+            .onChange(of: model.loadGeneration) { _, _ in
+                isPlacingNote = false
+                pendingNavigationDestination = nil
+                composerStore.reconcile(with: model)
+            }
+            .onChange(of: model.annotationRevision) { _, _ in
+                composerStore.reconcile(with: model)
+            }
+            .onChange(of: composerStore.isPresented) { _, presented in
+                if !presented { composerStore.discardIfClean() }
+            }
+            .alert(
+                "Couldn’t open this document",
+                isPresented: Binding(
+                    get: { model.lastError != nil },
+                    set: { if !$0 { model.dismissError() } }
+                )
+            ) {
+                Button("OK", role: .cancel) { model.dismissError() }
+            } message: {
+                Text(model.lastError?.errorDescription ?? "Unknown error.")
+            }
+        } else {
+            emptyState
                 .alert(
                     "Couldn’t open this document",
                     isPresented: Binding(
@@ -616,10 +876,6 @@ struct PDFReaderView: View {
                 } message: {
                     Text(model.lastError?.errorDescription ?? "Unknown error.")
                 }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-            emptyState
         }
     }
 
@@ -641,6 +897,23 @@ struct PDFReaderView: View {
                 isImporterPresented = true
             }
             .keyboardShortcut("o", modifiers: .command)
+
+            if !recentDocuments.items.isEmpty {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Recent Documents")
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(.secondary)
+                    ForEach(Array(recentDocuments.items.prefix(5))) { item in
+                        Button(item.displayName) {
+                            requestOpenRecent(item)
+                        }
+                        .buttonStyle(.plain)
+                        .help(item.lastKnownPath)
+                    }
+                }
+                .frame(maxWidth: 360, alignment: .leading)
+                .padding(.top, 14)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(40)
@@ -668,14 +941,32 @@ struct PDFReaderView: View {
     /// Everything that can open a file goes through here so that neither a
     /// document with unsaved edits nor a note that is still only in the composer
     /// is replaced without the user choosing what happens to it.
-    private func requestOpen(_ url: URL) {
-        switch promptKind(for: .open(url)) {
+    private func requestOpen(_ url: URL, relinking item: RecentDocument? = nil) {
+        let action: PendingAction = item.map { .relink(url, $0) } ?? .open(url)
+        switch promptKind(for: action) {
         case .none:
-            model.open(url: url)
+            perform(action)
         case .draft:
-            prompt = .draftChanges(.open(url))
+            prompt = .draftChanges(action)
         case .document:
-            prompt = .unsavedChanges(.open(url))
+            prompt = .unsavedChanges(action)
+        }
+    }
+
+    private func beginRecentRelink(_ item: RecentDocument) {
+        pendingRecentRelink = item
+        prompt = nil
+        Task { @MainActor in
+            await Task.yield()
+            isImporterPresented = true
+        }
+    }
+
+    private func requestOpenRecent(_ item: RecentDocument) {
+        do {
+            requestOpen(try recentDocuments.resolveURL(for: item))
+        } catch {
+            prompt = .recentDocumentUnavailable(item)
         }
     }
 
@@ -1134,6 +1425,8 @@ struct PDFReaderView: View {
             // failed open cannot leave a document on screen whose edits nothing
             // is protecting any more.
             model.open(url: url, discardingUnsavedChanges: true)
+        case let .relink(url, item):
+            model.open(url: url, discardingUnsavedChanges: true, relinking: item)
         case .closeWindow:
             // The window is closing now, so the edits really are being discarded.
             model.abandonUnsavedChanges()
@@ -1157,6 +1450,8 @@ struct PDFReaderView: View {
         switch action {
         case let .open(url):
             model.open(url: url)
+        case let .relink(url, item):
+            model.open(url: url, relinking: item)
         case .save:
             performSave()
         case .saveAs:

@@ -16,6 +16,7 @@ public final class PDFDocumentModel: ObservableObject {
         case permissionDenied
         case unreadable
         case emptyDocument
+        case couldNotRelinkRecentDocument
         case unsupportedFileSituation(UnsupportedFileSituation)
         /// The current document has edits that are not on disk. Replacing it
         /// would discard them, so the caller has to save or discard first.
@@ -104,6 +105,10 @@ public final class PDFDocumentModel: ObservableObject {
     /// store when a Save As leaves a file on disk without a session.
     let store: DocumentStore
 
+    /// App-level local history shared by reader windows. Tests and callers that
+    /// do not need persistence can leave this nil.
+    private let recentDocuments: RecentDocumentsStore?
+
     /// The persisted colour defaults. Owned by the model so the toolbar and the
     /// annotations created from it read one value, and so tests can point it at
     /// an isolated `UserDefaults` suite.
@@ -146,10 +151,12 @@ public final class PDFDocumentModel: ObservableObject {
     public init(
         access: any SecurityScopeAccessing = SystemSecurityScopeAccess(),
         io: any DocumentStoreIO = SystemDocumentStoreIO(),
-        markupPreferences: MarkupColorPreferences = MarkupColorPreferences()
+        markupPreferences: MarkupColorPreferences = MarkupColorPreferences(),
+        recentDocuments: RecentDocumentsStore? = nil
     ) {
         self.store = DocumentStore(access: access, io: io)
         self.markupPreferences = markupPreferences
+        self.recentDocuments = recentDocuments
     }
 
     public var isLoaded: Bool { document != nil }
@@ -180,8 +187,16 @@ public final class PDFDocumentModel: ObservableObject {
     /// document is known to be readable would clear the flag on a document that
     /// is still on screen, and the next close would drop its edits without
     /// asking.
+    ///
+    /// When `relinking` is supplied, the saved recent entry is updated only
+    /// after the selected PDF and its security-scoped session have both opened
+    /// successfully. A failed candidate leaves that entry intact.
     @discardableResult
-    public func open(url: URL, discardingUnsavedChanges: Bool = false) -> Bool {
+    public func open(
+        url: URL,
+        discardingUnsavedChanges: Bool = false,
+        relinking recentDocument: RecentDocument? = nil
+    ) -> Bool {
         guard discardingUnsavedChanges || !hasUnsavedChanges else {
             lastError = .unsavedChanges
             return false
@@ -193,6 +208,14 @@ public final class PDFDocumentModel: ObservableObject {
         guard url.pathExtension.lowercased() == "pdf" else {
             lastError = .unsupportedType(url.pathExtension)
             return false
+        }
+
+        let restoredPosition: RecentReadingPosition?
+        if let recentDocument {
+            restoredPosition = recentDocuments?.readingPosition(for: recentDocument)
+                ?? recentDocument.readingPosition
+        } else {
+            restoredPosition = recentDocuments?.readingPosition(for: url)
         }
 
         let reopeningCurrentFile = fileURL?.standardizedFileURL == url.standardizedFileURL
@@ -236,9 +259,15 @@ public final class PDFDocumentModel: ObservableObject {
         // Phase 3: commit. Stop a pending checkpoint before discarding the
         // previous document, then release its scope only after any already
         // running file operation has ended.
-        cancelPendingAutoSave(cancelInFlightWork: discardingUnsavedChanges)
+        let hadAutoSaveInProgress =
+            (autoSaveStatus == .pending || autoSaveStatus == .saving) && autoSaveTask != nil
+        let scheduledAutoSaveGeneration = autoSaveGeneration
+        let activeWorkMatchesSchedule = autoSaveWorkGeneration == scheduledAutoSaveGeneration
+        let writeWasCancelledBeforeStart = cancelPendingAutoSave(
+            cancelInFlightWork: discardingUnsavedChanges
+        )
         let automaticWriteWasStarted = autoSaveWorkCompletion?.didStartWrite ?? false
-        waitForAutoSaveWork()
+        let completedAutoSaveOutcome = waitForAutoSaveWork()
 
         // If the old worker committed while the candidate was being loaded,
         // that candidate and its session captured the previous file version.
@@ -269,17 +298,50 @@ public final class PDFDocumentModel: ObservableObject {
             opened = refreshed
         }
 
+        if let recentDocument {
+            do {
+                guard let recentDocuments,
+                      try recentDocuments.relink(recentDocument, to: url)
+                else {
+                    candidate.close()
+                    restoreAutoSaveAfterFailedOpen(
+                        wasScheduled: hadAutoSaveInProgress,
+                        activeWorkMatchesSchedule: activeWorkMatchesSchedule,
+                        writeWasCancelledBeforeStart: writeWasCancelledBeforeStart,
+                        completedOutcome: completedAutoSaveOutcome
+                    )
+                    lastError = .couldNotRelinkRecentDocument
+                    return false
+                }
+            } catch {
+                candidate.close()
+                restoreAutoSaveAfterFailedOpen(
+                    wasScheduled: hadAutoSaveInProgress,
+                    activeWorkMatchesSchedule: activeWorkMatchesSchedule,
+                    writeWasCancelledBeforeStart: writeWasCancelledBeforeStart,
+                    completedOutcome: completedAutoSaveOutcome
+                )
+                lastError = .couldNotRelinkRecentDocument
+                return false
+            }
+        }
+
         // Swap first, then release the previous scope, so the
         // model is never left without access to the document it displays.
         let previous = documentSession
         documentSession = candidate
         previous?.close()
 
-        apply(document: opened, fileURL: url)
+        apply(document: opened, fileURL: url, restoring: restoredPosition)
+        if recentDocument == nil, let recentDocuments, !recentDocuments.recordOpened(url) {
+            NSLog("YoPDF could not save a recent-document bookmark for %@", url.lastPathComponent)
+        }
+        persistReadingPosition()
         return true
     }
 
     public func close() {
+        persistReadingPosition()
         cancelPendingAutoSave(cancelInFlightWork: true)
         waitForAutoSaveWork()
         autoSavePauseDepth = 0
@@ -309,15 +371,22 @@ public final class PDFDocumentModel: ObservableObject {
         lastError = nil
     }
 
-    private func apply(document: PDFDocument, fileURL: URL?) {
+    private func apply(
+        document: PDFDocument,
+        fileURL: URL?,
+        restoring position: RecentReadingPosition?
+    ) {
         cancelPendingAutoSave()
         self.document = document
         self.fileURL = fileURL
         pageCount = document.pageCount
-        currentPageIndex = 0
-        zoomScale = 1
-        effectiveScale = 1
-        isAutoScaling = true
+        currentPageIndex = Self.clamped(position?.pageIndex ?? 0, pageCount: document.pageCount)
+        let restoredZoom = CGFloat(position?.zoomScale ?? 1)
+        zoomScale = restoredZoom.isFinite
+            ? min(max(restoredZoom, Self.minimumZoomScale), Self.maximumZoomScale)
+            : 1
+        effectiveScale = zoomScale
+        isAutoScaling = position?.usesAutomaticScaling ?? true
         lastError = nil
         hasUnsavedChanges = false
         autoSaveStatus = .idle
@@ -378,6 +447,10 @@ public final class PDFDocumentModel: ObservableObject {
         if let document {
             title = Self.resolvedTitle(for: document, fileURL: url)
         }
+        if let recentDocuments, !recentDocuments.recordOpened(url) {
+            NSLog("YoPDF could not save a recent-document bookmark for %@", url.lastPathComponent)
+        }
+        persistReadingPosition()
     }
 
     /// Swaps in the session that now owns the file, closing the old one.
@@ -487,7 +560,10 @@ public final class PDFDocumentModel: ObservableObject {
 
     public func goToPage(_ index: Int) {
         guard pageCount > 0 else { return }
-        currentPageIndex = min(max(index, 0), pageCount - 1)
+        let clampedIndex = min(max(index, 0), pageCount - 1)
+        guard clampedIndex != currentPageIndex else { return }
+        currentPageIndex = clampedIndex
+        persistReadingPosition()
     }
 
     public func goToNextPage() {
@@ -506,6 +582,7 @@ public final class PDFDocumentModel: ObservableObject {
         effectiveScale = zoomScale
         isAutoScaling = false
         zoomCommandRevision &+= 1
+        persistReadingPosition()
     }
 
     /// Base for the next zoom step: the live fitted scale while auto-scaling,
@@ -529,6 +606,7 @@ public final class PDFDocumentModel: ObservableObject {
     public func fitToWindow() {
         isAutoScaling = true
         zoomCommandRevision &+= 1
+        persistReadingPosition()
     }
 
     /// Called by the view whenever PDFView's scale changes. Never flips
@@ -538,6 +616,7 @@ public final class PDFDocumentModel: ObservableObject {
         effectiveScale = scale
         if !isAutoScaling {
             zoomScale = min(max(scale, Self.minimumZoomScale), Self.maximumZoomScale)
+            persistReadingPosition()
         }
     }
 
@@ -550,7 +629,20 @@ public final class PDFDocumentModel: ObservableObject {
             // scale command back through NSViewRepresentable.updateNSView.
             isAutoScaling = false
             zoomScale = min(max(effectiveScale, Self.minimumZoomScale), Self.maximumZoomScale)
+            persistReadingPosition()
         }
+    }
+
+    private func persistReadingPosition() {
+        guard let url = fileURL else { return }
+        recentDocuments?.updateReadingPosition(
+            RecentReadingPosition(
+                pageIndex: currentPageIndex,
+                zoomScale: Double(zoomScale),
+                usesAutomaticScaling: isAutoScaling
+            ),
+            for: url
+        )
     }
 }
 
@@ -570,6 +662,8 @@ extension PDFDocumentModel.LoadError: LocalizedError {
             return "This file is not a readable PDF. It may be damaged or password protected."
         case .emptyDocument:
             return "This PDF contains no pages."
+        case .couldNotRelinkRecentDocument:
+            return "YoPDF could not relink this recent document. The existing recent entry was left unchanged."
         case .unsavedChanges:
             return "Save or discard your changes before opening another document."
         case let .unsupportedFileSituation(situation):

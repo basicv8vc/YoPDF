@@ -13,6 +13,11 @@ struct OpenDocumentActionKey: FocusedValueKey {
     typealias Value = @MainActor () -> Void
 }
 
+/// Opens a saved recent URL through the focused reader's unsaved-work prompts.
+struct OpenRecentDocumentActionKey: FocusedValueKey {
+    typealias Value = @MainActor (RecentDocument) -> Void
+}
+
 /// Menu-bar counterparts of the toolbar's editing actions.
 ///
 /// They are actions rather than model calls because the reader has to route them
@@ -23,6 +28,18 @@ struct SaveDocumentActionKey: FocusedValueKey {
 }
 
 struct SaveDocumentAsActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
+struct FindInDocumentActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
+struct FindNextSearchResultActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
+struct FindPreviousSearchResultActionKey: FocusedValueKey {
     typealias Value = @MainActor () -> Void
 }
 
@@ -57,6 +74,11 @@ extension FocusedValues {
         set { self[OpenDocumentActionKey.self] = newValue }
     }
 
+    var openRecentDocument: (@MainActor (RecentDocument) -> Void)? {
+        get { self[OpenRecentDocumentActionKey.self] }
+        set { self[OpenRecentDocumentActionKey.self] = newValue }
+    }
+
     var saveDocument: (@MainActor () -> Void)? {
         get { self[SaveDocumentActionKey.self] }
         set { self[SaveDocumentActionKey.self] = newValue }
@@ -65,6 +87,21 @@ extension FocusedValues {
     var saveDocumentAs: (@MainActor () -> Void)? {
         get { self[SaveDocumentAsActionKey.self] }
         set { self[SaveDocumentAsActionKey.self] = newValue }
+    }
+
+    var findInDocument: (@MainActor () -> Void)? {
+        get { self[FindInDocumentActionKey.self] }
+        set { self[FindInDocumentActionKey.self] = newValue }
+    }
+
+    var findNextSearchResult: (@MainActor () -> Void)? {
+        get { self[FindNextSearchResultActionKey.self] }
+        set { self[FindNextSearchResultActionKey.self] = newValue }
+    }
+
+    var findPreviousSearchResult: (@MainActor () -> Void)? {
+        get { self[FindPreviousSearchResultActionKey.self] }
+        set { self[FindPreviousSearchResultActionKey.self] = newValue }
     }
 
     var highlightSelection: (@MainActor () -> Void)? {
