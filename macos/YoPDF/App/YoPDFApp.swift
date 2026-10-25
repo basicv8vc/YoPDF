@@ -9,13 +9,18 @@ struct YoPDFApp: App {
     @StateObject private var recentDocuments = RecentDocumentsStore.shared
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: "reader") {
             ReaderWindow(
                 updateController: updateController,
-                recentDocuments: recentDocuments
+                recentDocuments: recentDocuments,
+                fileOpenRequests: appDelegate.fileOpenRequests
             )
         }
         .defaultSize(width: 1100, height: 820)
+        // Leave document-open events to AppKit's application(_:open:) handler.
+        // Without this, WindowGroup claims external file URLs by creating an
+        // empty scene before the PDF reader can consume the request.
+        .handlesExternalEvents(matching: [])
         .commands {
             PDFReaderCommands(
                 updateController: updateController,
@@ -32,30 +37,40 @@ struct YoPDFApp: App {
 /// closing one does not touch the other, and each model releases only its own
 /// security-scoped access.
 ///
-/// There is deliberately no `.onOpenURL` here. A URL that arrives from Finder
-/// or a double-click is handled by `PDFReaderView`, which is the single place
-/// that knows how to ask about unsaved edits first; a second handler at this
-/// level would call `open` directly and race the prompt.
+/// Finder's AppKit open-file callbacks enqueue URLs before or after this window
+/// exists. `PDFReaderView` consumes them when this window is key and routes them
+/// through its normal unsaved-work prompt.
 private struct ReaderWindow: View {
 
+    @Environment(\.openWindow) private var openWindow
     @ObservedObject var updateController: SparkleUpdateController
     @ObservedObject var recentDocuments: RecentDocumentsStore
+    let fileOpenRequests: FileOpenRequestQueue
     @StateObject private var model: PDFDocumentModel
 
     init(
         updateController: SparkleUpdateController,
-        recentDocuments: RecentDocumentsStore
+        recentDocuments: RecentDocumentsStore,
+        fileOpenRequests: FileOpenRequestQueue
     ) {
         self.updateController = updateController
         self.recentDocuments = recentDocuments
+        self.fileOpenRequests = fileOpenRequests
         _model = StateObject(wrappedValue: PDFDocumentModel(recentDocuments: recentDocuments))
     }
 
     var body: some View {
+        let openWindowAction = openWindow
         PDFReaderView(
             model: model,
             updateController: updateController,
-            recentDocuments: recentDocuments
+            recentDocuments: recentDocuments,
+            fileOpenRequests: fileOpenRequests
         )
+        .onAppear {
+            fileOpenRequests.registerReaderWindowOpener {
+                openWindowAction(id: "reader")
+            }
+        }
     }
 }

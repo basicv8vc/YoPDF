@@ -349,10 +349,17 @@ note. ⌘S and the Save button remain available for an immediate save.
   stays on the original, still dirty), an unclassifiable replacement is reported
   as "uncertain" with the recovery files listed, and only a write that did not
   happen is reported as a failure.
-- The reader has exactly one way in for a file: the toolbar, the Open panel,
-  drag and drop, and `.onOpenURL` all funnel through `PDFReaderView.requestOpen`,
-  which is where the unsaved-changes prompt lives. There is no second
-  `.onOpenURL` handler that could open a file behind that prompt.
+- The toolbar, Open panel, drag and drop, and Finder's AppKit
+  `application(_:open:)` callback all funnel through `PDFReaderView.requestOpen`,
+  which is where the unsaved-changes prompt lives. Finder has one request slot;
+  it stays occupied until the key reader handles the URL and any unsaved-work
+  prompt is resolved. A second event is refused instead of being left in a queue
+  to open unexpectedly later. If all reader windows are closed while YoPDF is
+  still running, the AppKit delegate opens a new reader scene for the next
+  accepted Finder request. `WindowGroup` declines to claim external events so it
+  cannot create an empty scene before AppKit receives the file. A request
+  containing multiple files is refused because the app does not yet route each
+  file to a separate window.
 
 ### Markup editing (P2b)
 

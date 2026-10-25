@@ -273,6 +273,7 @@ struct WindowCloseGuardInstaller: NSViewRepresentable {
     let discardDraft: () -> Void
     let discardDocumentChanges: () -> Void
     let onUnsavedChanges: (WindowCloseGuard.Intent) -> Void
+    let onWindowAvailable: () -> Void
 
     func makeNSView(context: Context) -> NSView {
         let view = WindowReportingView()
@@ -287,6 +288,7 @@ struct WindowCloseGuardInstaller: NSViewRepresentable {
     private func install(from view: NSView) {
         guard let view = view as? WindowReportingView else { return }
         view.onWindowAvailable = { window in
+            let wasAlreadyAttached = guardObject.window === window
             guardObject.install(
                 on: window,
                 unsavedWork: unsavedWork,
@@ -294,6 +296,9 @@ struct WindowCloseGuardInstaller: NSViewRepresentable {
                 discardDocumentChanges: discardDocumentChanges,
                 onUnsavedChanges: onUnsavedChanges
             )
+            if !wasAlreadyAttached {
+                onWindowAvailable()
+            }
         }
         if let window = view.window {
             view.onWindowAvailable?(window)

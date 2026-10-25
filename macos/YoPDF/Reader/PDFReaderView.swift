@@ -9,9 +9,13 @@ struct PDFReaderView: View {
     @ObservedObject var model: PDFDocumentModel
     @ObservedObject var updateController: SparkleUpdateController
     @ObservedObject var recentDocuments: RecentDocumentsStore
+    @ObservedObject var fileOpenRequests: FileOpenRequestQueue
 
     @State private var isImporterPresented = false
     @State private var pendingRecentRelink: RecentDocument?
+    /// A Finder request stays reserved while its Save / Discard / Cancel prompt
+    /// is visible, so another event cannot replace the action in that prompt.
+    @State private var finderOpenRequestAwaitingResolution = false
     @State private var isDropTargeted = false
     @State private var prompt: Prompt?
     @State private var isSidebarVisible = true
@@ -173,12 +177,19 @@ struct PDFReaderView: View {
                     Button("Save As…") {
                         self.prompt = nil
                         presentSaveAsPanel()
+                        finishFinderOpenRequestIfResolved()
                     }
                 }
-                Button("OK", role: .cancel) { self.prompt = nil }
+                Button("OK", role: .cancel) {
+                    self.prompt = nil
+                    finishFinderOpenRequestIfResolved()
+                }
             case let .recentDocumentUnavailable(item):
                 Button("Relink…") { beginRecentRelink(item) }
-                Button("Cancel", role: .cancel) { self.prompt = nil }
+                Button("Cancel", role: .cancel) {
+                    self.prompt = nil
+                    finishFinderOpenRequestIfResolved()
+                }
             }
         } message: { prompt in
             Text(prompt.message)
@@ -208,7 +219,17 @@ struct PDFReaderView: View {
                 discardDocumentChanges: {
                     model.abandonUnsavedChanges()
                 },
-                onUnsavedChanges: handleCloseIntent
+                onUnsavedChanges: handleCloseIntent,
+                onWindowAvailable: {
+                    // SwiftUI can attach the representable after the window's
+                    // first key event. Retry after the view update so a file
+                    // queued during launch is not stranded in that case.
+                    fileOpenRequests.readerWindowDidBecomeAvailable()
+                    Task { @MainActor in
+                        await Task.yield()
+                        openFileRequestIfReady()
+                    }
+                }
             )
         )
     }
@@ -238,6 +259,32 @@ struct PDFReaderView: View {
 
     private var lifecycleReader: some View {
         urlReader
+            .onChange(of: fileOpenRequests.revision) { _, _ in
+                openFileRequestIfReady()
+            }
+            .onChange(of: prompt) { _, newPrompt in
+                guard newPrompt == nil else { return }
+                finishFinderOpenRequestIfResolved()
+                // If a Finder event arrived while another alert was visible,
+                // let SwiftUI dismiss it before presenting the open request.
+                Task { @MainActor in
+                    await Task.yield()
+                    openFileRequestIfReady()
+                }
+            }
+            .onChange(of: isImporterPresented) { _, isPresented in
+                guard !isPresented else { return }
+                Task { @MainActor in
+                    await Task.yield()
+                    openFileRequestIfReady()
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { notification in
+                guard let window = notification.object as? NSWindow,
+                      window === closeGuard.window
+                else { return }
+                openFileRequestIfReady()
+            }
             .onChange(of: model.autoSaveFailureRevision) { _, _ in
                 presentLatestAutoSaveFailure()
             }
@@ -260,8 +307,37 @@ struct PDFReaderView: View {
 
     private var urlReader: some View {
         importedReader
-            .onOpenURL { url in requestOpen(url) }
-            .task { openScreenshotPDFIfConfigured() }
+            .task {
+                openScreenshotPDFIfConfigured()
+                openFileRequestIfReady()
+            }
+    }
+
+    /// Only the key reader window consumes Finder requests. On a cold launch,
+    /// the URL may be queued before SwiftUI creates this view; on an already
+    /// running app, the queue revision wakes the active reader. Becoming key
+    /// retries a request that arrived before a window was ready.
+    private func openFileRequestIfReady() {
+        let window = closeGuard.window
+        let isKeyWindow = window.map { NSApp.keyWindow === $0 } ?? false
+        guard prompt == nil,
+              !isImporterPresented,
+              window != nil,
+              isKeyWindow,
+              let url = fileOpenRequests.takeNext()
+        else { return }
+
+        finderOpenRequestAwaitingResolution = promptKind(for: .open(url)) != .none
+        requestOpen(url)
+        if !finderOpenRequestAwaitingResolution {
+            fileOpenRequests.finishRequest()
+        }
+    }
+
+    private func finishFinderOpenRequestIfResolved() {
+        guard finderOpenRequestAwaitingResolution, prompt == nil else { return }
+        finderOpenRequestAwaitingResolution = false
+        fileOpenRequests.finishRequest()
     }
 
     private var importedReader: some View {
@@ -299,7 +375,11 @@ struct PDFReaderView: View {
     private var promptPresentation: Binding<Bool> {
         Binding(
             get: { prompt != nil },
-            set: { if !$0 { prompt = nil } }
+            set: {
+                if !$0 {
+                    prompt = nil
+                }
+            }
         )
     }
 
@@ -1381,6 +1461,7 @@ struct PDFReaderView: View {
                 proceed(afterDraft: action)
             }
         }
+        finishFinderOpenRequestIfResolved()
     }
 
     /// "Discard Draft": the typed text is dropped by an explicit choice, and the
@@ -1403,6 +1484,7 @@ struct PDFReaderView: View {
         case let .deferredUntilQuitCommit(need):
             showQuitPrompt(for: need)
         }
+        finishFinderOpenRequestIfResolved()
     }
 
     private func cancel(_ action: PendingAction) {
@@ -1411,6 +1493,7 @@ struct PDFReaderView: View {
         // The prompt never closed the composer, but the alert may have dismissed
         // the popover on its way in. Put it back: the draft is still there.
         if composerStore.hasSession { composerStore.isPresented = true }
+        finishFinderOpenRequestIfResolved()
     }
 
     /// Continues an action once the draft is out of the way.
@@ -1446,12 +1529,14 @@ struct PDFReaderView: View {
             // Any "Don't Save" answers collected from other windows belong to
             // an attempt that is no longer running, so they must not survive.
             if action == .quit { QuitSession.coordinator.cancel() }
+            finishFinderOpenRequestIfResolved()
             return
         }
         if keptDeferredDraft {
             QuitSession.coordinator.approveDraftDiscard(of: closeGuard)
         }
         perform(action)
+        finishFinderOpenRequestIfResolved()
     }
 
     private func discardThen(_ action: PendingAction) {
@@ -1483,6 +1568,7 @@ struct PDFReaderView: View {
             // composing is not a document-level action.
             break
         }
+        finishFinderOpenRequestIfResolved()
     }
 
     private func perform(_ action: PendingAction) {
