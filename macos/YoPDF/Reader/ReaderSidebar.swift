@@ -43,6 +43,7 @@ struct ReaderSidebar: View {
     let onSelectDestination: (PDFDestination) -> Void
 
     @State private var annotationItems: [SidebarAnnotationItem] = []
+    @State private var outlineItems: [OutlineSidebarItem] = []
 
     var body: some View {
         VStack(spacing: 0) {
@@ -57,9 +58,13 @@ struct ReaderSidebar: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(Color(nsColor: .controlBackgroundColor))
-        .onAppear(perform: refreshAnnotationItems)
+        .onAppear {
+            refreshAnnotationItems()
+            refreshOutlineItems()
+        }
         .onChange(of: model.loadGeneration) { _, _ in
             refreshAnnotationItems()
+            refreshOutlineItems()
         }
         .onChange(of: model.annotationRevision) { _, _ in
             refreshAnnotationItems()
@@ -131,9 +136,19 @@ struct ReaderSidebar: View {
         case .outline:
             outlineContent
         case .thumbnails:
-            PDFThumbnailSidebarRepresentable(pdfViewHandle: pdfViewHandle)
+            GeometryReader { geometry in
+                let thumbnailWidth = min(180, max(0, geometry.size.width - 40))
+
+                PDFThumbnailSidebarRepresentable(
+                    pdfViewHandle: pdfViewHandle,
+                    thumbnailSize: CGSize(
+                        width: thumbnailWidth,
+                        height: thumbnailWidth * 792 / 612
+                    )
+                )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .accessibilityLabel("Page thumbnails")
+            }
         case .annotations:
             annotationsContent
         }
@@ -141,8 +156,7 @@ struct ReaderSidebar: View {
 
     @ViewBuilder
     private var outlineContent: some View {
-        let roots = outlineRoots
-        if roots.isEmpty {
+        if outlineItems.isEmpty {
             SidebarEmptyState(
                 symbolName: "list.bullet.indent",
                 title: "No outline",
@@ -151,12 +165,11 @@ struct ReaderSidebar: View {
         } else {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 1) {
-                    ForEach(Array(roots.enumerated()), id: \.offset) { entry in
+                    ForEach(outlineItems) { item in
                         OutlineSidebarRow(
-                            outline: entry.element,
-                            path: "\(entry.offset)",
-                            depth: 0,
+                            item: item,
                             currentPageIndex: model.currentPageIndex,
+                            onToggle: toggleOutlineItem,
                             onSelectDestination: onSelectDestination
                         )
                     }
@@ -192,9 +205,102 @@ struct ReaderSidebar: View {
         }
     }
 
-    private var outlineRoots: [PDFOutline] {
-        guard let root = model.document?.outlineRoot else { return [] }
-        return (0..<root.numberOfChildren).compactMap { root.child(at: $0) }
+    private func refreshOutlineItems() {
+        guard let root = model.document?.outlineRoot else {
+            outlineItems = []
+            return
+        }
+
+        let requests = (0..<root.numberOfChildren).reversed().compactMap { index in
+            root.child(at: index).map {
+                OutlineNodeRequest(outline: $0, id: "\(index)", depth: 0)
+            }
+        }
+        outlineItems = makeVisibleOutlineItems(from: requests, excluding: [ObjectIdentifier(root)])
+    }
+
+    private func toggleOutlineItem(id: String) {
+        guard let index = outlineItems.firstIndex(where: { $0.id == id }) else { return }
+        let item = outlineItems[index]
+        guard item.canExpand else { return }
+
+        if item.isExpanded {
+            var endIndex = index + 1
+            while endIndex < outlineItems.count, outlineItems[endIndex].depth > item.depth {
+                endIndex += 1
+            }
+            outlineItems[index].isExpanded = false
+            outlineItems.removeSubrange((index + 1)..<endIndex)
+            return
+        }
+
+        let visibleOutlineIDs = Set(outlineItems.map { ObjectIdentifier($0.outline) })
+        let requests = (0..<item.childCount).reversed().compactMap { childIndex in
+            item.outline.child(at: childIndex).map {
+                OutlineNodeRequest(
+                    outline: $0,
+                    id: "\(item.id).\(childIndex)",
+                    depth: item.depth + 1
+                )
+            }
+        }
+        let descendants = makeVisibleOutlineItems(from: requests, excluding: visibleOutlineIDs)
+        outlineItems[index].isExpanded = true
+        outlineItems.insert(contentsOf: descendants, at: index + 1)
+    }
+
+    /// Build a flat list of rows that are currently visible. Keeping outline
+    /// hierarchy out of the SwiftUI view tree lets LazyVStack virtualize every
+    /// row, including descendants of expanded sections.
+    private func makeVisibleOutlineItems(
+        from requests: [OutlineNodeRequest],
+        excluding existingOutlineIDs: Set<ObjectIdentifier>
+    ) -> [OutlineSidebarItem] {
+        guard let document = model.document else { return [] }
+
+        var result: [OutlineSidebarItem] = []
+        var seenOutlineIDs = existingOutlineIDs
+        var pending = requests
+
+        while let request = pending.popLast() {
+            let outlineID = ObjectIdentifier(request.outline)
+            guard seenOutlineIDs.insert(outlineID).inserted else { continue }
+
+            let children = request.outline.numberOfChildren
+            let canExpand = children > 0 && request.depth < OutlineSidebarItem.maximumDepth
+            let candidateDestination = request.outline.destination
+            let destinationPageIndex = candidateDestination?.page.flatMap { page in
+                let index = document.index(for: page)
+                return index == NSNotFound ? nil : index
+            }
+            let destination = destinationPageIndex == nil ? nil : candidateDestination
+            let label = request.outline.label?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let item = OutlineSidebarItem(
+                id: request.id,
+                outline: request.outline,
+                title: label.isEmpty ? "Untitled Section" : label,
+                depth: request.depth,
+                childCount: children,
+                destination: destination,
+                destinationPageIndex: destinationPageIndex,
+                isExpanded: request.outline.isOpen && canExpand
+            )
+            result.append(item)
+
+            if item.isExpanded {
+                for childIndex in stride(from: children - 1, through: 0, by: -1) {
+                    guard let child = request.outline.child(at: childIndex) else { continue }
+                    pending.append(
+                        OutlineNodeRequest(
+                            outline: child,
+                            id: "\(request.id).\(childIndex)",
+                            depth: request.depth + 1
+                        )
+                    )
+                }
+            }
+        }
+        return result
     }
 
     private func refreshAnnotationItems() {
@@ -264,111 +370,73 @@ struct ReaderSidebar: View {
     }
 }
 
-private struct OutlineSidebarRow: View {
+private struct OutlineNodeRequest {
     let outline: PDFOutline
-    let path: String
+    let id: String
     let depth: Int
+}
+
+private struct OutlineSidebarItem: Identifiable {
+    static let maximumDepth = 48
+
+    let id: String
+    let outline: PDFOutline
+    let title: String
+    let depth: Int
+    let childCount: Int
+    let destination: PDFDestination?
+    let destinationPageIndex: Int?
+    var isExpanded: Bool
+
+    var canExpand: Bool {
+        childCount > 0 && depth < Self.maximumDepth
+    }
+}
+
+private struct OutlineSidebarRow: View {
+    let item: OutlineSidebarItem
     let currentPageIndex: Int
+    let onToggle: (String) -> Void
     let onSelectDestination: (PDFDestination) -> Void
 
-    @State private var isExpanded: Bool
-
-    private static let maximumDepth = 48
-
-    init(
-        outline: PDFOutline,
-        path: String,
-        depth: Int,
-        currentPageIndex: Int,
-        onSelectDestination: @escaping (PDFDestination) -> Void
-    ) {
-        self.outline = outline
-        self.path = path
-        self.depth = depth
-        self.currentPageIndex = currentPageIndex
-        self.onSelectDestination = onSelectDestination
-        self._isExpanded = State(initialValue: outline.isOpen)
-    }
-
-    private var children: Int { outline.numberOfChildren }
-    private var canExpand: Bool { children > 0 && depth < Self.maximumDepth }
-
-    private var destination: PDFDestination? {
-        guard let destination = outline.destination,
-              let page = destination.page,
-              let document = outline.document,
-              document.index(for: page) != NSNotFound
-        else { return nil }
-        return destination
-    }
-
-    private var isOnCurrentPage: Bool {
-        guard let destination,
-              let page = destination.page,
-              let document = outline.document
-        else { return false }
-        return document.index(for: page) == currentPageIndex
-    }
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 1) {
-            HStack(spacing: 2) {
-                if canExpand {
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.12)) {
-                            isExpanded.toggle()
-                        }
-                    } label: {
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 9, weight: .semibold))
-                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                            .foregroundStyle(.tertiary)
-                            .frame(width: 20, height: 25)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .help(isExpanded ? "Collapse section" : "Expand section")
-                } else {
-                    Color.clear.frame(width: 20, height: 25)
-                }
-
+        HStack(spacing: 2) {
+            if item.canExpand {
                 Button {
-                    if let destination { onSelectDestination(destination) }
+                    onToggle(item.id)
                 } label: {
-                    Text(title)
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(isOnCurrentPage ? Color.accentColor : Color.primary)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
-                        .frame(maxWidth: .infinity, minHeight: 25, alignment: .leading)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .rotationEffect(.degrees(item.isExpanded ? 90 : 0))
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 20, height: 25)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .disabled(destination == nil)
-                .help(destination == nil ? "This outline item has no page destination" : title)
+                .help(item.isExpanded ? "Collapse section" : "Expand section")
+            } else {
+                Color.clear.frame(width: 20, height: 25)
             }
-            .padding(.leading, CGFloat(min(depth, 8) * 12))
 
-            if isExpanded, canExpand {
-                ForEach(0..<children, id: \.self) { index in
-                    if let child = outline.child(at: index) {
-                        OutlineSidebarRow(
-                            outline: child,
-                            path: "\(path).\(index)",
-                            depth: depth + 1,
-                            currentPageIndex: currentPageIndex,
-                            onSelectDestination: onSelectDestination
-                        )
-                    }
+            Button {
+                if let destination = item.destination {
+                    onSelectDestination(destination)
                 }
+            } label: {
+                Text(item.title)
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(item.destinationPageIndex == currentPageIndex
+                        ? Color.accentColor : Color.primary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, minHeight: 25, alignment: .leading)
+                    .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .disabled(item.destination == nil)
+            .help(item.destination == nil ? "This outline item has no page destination" : item.title)
         }
-        .id(path)
-    }
-
-    private var title: String {
-        let label = outline.label?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return label.isEmpty ? "Untitled Section" : label
+        .padding(.leading, CGFloat(min(item.depth, 8) * 12))
     }
 }
 
@@ -493,10 +561,11 @@ private struct SidebarEmptyState: View {
 
 private struct PDFThumbnailSidebarRepresentable: NSViewRepresentable {
     @ObservedObject var pdfViewHandle: PDFViewHandle
+    let thumbnailSize: CGSize
 
     func makeNSView(context: Context) -> PDFThumbnailView {
         let view = PDFThumbnailView(frame: .zero)
-        view.thumbnailSize = CGSize(width: 136, height: 176)
+        view.thumbnailSize = thumbnailSize
         view.maximumNumberOfColumns = 1
         view.allowsDragging = false
         view.labelFont = .monospacedDigitSystemFont(ofSize: 10, weight: .regular)
@@ -506,6 +575,10 @@ private struct PDFThumbnailSidebarRepresentable: NSViewRepresentable {
     }
 
     func updateNSView(_ view: PDFThumbnailView, context: Context) {
+        if view.thumbnailSize != thumbnailSize {
+            view.thumbnailSize = thumbnailSize
+        }
+
         if view.pdfView !== pdfViewHandle.pdfView {
             view.pdfView = pdfViewHandle.pdfView
         }
