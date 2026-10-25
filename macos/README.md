@@ -349,10 +349,13 @@ note. ⌘S and the Save button remain available for an immediate save.
   stays on the original, still dirty), an unclassifiable replacement is reported
   as "uncertain" with the recovery files listed, and only a write that did not
   happen is reported as a failure.
-- The reader has exactly one way in for a file: the toolbar, the Open panel,
-  drag and drop, and `.onOpenURL` all funnel through `PDFReaderView.requestOpen`,
-  which is where the unsaved-changes prompt lives. There is no second
-  `.onOpenURL` handler that could open a file behind that prompt.
+- The toolbar, Open panel, drag and drop, and Finder's AppKit
+  `application(_:open:)` callback all funnel through `PDFReaderView.requestOpen`,
+  which is where the unsaved-changes prompt lives. Finder requests are queued
+  until the key reader window is ready. `WindowGroup` declines to claim external
+  events so it cannot create an empty scene before AppKit receives the file.
+  A request containing multiple files is refused because the app does not yet
+  route each file to a separate window.
 
 ### Markup editing (P2b)
 

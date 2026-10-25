@@ -1,7 +1,8 @@
 import AppKit
+import Combine
 import YoPDFCore
 
-/// Handles the one app-level decision the reader cannot make from a view:
+/// Handles app events that sit above any reader view: Finder file opens and
 /// quitting with unsaved edits.
 ///
 /// Quitting does not close windows one by one, so `windowShouldClose` never
@@ -22,6 +23,38 @@ import YoPDFCore
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
+    /// Finder can ask the app to open a document before SwiftUI has created a
+    /// reader window. The queue keeps that request until the frontmost reader
+    /// is ready to pass it through its normal unsaved-work prompt.
+    let fileOpenRequests = FileOpenRequestQueue()
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard urls.count == 1, let url = urls.first, url.isFileURL else {
+            application.reply(toOpenOrPrint: .failure)
+            return
+        }
+        fileOpenRequests.enqueue(url)
+        application.reply(toOpenOrPrint: .success)
+    }
+
+    func application(_ sender: NSApplication, openFile filename: String) -> Bool {
+        fileOpenRequests.enqueue(URL(fileURLWithPath: filename))
+        return true
+    }
+
+    func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        // YoPDF currently has one document per reader window, but no app-level
+        // multi-window routing for a batch of Finder documents. Refuse a batch
+        // instead of silently replacing one PDF with another.
+        guard filenames.count == 1, let filename = filenames.first else {
+            sender.reply(toOpenOrPrint: .failure)
+            return
+        }
+
+        fileOpenRequests.enqueue(URL(fileURLWithPath: filename))
+        sender.reply(toOpenOrPrint: .success)
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let windows = WindowCloseGuard.installedGuards(among: sender.windows)
         let coordinator = QuitSession.coordinator
@@ -36,5 +69,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // edits may actually be dropped.
         coordinator.commit(among: windows)
         return .terminateNow
+    }
+}
+
+/// Bridges AppKit's document-open callbacks to the SwiftUI reader lifecycle.
+/// It is deliberately small: `PDFReaderView` remains responsible for deciding
+/// whether the current document or note draft needs a prompt before switching.
+@MainActor
+final class FileOpenRequestQueue: ObservableObject {
+
+    @Published private(set) var revision = 0
+    private var pendingURLs: [URL] = []
+
+    func enqueue(_ url: URL) {
+        pendingURLs.append(url)
+        revision &+= 1
+    }
+
+    func takeNext() -> URL? {
+        guard !pendingURLs.isEmpty else { return nil }
+        return pendingURLs.removeFirst()
     }
 }

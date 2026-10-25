@@ -9,6 +9,7 @@ struct PDFReaderView: View {
     @ObservedObject var model: PDFDocumentModel
     @ObservedObject var updateController: SparkleUpdateController
     @ObservedObject var recentDocuments: RecentDocumentsStore
+    @ObservedObject var fileOpenRequests: FileOpenRequestQueue
 
     @State private var isImporterPresented = false
     @State private var pendingRecentRelink: RecentDocument?
@@ -208,7 +209,16 @@ struct PDFReaderView: View {
                 discardDocumentChanges: {
                     model.abandonUnsavedChanges()
                 },
-                onUnsavedChanges: handleCloseIntent
+                onUnsavedChanges: handleCloseIntent,
+                onWindowAvailable: {
+                    // SwiftUI can attach the representable after the window's
+                    // first key event. Retry after the view update so a file
+                    // queued during launch is not stranded in that case.
+                    Task { @MainActor in
+                        await Task.yield()
+                        openFileRequestIfReady()
+                    }
+                }
             )
         )
     }
@@ -238,6 +248,15 @@ struct PDFReaderView: View {
 
     private var lifecycleReader: some View {
         urlReader
+            .onChange(of: fileOpenRequests.revision) { _, _ in
+                openFileRequestIfReady()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { notification in
+                guard let window = notification.object as? NSWindow,
+                      window === closeGuard.window
+                else { return }
+                openFileRequestIfReady()
+            }
             .onChange(of: model.autoSaveFailureRevision) { _, _ in
                 presentLatestAutoSaveFailure()
             }
@@ -260,8 +279,24 @@ struct PDFReaderView: View {
 
     private var urlReader: some View {
         importedReader
-            .onOpenURL { url in requestOpen(url) }
-            .task { openScreenshotPDFIfConfigured() }
+            .task {
+                openScreenshotPDFIfConfigured()
+                openFileRequestIfReady()
+            }
+    }
+
+    /// Only the key reader window consumes Finder requests. On a cold launch,
+    /// the URL may be queued before SwiftUI creates this view; on an already
+    /// running app, the queue revision wakes the active reader. Becoming key
+    /// retries a request that arrived before a window was ready.
+    private func openFileRequestIfReady() {
+        let window = closeGuard.window
+        let isKeyWindow = window.map { NSApp.keyWindow === $0 } ?? false
+        guard window != nil,
+              isKeyWindow,
+              let url = fileOpenRequests.takeNext()
+        else { return }
+        requestOpen(url)
     }
 
     private var importedReader: some View {
