@@ -28,11 +28,17 @@ public final class PDFSearchSession: ObservableObject {
         var debounceElapsed = false
     }
 
-    private struct ActiveOperation {
+    @MainActor
+    private final class ActiveOperation {
         let generation: Int
         let document: PDFDocument
         var observerTokens: [NSObjectProtocol] = []
         var matches: [PDFSelection] = []
+
+        init(generation: Int, document: PDFDocument) {
+            self.generation = generation
+            self.document = document
+        }
     }
 
     /// PDFKit sends notifications through NotificationCenter's main operation
@@ -209,7 +215,7 @@ public final class PDFSearchSession: ObservableObject {
     }
 
     private func didFindMatch(_ payload: FindNotificationPayload, generation: Int) {
-        guard var operation = activeOperation,
+        guard let operation = activeOperation,
               operation.generation == generation,
               generation == self.generation,
               operation.document === payload.document,
@@ -217,7 +223,6 @@ public final class PDFSearchSession: ObservableObject {
         else { return }
 
         operation.matches.append(match)
-        activeOperation = operation
     }
 
     private func didEndFind(_ payload: FindNotificationPayload, generation: Int) {

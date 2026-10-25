@@ -103,6 +103,26 @@ final class PDFSearchSessionTests: XCTestCase {
         }, "Selections from the old document must never be published into the new document's results.")
     }
 
+    func testHighFrequencySearchCompletesAsynchronouslyWithEveryHit() async throws {
+        let document = try makeDocument(pageCount: 120) { _ in
+            String(repeating: "highfreq ", count: 80)
+        }
+        let expectedHitCount = (0..<document.pageCount).reduce(into: 0) { count, pageIndex in
+            let text = document.page(at: pageIndex)?.string ?? ""
+            count += text.components(separatedBy: "highfreq").count - 1
+        }
+        let session = PDFSearchSession(debounceNanoseconds: 0)
+
+        XCTAssertGreaterThan(expectedHitCount, 1_000)
+        session.search("highfreq", in: document)
+        let searchWasInFlight = await waitUntilFinding(document)
+        XCTAssertTrue(searchWasInFlight, "The large search must be in progress after search() returns.")
+        try await waitForSearchCompletion(session)
+
+        XCTAssertEqual(session.results.count, expectedHitCount)
+        XCTAssertFalse(session.isSearching)
+    }
+
     func testClearingSearchCancelsDebounceAndRemovesTemporaryResults() async throws {
         let document = try makeDocument(pageCount: 1) { _ in "temporary hit" }
         let session = PDFSearchSession()
