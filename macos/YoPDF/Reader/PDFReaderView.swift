@@ -980,26 +980,31 @@ struct PDFReaderView: View {
             .keyboardShortcut("o", modifiers: .command)
 
             if !recentDocuments.items.isEmpty {
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("Recent Documents")
-                        .font(.callout.weight(.medium))
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    ForEach(Array(recentDocuments.items.prefix(5))) { item in
-                        Button {
-                            requestOpenRecent(item)
-                        } label: {
-                            Text(item.displayName)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                HStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    VStack(alignment: .leading, spacing: 7) {
+                        Text("Recent Documents")
+                            .font(.callout.weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        ForEach(Array(recentDocuments.items.prefix(5))) { item in
+                            Button {
+                                requestOpenRecent(item)
+                            } label: {
+                                Text(item.displayName)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .buttonStyle(.plain)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .help(item.lastKnownPath)
                         }
-                        .buttonStyle(.plain)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .help(item.lastKnownPath)
                     }
+                    .frame(maxWidth: 360, alignment: .leading)
+                    Spacer(minLength: 0)
                 }
-                .frame(maxWidth: 360, alignment: .center)
+                .frame(maxWidth: .infinity)
                 .padding(.top, 14)
             }
         }
