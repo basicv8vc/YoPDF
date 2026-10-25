@@ -259,10 +259,15 @@ public final class PDFDocumentModel: ObservableObject {
         // Phase 3: commit. Stop a pending checkpoint before discarding the
         // previous document, then release its scope only after any already
         // running file operation has ended.
-        let hadPendingAutoSave = autoSaveStatus == .pending && autoSaveTask != nil
-        cancelPendingAutoSave(cancelInFlightWork: discardingUnsavedChanges)
+        let hadAutoSaveInProgress =
+            (autoSaveStatus == .pending || autoSaveStatus == .saving) && autoSaveTask != nil
+        let scheduledAutoSaveGeneration = autoSaveGeneration
+        let activeWorkMatchesSchedule = autoSaveWorkGeneration == scheduledAutoSaveGeneration
+        let writeWasCancelledBeforeStart = cancelPendingAutoSave(
+            cancelInFlightWork: discardingUnsavedChanges
+        )
         let automaticWriteWasStarted = autoSaveWorkCompletion?.didStartWrite ?? false
-        waitForAutoSaveWork()
+        let completedAutoSaveOutcome = waitForAutoSaveWork()
 
         // If the old worker committed while the candidate was being loaded,
         // that candidate and its session captured the previous file version.
@@ -299,13 +304,23 @@ public final class PDFDocumentModel: ObservableObject {
                       try recentDocuments.relink(recentDocument, to: url)
                 else {
                     candidate.close()
-                    restoreAutoSaveAfterFailedOpen(wasPending: hadPendingAutoSave)
+                    restoreAutoSaveAfterFailedOpen(
+                        wasScheduled: hadAutoSaveInProgress,
+                        activeWorkMatchesSchedule: activeWorkMatchesSchedule,
+                        writeWasCancelledBeforeStart: writeWasCancelledBeforeStart,
+                        completedOutcome: completedAutoSaveOutcome
+                    )
                     lastError = .couldNotRelinkRecentDocument
                     return false
                 }
             } catch {
                 candidate.close()
-                restoreAutoSaveAfterFailedOpen(wasPending: hadPendingAutoSave)
+                restoreAutoSaveAfterFailedOpen(
+                    wasScheduled: hadAutoSaveInProgress,
+                    activeWorkMatchesSchedule: activeWorkMatchesSchedule,
+                    writeWasCancelledBeforeStart: writeWasCancelledBeforeStart,
+                    completedOutcome: completedAutoSaveOutcome
+                )
                 lastError = .couldNotRelinkRecentDocument
                 return false
             }
