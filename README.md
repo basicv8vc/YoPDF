@@ -13,7 +13,8 @@ reader: opening local PDFs, continuous scrolling, page navigation, zoom, a
 recent-document list with reading-position restoration, and standard PDF
 Highlight/Underline/Note annotations, including illustrated sticker notes,
 with automatic saving for committed annotation edits. Full-text search is
-available; AI-assisted reading is not implemented yet.
+available, and annotations can be exported as page-grouped Markdown. AI-assisted
+reading is not implemented yet.
 
 ## Design constraints
 

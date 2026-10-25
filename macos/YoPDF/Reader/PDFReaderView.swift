@@ -215,6 +215,7 @@ struct PDFReaderView: View {
             .focusedSceneValue(\.openRecentDocument, { requestOpenRecent($0) })
             .focusedSceneValue(\.saveDocument, { requestSave() })
             .focusedSceneValue(\.saveDocumentAs, { requestSaveAs() })
+            .focusedSceneValue(\.exportAnnotations, { exportAnnotationsAsMarkdown() })
             .focusedSceneValue(\.findInDocument, { showSearch() })
             .focusedSceneValue(\.findNextSearchResult, findNextSearchResultAction)
             .focusedSceneValue(\.findPreviousSearchResult, findPreviousSearchResultAction)
@@ -952,6 +953,37 @@ struct PDFReaderView: View {
         let response = model.withAutoSavePaused { panel.runModal() }
         guard response == .OK, let url = panel.url else { return }
         present(model.saveAs(to: url, overwrite: true))
+    }
+
+    private func exportAnnotationsAsMarkdown() {
+        guard model.isLoaded, let document = model.document else { return }
+
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        panel.canCreateDirectories = true
+        panel.prompt = "Export"
+        panel.nameFieldStringValue = suggestedMarkdownFilename(for: model.title)
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        let markdown = AnnotationMarkdownExporter.markdown(for: document, fallbackTitle: model.title)
+        do {
+            try Data(markdown.utf8).write(to: url, options: .atomic)
+        } catch {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Couldn’t Export Annotations"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
+    }
+
+    private func suggestedMarkdownFilename(for title: String) -> String {
+        let safeTitle = title
+            .replacingOccurrences(of: "/", with: "∕")
+            .replacingOccurrences(of: ":", with: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return "\(safeTitle.isEmpty ? "Annotations" : safeTitle).md"
     }
 
     @discardableResult
