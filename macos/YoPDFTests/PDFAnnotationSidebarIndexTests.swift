@@ -131,6 +131,24 @@ final class PDFAnnotationSidebarIndexTests: XCTestCase {
         }
     }
 
+    func testPageThumbnailChangesAfterAddingAnnotation() throws {
+        let document = try XCTUnwrap(PDFDocument(data: PDFFixtureFactory.makePDFData(pageCount: 1)))
+        let page = try XCTUnwrap(document.page(at: 0))
+        let thumbnailSize = CGSize(width: 180, height: 234)
+        let before = try XCTUnwrap(page.thumbnail(of: thumbnailSize, for: .cropBox).tiffRepresentation)
+
+        let highlight = PDFAnnotation(
+            bounds: CGRect(x: 72, y: 680, width: 190, height: 24),
+            forType: .highlight,
+            withProperties: nil
+        )
+        highlight.color = .yellow
+        page.addAnnotation(highlight)
+
+        let after = try XCTUnwrap(page.thumbnail(of: thumbnailSize, for: .cropBox).tiffRepresentation)
+        XCTAssertNotEqual(before, after, "A new annotation must produce a new thumbnail image")
+    }
+
     func testIndexCanBuildFor500And1000PageDocuments() throws {
         for pageCount in [500, 1_000] {
             let data = try PDFFixtureFactory.makePDFData(pageCount: pageCount)

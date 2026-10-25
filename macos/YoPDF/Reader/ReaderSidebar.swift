@@ -186,6 +186,8 @@ struct ReaderSidebar: View {
                 PDFPageThumbnailList(
                     document: model.document,
                     currentPageIndex: model.currentPageIndex,
+                    loadGeneration: model.loadGeneration,
+                    annotationRevision: model.annotationRevision,
                     thumbnailSize: CGSize(
                         width: thumbnailWidth,
                         height: thumbnailWidth * 792 / 612
@@ -810,6 +812,8 @@ private struct SidebarEmptyState: View {
 private struct PDFPageThumbnailList: View {
     let document: PDFDocument?
     let currentPageIndex: Int
+    let loadGeneration: Int
+    let annotationRevision: Int
     let thumbnailSize: CGSize
     let onSelectPage: (Int) -> Void
 
@@ -824,7 +828,16 @@ private struct PDFPageThumbnailList: View {
                                     onSelectPage(pageIndex)
                                 } label: {
                                     VStack(spacing: 5) {
-                                        PDFPageThumbnail(page: page, maximumSize: thumbnailSize)
+                                        PDFPageThumbnail(
+                                            page: page,
+                                            maximumSize: thumbnailSize,
+                                            renderIdentity: PDFThumbnailRenderIdentity(
+                                                loadGeneration: loadGeneration,
+                                                annotationRevision: annotationRevision,
+                                                pageIndex: pageIndex,
+                                                thumbnailSize: thumbnailSize
+                                            )
+                                        )
 
                                         Text("\(pageIndex + 1)")
                                             .font(.system(size: 12, weight: .medium).monospacedDigit())
@@ -884,12 +897,14 @@ private struct PDFPageThumbnailList: View {
 private struct PDFPageThumbnail: View {
     let page: PDFPage
     let maximumSize: CGSize
+    let renderIdentity: PDFThumbnailRenderIdentity
 
     @State private var image: NSImage?
+    @State private var renderedIdentity: PDFThumbnailRenderIdentity?
 
     var body: some View {
         Group {
-            if let image {
+            if let image, renderedIdentity == renderIdentity {
                 Image(nsImage: image)
                     .resizable()
                     .interpolation(.high)
@@ -905,8 +920,11 @@ private struct PDFPageThumbnail: View {
                     .overlay(Rectangle().stroke(Color.black.opacity(0.12), lineWidth: 0.6))
             }
         }
-        .task(id: maximumSize) {
-            image = page.thumbnail(of: maximumSize, for: .cropBox)
+        .task(id: renderIdentity) {
+            let thumbnail = page.thumbnail(of: maximumSize, for: .cropBox)
+            guard !Task.isCancelled else { return }
+            image = thumbnail
+            renderedIdentity = renderIdentity
         }
     }
 
