@@ -630,6 +630,13 @@ private final class OutlineKeyboardFocusController {
                 return event
             }
 
+            // The local monitor runs before AppKit dispatches the key to its
+            // first responder. Let text-field editors keep their caret keys,
+            // including the PDF search field opened with ⌘F.
+            if (event.window?.firstResponder as? NSTextView)?.isFieldEditor == true {
+                return event
+            }
+
             let modifiers = event.modifierFlags
             let keyCode = event.keyCode
             guard !modifiers.contains(.command),
