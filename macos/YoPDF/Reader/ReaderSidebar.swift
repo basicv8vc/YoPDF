@@ -39,13 +39,28 @@ struct ReaderSidebar: View {
 
     @ObservedObject var model: PDFDocumentModel
     @ObservedObject var pdfViewHandle: PDFViewHandle
+    @ObservedObject var navigationState: ReaderNavigationState
     @Binding var selection: ReaderSidebarSection
     let onSelectDestination: (PDFDestination) -> Void
 
-    @State private var annotationItems: [SidebarAnnotationItem] = []
-    @State private var outlineItems: [OutlineSidebarItem] = []
-    @State private var selectedOutlineItemID: String?
     @State private var outlineKeyboardFocus = OutlineKeyboardFocusController()
+
+    private var annotationItems: [SidebarAnnotationItem] {
+        get { navigationState.annotationItems }
+        nonmutating set { navigationState.annotationItems = newValue }
+    }
+
+    private var outlineItems: [OutlineSidebarItem] {
+        get { navigationState.outlineItems }
+        nonmutating set { navigationState.outlineItems = newValue }
+    }
+
+    private var selectedOutlineItemID: String? {
+        get { navigationState.memory.selectedOutlineItemID }
+        nonmutating set {
+            navigationState.updateMemory { $0.selectOutlineItem(newValue) }
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -61,23 +76,44 @@ struct ReaderSidebar: View {
         }
         .background(Color(nsColor: .controlBackgroundColor))
         .onAppear {
-            refreshAnnotationItems()
-            refreshOutlineItems()
+            prepareNavigationState()
         }
         .onChange(of: model.loadGeneration) { _, _ in
-            refreshAnnotationItems()
-            selectedOutlineItemID = nil
+            navigationState.prepare(for: model.loadGeneration)
             outlineKeyboardFocus.clearFocus()
-            refreshOutlineItems()
+            prepareNavigationState()
         }
         .onChange(of: selection) { _, newSelection in
             if newSelection != .outline {
                 outlineKeyboardFocus.clearFocus()
             }
+            if newSelection == .annotations {
+                indexAnnotationsIfNeeded()
+            }
         }
         .onChange(of: model.annotationRevision) { _, _ in
+            guard navigationState.memory.documentGeneration == model.loadGeneration,
+                  navigationState.memory.hasAnnotationIndex
+            else { return }
             refreshAnnotationItems()
         }
+    }
+
+    private func prepareNavigationState() {
+        navigationState.prepare(for: model.loadGeneration)
+        if navigationState.memory.needsOutlineLoad {
+            refreshOutlineItems()
+        }
+        if selection == .annotations {
+            indexAnnotationsIfNeeded()
+        }
+    }
+
+    private func indexAnnotationsIfNeeded() {
+        guard navigationState.memory.documentGeneration == model.loadGeneration,
+              navigationState.memory.needsAnnotationIndex(for: model.annotationRevision)
+        else { return }
+        refreshAnnotationItems()
     }
 
     private var header: some View {
@@ -228,6 +264,7 @@ struct ReaderSidebar: View {
     private func refreshOutlineItems() {
         guard let root = model.document?.outlineRoot else {
             outlineItems = []
+            navigationState.updateMemory { $0.markOutlineLoaded() }
             return
         }
 
@@ -237,6 +274,7 @@ struct ReaderSidebar: View {
             }
         }
         outlineItems = makeVisibleOutlineItems(from: requests, excluding: [ObjectIdentifier(root)])
+        navigationState.updateMemory { $0.markOutlineLoaded() }
     }
 
     private func toggleOutlineItem(id: String) {
@@ -244,6 +282,7 @@ struct ReaderSidebar: View {
         let item = outlineItems[index]
         guard item.canExpand else { return }
         selectedOutlineItemID = id
+        navigationState.updateMemory { $0.setOutlineItem(id, expanded: !item.isExpanded) }
         requestOutlineKeyboardFocus()
 
         if item.isExpanded {
@@ -377,6 +416,7 @@ struct ReaderSidebar: View {
             }
             let destination = destinationPageIndex == nil ? nil : candidateDestination
             let label = request.outline.label?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let defaultExpanded = request.outline.isOpen && canExpand
             let item = OutlineSidebarItem(
                 id: request.id,
                 outline: request.outline,
@@ -385,7 +425,10 @@ struct ReaderSidebar: View {
                 childCount: children,
                 destination: destination,
                 destinationPageIndex: destinationPageIndex,
-                isExpanded: request.outline.isOpen && canExpand
+                isExpanded: navigationState.memory.isExpanded(
+                    for: request.id,
+                    defaultValue: defaultExpanded
+                ) && canExpand
             )
             result.append(item)
 
@@ -411,34 +454,12 @@ struct ReaderSidebar: View {
             return
         }
 
-        var result: [SidebarAnnotationItem] = []
-        for pageIndex in 0..<document.pageCount {
-            guard let page = document.page(at: pageIndex) else { continue }
-
-            let visibleAnnotations = page.annotations.enumerated().filter { entry in
-                let type = entry.element.type?.lowercased()
-                return type != "popup" && type != "widget" && type != "link"
-            }
-            let sortedAnnotations = visibleAnnotations.sorted { left, right in
-                let leftY = left.element.bounds.maxY
-                let rightY = right.element.bounds.maxY
-                let safeLeftY = leftY.isFinite ? leftY : 0
-                let safeRightY = rightY.isFinite ? rightY : 0
-                if safeLeftY != safeRightY { return safeLeftY > safeRightY }
-                return left.offset < right.offset
-            }
-
-            for (index, entry) in sortedAnnotations.enumerated() {
-                result.append(
-                    SidebarAnnotationItem(
-                        id: "\(pageIndex)-\(index)",
-                        pageIndex: pageIndex,
-                        annotation: entry.element
-                    )
-                )
-            }
+        annotationItems = PDFAnnotationSidebarIndex.entries(in: document).map {
+            SidebarAnnotationItem(id: $0.id, pageIndex: $0.pageIndex, annotation: $0.annotation)
         }
-        annotationItems = result
+        navigationState.updateMemory {
+            $0.markAnnotationIndexUpdated(revision: model.annotationRevision)
+        }
     }
 
     private func navigate(to item: SidebarAnnotationItem) {
@@ -478,7 +499,7 @@ private struct OutlineNodeRequest {
     let depth: Int
 }
 
-private struct OutlineSidebarItem: Identifiable {
+struct OutlineSidebarItem: Identifiable {
     static let maximumDepth = 48
 
     let id: String
@@ -667,13 +688,13 @@ private struct OutlineKeyboardCaptureRepresentable: NSViewRepresentable {
     }
 }
 
-private struct SidebarAnnotationItem: Identifiable {
+struct SidebarAnnotationItem: Identifiable {
     let id: String
     let pageIndex: Int
     let annotation: PDFAnnotation
 
     var typeLabel: String {
-        switch annotation.type?.lowercased() {
+        switch PDFAnnotationTypeName.normalized(annotation.type) {
         case "text": "Note"
         case "freetext": "Text"
         case "strikeout": "Strikethrough"
@@ -685,7 +706,7 @@ private struct SidebarAnnotationItem: Identifiable {
     }
 
     var title: String {
-        if annotation.type?.lowercased() == "text",
+        if PDFAnnotationTypeName.normalized(annotation.type) == "text",
            let contents = annotation.contents,
            let preview = Self.preview(contents) {
             return preview
@@ -694,7 +715,7 @@ private struct SidebarAnnotationItem: Identifiable {
     }
 
     var iconName: String {
-        switch annotation.type?.lowercased() {
+        switch PDFAnnotationTypeName.normalized(annotation.type) {
         case "highlight": "highlighter"
         case "underline": "underline"
         case "strikeout": "strikethrough"

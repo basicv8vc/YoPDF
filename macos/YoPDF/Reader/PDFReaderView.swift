@@ -14,6 +14,7 @@ struct PDFReaderView: View {
     @State private var prompt: Prompt?
     @State private var isSidebarVisible = true
     @State private var sidebarSection: ReaderSidebarSection = .thumbnails
+    @StateObject private var readerNavigationState = ReaderNavigationState()
     @StateObject private var pdfViewHandle = PDFViewHandle()
     @State private var pendingNavigationDestination: PDFDestination?
     @State private var navigationRevision = 0
@@ -515,6 +516,7 @@ struct PDFReaderView: View {
                     ReaderSidebar(
                         model: model,
                         pdfViewHandle: pdfViewHandle,
+                        navigationState: readerNavigationState,
                         selection: $sidebarSection,
                         onSelectDestination: { navigate(to: $0) }
                     )
