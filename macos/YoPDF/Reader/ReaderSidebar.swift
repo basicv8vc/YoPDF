@@ -44,6 +44,8 @@ struct ReaderSidebar: View {
 
     @State private var annotationItems: [SidebarAnnotationItem] = []
     @State private var outlineItems: [OutlineSidebarItem] = []
+    @State private var selectedOutlineItemID: String?
+    @State private var outlineKeyboardFocus = OutlineKeyboardFocusController()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -64,7 +66,14 @@ struct ReaderSidebar: View {
         }
         .onChange(of: model.loadGeneration) { _, _ in
             refreshAnnotationItems()
+            selectedOutlineItemID = nil
+            outlineKeyboardFocus.clearFocus()
             refreshOutlineItems()
+        }
+        .onChange(of: selection) { _, newSelection in
+            if newSelection != .outline {
+                outlineKeyboardFocus.clearFocus()
+            }
         }
         .onChange(of: model.annotationRevision) { _, _ in
             refreshAnnotationItems()
@@ -163,19 +172,30 @@ struct ReaderSidebar: View {
                 message: "This PDF does not include a document outline."
             )
         } else {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 1) {
-                    ForEach(outlineItems) { item in
-                        OutlineSidebarRow(
-                            item: item,
-                            currentPageIndex: model.currentPageIndex,
-                            onToggle: toggleOutlineItem,
-                            onSelectDestination: onSelectDestination
-                        )
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 1) {
+                        ForEach(outlineItems) { item in
+                            OutlineSidebarRow(
+                                item: item,
+                                currentPageIndex: model.currentPageIndex,
+                                isSelected: selectedOutlineItemID == item.id,
+                                onToggle: toggleOutlineItem,
+                                onSelect: { selectOutlineItem(item.id, scrollProxy: proxy) }
+                            )
+                        }
                     }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 8)
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 8)
+                .overlay(alignment: .topLeading) {
+                    OutlineKeyboardCaptureRepresentable(focusController: outlineKeyboardFocus) { keyCode in
+                        handleOutlineArrowKey(keyCode, scrollProxy: proxy)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+                }
             }
         }
     }
@@ -223,6 +243,8 @@ struct ReaderSidebar: View {
         guard let index = outlineItems.firstIndex(where: { $0.id == id }) else { return }
         let item = outlineItems[index]
         guard item.canExpand else { return }
+        selectedOutlineItemID = id
+        requestOutlineKeyboardFocus()
 
         if item.isExpanded {
             var endIndex = index + 1
@@ -247,6 +269,86 @@ struct ReaderSidebar: View {
         let descendants = makeVisibleOutlineItems(from: requests, excluding: visibleOutlineIDs)
         outlineItems[index].isExpanded = true
         outlineItems.insert(contentsOf: descendants, at: index + 1)
+    }
+
+    private func handleOutlineArrowKey(
+        _ keyCode: UInt16,
+        scrollProxy: ScrollViewProxy
+    ) {
+        switch keyCode {
+        case 126: // Up
+            moveOutlineSelection(by: -1, scrollProxy: scrollProxy)
+        case 125: // Down
+            moveOutlineSelection(by: 1, scrollProxy: scrollProxy)
+        case 123: // Left
+            moveOutlineSelectionToParent(scrollProxy: scrollProxy)
+        case 124: // Right
+            moveOutlineSelectionToChild(scrollProxy: scrollProxy)
+        default:
+            break
+        }
+    }
+
+    private func moveOutlineSelection(by offset: Int, scrollProxy: ScrollViewProxy) {
+        guard !outlineItems.isEmpty else { return }
+
+        let currentIndex = selectedOutlineItemID.flatMap { id in
+            outlineItems.firstIndex { $0.id == id }
+        }
+        let nextIndex = currentIndex.map { $0 + offset } ?? (offset > 0 ? 0 : outlineItems.count - 1)
+        guard outlineItems.indices.contains(nextIndex) else { return }
+        selectOutlineItem(outlineItems[nextIndex].id, scrollProxy: scrollProxy)
+    }
+
+    private func moveOutlineSelectionToParent(scrollProxy: ScrollViewProxy) {
+        guard let selectedOutlineItemID,
+              let index = outlineItems.firstIndex(where: { $0.id == selectedOutlineItemID })
+        else { return }
+
+        let item = outlineItems[index]
+        if item.canExpand, item.isExpanded {
+            toggleOutlineItem(id: item.id)
+            return
+        }
+        guard item.depth > 0,
+              let parent = outlineItems[..<index].reversed().first(where: {
+                  $0.depth == item.depth - 1
+              })
+        else { return }
+        selectOutlineItem(parent.id, scrollProxy: scrollProxy)
+    }
+
+    private func moveOutlineSelectionToChild(scrollProxy: ScrollViewProxy) {
+        guard let selectedOutlineItemID,
+              let index = outlineItems.firstIndex(where: { $0.id == selectedOutlineItemID })
+        else { return }
+
+        let item = outlineItems[index]
+        guard item.canExpand else { return }
+        if !item.isExpanded {
+            toggleOutlineItem(id: item.id)
+            return
+        }
+        guard index + 1 < outlineItems.count,
+              outlineItems[index + 1].depth > item.depth
+        else { return }
+        selectOutlineItem(outlineItems[index + 1].id, scrollProxy: scrollProxy)
+    }
+
+    private func selectOutlineItem(_ id: String, scrollProxy: ScrollViewProxy) {
+        guard let item = outlineItems.first(where: { $0.id == id }) else { return }
+        selectedOutlineItemID = id
+        if let destination = item.destination {
+            onSelectDestination(destination)
+        }
+        requestOutlineKeyboardFocus()
+        scrollProxy.scrollTo(id, anchor: .center)
+    }
+
+    private func requestOutlineKeyboardFocus() {
+        DispatchQueue.main.async {
+            outlineKeyboardFocus.focus()
+        }
     }
 
     /// Build a flat list of rows that are currently visible. Keeping outline
@@ -396,8 +498,9 @@ private struct OutlineSidebarItem: Identifiable {
 private struct OutlineSidebarRow: View {
     let item: OutlineSidebarItem
     let currentPageIndex: Int
+    let isSelected: Bool
     let onToggle: (String) -> Void
-    let onSelectDestination: (PDFDestination) -> Void
+    let onSelect: () -> Void
 
     var body: some View {
         HStack(spacing: 2) {
@@ -419,24 +522,148 @@ private struct OutlineSidebarRow: View {
             }
 
             Button {
-                if let destination = item.destination {
-                    onSelectDestination(destination)
-                }
+                onSelect()
             } label: {
                 Text(item.title)
-                    .font(.system(size: 12.5))
+                    .font(.system(size: 12.5, weight: isSelected ? .medium : .regular))
                     .foregroundStyle(item.destinationPageIndex == currentPageIndex
                         ? Color.accentColor : Color.primary)
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
                     .frame(maxWidth: .infinity, minHeight: 25, alignment: .leading)
                     .contentShape(Rectangle())
+                    .background {
+                        if isSelected {
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(Color.accentColor.opacity(0.12))
+                        }
+                    }
             }
             .buttonStyle(.plain)
-            .disabled(item.destination == nil)
             .help(item.destination == nil ? "This outline item has no page destination" : item.title)
         }
         .padding(.leading, CGFloat(min(item.depth, 8) * 12))
+    }
+}
+
+@MainActor
+private final class OutlineKeyboardFocusController {
+    private weak var captureView: OutlineKeyboardCaptureView?
+    private var focusRequested = false
+    private var keyMonitor: Any?
+
+    func attach(_ view: OutlineKeyboardCaptureView) {
+        captureView = view
+        if focusRequested {
+            removeKeyMonitor()
+            installKeyMonitor()
+        }
+    }
+
+    func focus() {
+        focusRequested = true
+        installKeyMonitor()
+    }
+
+    func clearFocus() {
+        focusRequested = false
+        removeKeyMonitor()
+    }
+
+    private func removeKeyMonitor() {
+        if let keyMonitor {
+            NSEvent.removeMonitor(keyMonitor)
+            self.keyMonitor = nil
+        }
+    }
+
+    func detach(_ view: OutlineKeyboardCaptureView) {
+        guard captureView === view else { return }
+        clearFocus()
+        captureView = nil
+    }
+
+    private func installKeyMonitor() {
+        guard keyMonitor == nil,
+              let view = captureView,
+              let window = view.window
+        else { return }
+
+        let windowNumber = window.windowNumber
+        let outlineFrameInWindow = view.convert(view.bounds, to: nil)
+        keyMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.keyDown, .leftMouseDown, .rightMouseDown]
+        ) { [weak self] event in
+            let eventWindowNumber = event.window?.windowNumber
+            guard eventWindowNumber == windowNumber else { return event }
+
+            if event.type == .leftMouseDown || event.type == .rightMouseDown {
+                let clickLocation = event.locationInWindow
+                if !outlineFrameInWindow.contains(clickLocation) {
+                    MainActor.assumeIsolated {
+                        self?.clearFocus()
+                    }
+                }
+                return event
+            }
+
+            let modifiers = event.modifierFlags
+            let keyCode = event.keyCode
+            guard !modifiers.contains(.command),
+                  !modifiers.contains(.control),
+                  !modifiers.contains(.option),
+                  !modifiers.contains(.shift),
+                  [123, 124, 125, 126].contains(keyCode)
+            else { return event }
+
+            MainActor.assumeIsolated {
+                self?.handleArrowKey(keyCode, windowNumber: windowNumber)
+            }
+            return nil
+        }
+    }
+
+    private func handleArrowKey(_ keyCode: UInt16, windowNumber: Int) {
+        guard focusRequested,
+              captureView?.window?.windowNumber == windowNumber
+        else { return }
+        captureView?.onArrowKey?(keyCode)
+    }
+}
+
+/// Supplies the Outline viewport bounds and arrow-key callback to the scoped
+/// local event monitor.
+@MainActor
+private final class OutlineKeyboardCaptureView: NSView {
+    var onArrowKey: ((UInt16) -> Void)?
+}
+
+@MainActor
+private struct OutlineKeyboardCaptureRepresentable: NSViewRepresentable {
+    let focusController: OutlineKeyboardFocusController
+    let onArrowKey: (UInt16) -> Void
+
+    func makeCoordinator() -> OutlineKeyboardFocusController {
+        focusController
+    }
+
+    func makeNSView(context: Context) -> OutlineKeyboardCaptureView {
+        let view = OutlineKeyboardCaptureView(frame: .zero)
+        view.onArrowKey = onArrowKey
+        focusController.attach(view)
+        return view
+    }
+
+    func updateNSView(_ view: OutlineKeyboardCaptureView, context: Context) {
+        view.onArrowKey = onArrowKey
+        focusController.attach(view)
+    }
+
+    static func dismantleNSView(
+        _ view: OutlineKeyboardCaptureView,
+        coordinator: OutlineKeyboardFocusController
+    ) {
+        coordinator.detach(view)
     }
 }
 
