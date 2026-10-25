@@ -40,7 +40,7 @@ common=(
 xcodebuild "${common[@]}" build-for-testing
 
 if [[ "${XCODEBUILD_TEST:-0}" == "1" ]]; then
-  xcodebuild "${common[@]}" test-without-building
+  xcodebuild "${common[@]}" -only-testing:YoPDFTests test-without-building
   exit $?
 fi
 

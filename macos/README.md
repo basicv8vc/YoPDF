@@ -107,7 +107,8 @@ action intermittently fails to instantiate a freshly built test bundle
 (`Failed to create a bundle instance ...`) even though the same bundle runs
 fine through `xctest`; see the header of `scripts/test.sh`. Set
 `XCODEBUILD_TEST=1` to force the xcodebuild path when you need an `.xcresult`
-or coverage data.
+or coverage data. This path filters to `YoPDFTests`, so it remains usable
+without a desktop session; run `test-ui.sh` separately for GUI tests.
 
 `test-ui.sh` runs `YoPDFUITests` through Xcode's UI testing runner. It launches
 the built app and sends real keyboard input, so it requires an interactive,
