@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import YoPDFCore
 
 /// Handles app events that sit above any reader view: Finder file opens and
@@ -24,8 +23,9 @@ import YoPDFCore
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Finder can ask the app to open a document before SwiftUI has created a
-    /// reader window. The queue keeps that request until the frontmost reader
-    /// is ready to pass it through its normal unsaved-work prompt.
+    /// reader window. The queue keeps one request until the frontmost reader
+    /// has handled it. A second request is rejected while that request is
+    /// pending or waiting for the user's unsaved-work decision.
     let fileOpenRequests = FileOpenRequestQueue()
 
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -33,13 +33,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             application.reply(toOpenOrPrint: .failure)
             return
         }
-        fileOpenRequests.enqueue(url)
-        application.reply(toOpenOrPrint: .success)
+        let reply: NSApplication.DelegateReply = acceptOpenRequest(url, from: application)
+            ? .success
+            : .failure
+        application.reply(toOpenOrPrint: reply)
     }
 
     func application(_ sender: NSApplication, openFile filename: String) -> Bool {
-        fileOpenRequests.enqueue(URL(fileURLWithPath: filename))
-        return true
+        acceptOpenRequest(URL(fileURLWithPath: filename), from: sender)
     }
 
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
@@ -51,8 +52,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        fileOpenRequests.enqueue(URL(fileURLWithPath: filename))
-        sender.reply(toOpenOrPrint: .success)
+        let reply: NSApplication.DelegateReply = acceptOpenRequest(
+            URL(fileURLWithPath: filename),
+            from: sender
+        ) ? .success : .failure
+        sender.reply(toOpenOrPrint: reply)
+    }
+
+    private func acceptOpenRequest(_ url: URL, from application: NSApplication) -> Bool {
+        guard fileOpenRequests.enqueue(url) else { return false }
+
+        // A cold Finder launch already gets the WindowGroup's initial window.
+        // For an app that is still running after all reader windows were closed,
+        // explicitly create a new reader scene so the queued URL has a view to
+        // consume it.
+        if fileOpenRequests.hasHadReaderWindow,
+           WindowCloseGuard.installedGuards(among: application.windows).isEmpty {
+            fileOpenRequests.openReaderWindowIfAvailable()
+        }
+        return true
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -69,25 +87,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // edits may actually be dropped.
         coordinator.commit(among: windows)
         return .terminateNow
-    }
-}
-
-/// Bridges AppKit's document-open callbacks to the SwiftUI reader lifecycle.
-/// It is deliberately small: `PDFReaderView` remains responsible for deciding
-/// whether the current document or note draft needs a prompt before switching.
-@MainActor
-final class FileOpenRequestQueue: ObservableObject {
-
-    @Published private(set) var revision = 0
-    private var pendingURLs: [URL] = []
-
-    func enqueue(_ url: URL) {
-        pendingURLs.append(url)
-        revision &+= 1
-    }
-
-    func takeNext() -> URL? {
-        guard !pendingURLs.isEmpty else { return nil }
-        return pendingURLs.removeFirst()
     }
 }

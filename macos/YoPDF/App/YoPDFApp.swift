@@ -9,7 +9,7 @@ struct YoPDFApp: App {
     @StateObject private var recentDocuments = RecentDocumentsStore.shared
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: "reader") {
             ReaderWindow(
                 updateController: updateController,
                 recentDocuments: recentDocuments,
@@ -42,6 +42,7 @@ struct YoPDFApp: App {
 /// through its normal unsaved-work prompt.
 private struct ReaderWindow: View {
 
+    @Environment(\.openWindow) private var openWindow
     @ObservedObject var updateController: SparkleUpdateController
     @ObservedObject var recentDocuments: RecentDocumentsStore
     let fileOpenRequests: FileOpenRequestQueue
@@ -59,11 +60,17 @@ private struct ReaderWindow: View {
     }
 
     var body: some View {
+        let openWindowAction = openWindow
         PDFReaderView(
             model: model,
             updateController: updateController,
             recentDocuments: recentDocuments,
             fileOpenRequests: fileOpenRequests
         )
+        .onAppear {
+            fileOpenRequests.registerReaderWindowOpener {
+                openWindowAction(id: "reader")
+            }
+        }
     }
 }
