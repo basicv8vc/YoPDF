@@ -38,6 +38,14 @@ badge. Legacy stacks that lost their group ID are recognized when same-style,
 group marker moves its member notes together. Editing individual thoughts
 within a group remains a later stage.
 
+P3 adds **full-text PDF search**. Press ⌘F to open the find bar, type a literal
+phrase, and use the result count and previous/next controls to move through the
+matches. Search is case-insensitive and highlights every match on the pages;
+Return or ⌘G moves forward, ⇧⌘G moves backward, and results wrap at either end.
+Esc closes the find bar and removes the temporary search highlights. The
+search covers text extractable by PDFKit; image-only scans require OCR and are
+not included. Search uses PDFKit and does not require network access.
+
 ## Requirements
 
 - macOS 14.0 or later (deployment target)
@@ -53,6 +61,7 @@ cd macos
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
 ./scripts/test.sh                     # unit tests (306)
+./scripts/test-ui.sh                  # GUI tests (interactive logged-in desktop session)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
@@ -98,7 +107,13 @@ action intermittently fails to instantiate a freshly built test bundle
 (`Failed to create a bundle instance ...`) even though the same bundle runs
 fine through `xctest`; see the header of `scripts/test.sh`. Set
 `XCODEBUILD_TEST=1` to force the xcodebuild path when you need an `.xcresult`
-or coverage data.
+or coverage data. This path filters to `YoPDFTests`, so it remains usable
+without a desktop session; run `test-ui.sh` separately for GUI tests.
+
+`test-ui.sh` runs `YoPDFUITests` through Xcode's UI testing runner. It launches
+the built app and sends real keyboard input, so it requires an interactive,
+logged-in macOS desktop session. The UI regression tests use PDFs generated in
+temporary directories and remove them after each test.
 
 ## Layout
 
