@@ -31,6 +31,18 @@ struct SaveDocumentAsActionKey: FocusedValueKey {
     typealias Value = @MainActor () -> Void
 }
 
+struct FindInDocumentActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
+struct FindNextSearchResultActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
+struct FindPreviousSearchResultActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
 struct HighlightSelectionActionKey: FocusedValueKey {
     typealias Value = @MainActor () -> Void
 }
@@ -69,6 +81,21 @@ extension FocusedValues {
     var saveDocumentAs: (@MainActor () -> Void)? {
         get { self[SaveDocumentAsActionKey.self] }
         set { self[SaveDocumentAsActionKey.self] = newValue }
+    }
+
+    var findInDocument: (@MainActor () -> Void)? {
+        get { self[FindInDocumentActionKey.self] }
+        set { self[FindInDocumentActionKey.self] = newValue }
+    }
+
+    var findNextSearchResult: (@MainActor () -> Void)? {
+        get { self[FindNextSearchResultActionKey.self] }
+        set { self[FindNextSearchResultActionKey.self] = newValue }
+    }
+
+    var findPreviousSearchResult: (@MainActor () -> Void)? {
+        get { self[FindPreviousSearchResultActionKey.self] }
+        set { self[FindPreviousSearchResultActionKey.self] = newValue }
     }
 
     var highlightSelection: (@MainActor () -> Void)? {

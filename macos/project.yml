@@ -121,6 +121,20 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: dev.yopdf.provisional.tests
         GENERATE_INFOPLIST_FILE: YES
 
+  YoPDFUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - path: YoPDFUITests
+      - path: YoPDFTests/PDFFixtureFactory.swift
+    dependencies:
+      - target: YoPDF
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.yopdf.provisional.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: YoPDF
+
 schemes:
   YoPDF:
     build:
@@ -128,6 +142,7 @@ schemes:
         YoPDFCore: all
         YoPDF: all
         YoPDFTests: [test]
+        YoPDFUITests: [test]
     run:
       config: Debug
     test:
@@ -135,3 +150,4 @@ schemes:
       gatherCoverageData: true
       targets:
         - YoPDFTests
+        - YoPDFUITests

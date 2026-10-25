@@ -17,6 +17,9 @@ struct PDFReaderCommands: Commands {
     @FocusedValue(\.openRecentDocument) private var openRecentDocument
     @FocusedValue(\.saveDocument) private var saveDocument
     @FocusedValue(\.saveDocumentAs) private var saveDocumentAs
+    @FocusedValue(\.findInDocument) private var findInDocument
+    @FocusedValue(\.findNextSearchResult) private var findNextSearchResult
+    @FocusedValue(\.findPreviousSearchResult) private var findPreviousSearchResult
     @FocusedValue(\.highlightSelection) private var highlightSelection
     @FocusedValue(\.underlineSelection) private var underlineSelection
     @FocusedValue(\.addNote) private var addNote
@@ -100,6 +103,26 @@ struct PDFReaderCommands: Commands {
             }
             .keyboardShortcut("s", modifiers: [.command, .shift])
             .disabled(model?.isLoaded != true)
+        }
+
+        CommandGroup(after: .pasteboard) {
+            Button("Find in PDF") {
+                findInDocument?()
+            }
+            .keyboardShortcut("f", modifiers: .command)
+            .disabled(model?.isLoaded != true)
+
+            Button("Find Next") {
+                findNextSearchResult?()
+            }
+            .keyboardShortcut("g", modifiers: .command)
+            .disabled(findNextSearchResult == nil)
+
+            Button("Find Previous") {
+                findPreviousSearchResult?()
+            }
+            .keyboardShortcut("g", modifiers: [.command, .shift])
+            .disabled(findPreviousSearchResult == nil)
         }
 
         CommandMenu("Annotate") {
