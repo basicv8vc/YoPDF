@@ -12,6 +12,11 @@ struct PDFReaderView: View {
     @State private var isImporterPresented = false
     @State private var isDropTargeted = false
     @State private var prompt: Prompt?
+    @State private var isSearchPresented = false
+    @State private var searchQuery = ""
+    @State private var searchMatches: [PDFSelection] = []
+    @State private var currentSearchResultIndex: Int?
+    @FocusState private var isSearchFieldFocused: Bool
     /// Installed on the window so closing it cannot drop unsaved edits.
     @State private var closeGuard = WindowCloseGuard()
     /// The window's one note composer, and the draft that outlives its popover.
@@ -126,77 +131,13 @@ struct PDFReaderView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            toolbar
-            Divider()
-            content
-        }
-        .frame(minWidth: 900, minHeight: 520)
-        .background(Color(nsColor: .windowBackgroundColor))
-        .fileImporter(
-            isPresented: $isImporterPresented,
-            allowedContentTypes: [.pdf],
-            allowsMultipleSelection: false
-        ) { result in
-            guard case let .success(urls) = result, let url = urls.first else { return }
-            requestOpen(url)
-        }
-        .onOpenURL { url in
-            requestOpen(url)
-        }
-        .task {
-            #if DEBUG
-            let environmentPath = ProcessInfo.processInfo.environment["YOPDF_SCREENSHOT_PDF"]
-            let preferencePath = UserDefaults.standard.string(forKey: "YOPDF_SCREENSHOT_PDF")
-            guard !didOpenScreenshotPDF,
-                  let path = environmentPath ?? preferencePath
-            else { return }
-            didOpenScreenshotPDF = true
-            requestOpen(URL(fileURLWithPath: path))
-            #endif
-        }
-        .onChange(of: model.autoSaveFailureRevision) { _, _ in
-            // Do not replace an action prompt already on screen. The toolbar
-            // keeps the failure visible, and dismissing the current prompt
-            // leaves the user free to retry or save a copy.
-            guard prompt == nil, let outcome = model.lastAutoSaveOutcome else { return }
-            _ = present(outcome)
-        }
-        .focusedSceneValue(\.documentModel, model)
-        .focusedSceneValue(\.openDocument, { isImporterPresented = true })
-        .focusedSceneValue(\.saveDocument, { requestSave() })
-        .focusedSceneValue(\.saveDocumentAs, { requestSaveAs() })
-        .focusedSceneValue(\.highlightSelection, { _ = model.addMarkup(.highlight) })
-        .focusedSceneValue(\.underlineSelection, { _ = model.addMarkup(.underline) })
-        .focusedSceneValue(\.addNote, { beginNote() })
-        .background(
-            WindowCloseGuardInstaller(
-                guardObject: closeGuard,
-                unsavedWork: { unsavedWork },
-                discardDraft: {
-                    // Termination is committed, so the draft goes with the
-                    // document's edits. Until this point a "Discard Draft" is
-                    // only an intent for the quit attempt.
-                    composerStore.end()
-                },
-                discardDocumentChanges: {
-                    model.abandonUnsavedChanges()
-                },
-                onUnsavedChanges: handleCloseIntent
-            )
-        )
-        .background(
-            TitlebarUpdateIndicatorInstaller(updateController: updateController)
-                .frame(width: 0, height: 0)
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
-        )
-        .alert(
+        alertReader
+    }
+
+    private var alertReader: some View {
+        titlebarReader.alert(
             prompt?.title ?? "",
-            isPresented: Binding(
-                get: { prompt != nil },
-                set: { if !$0 { prompt = nil } }
-            ),
+            isPresented: promptPresentation,
             presenting: prompt
         ) { prompt in
             switch prompt {
@@ -219,6 +160,127 @@ struct PDFReaderView: View {
             }
         } message: { prompt in
             Text(prompt.message)
+        }
+    }
+
+    private var titlebarReader: some View {
+        closeGuardReader.background(
+            TitlebarUpdateIndicatorInstaller(updateController: updateController)
+                .frame(width: 0, height: 0)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        )
+    }
+
+    private var closeGuardReader: some View {
+        focusedReader.background(
+            WindowCloseGuardInstaller(
+                guardObject: closeGuard,
+                unsavedWork: { unsavedWork },
+                discardDraft: {
+                    // Termination is committed, so the draft goes with the
+                    // document's edits. Until this point a "Discard Draft" is
+                    // only an intent for the quit attempt.
+                    composerStore.end()
+                },
+                discardDocumentChanges: {
+                    model.abandonUnsavedChanges()
+                },
+                onUnsavedChanges: handleCloseIntent
+            )
+        )
+    }
+
+    private var focusedReader: some View {
+        lifecycleReader
+            .focusedSceneValue(\.documentModel, model)
+            .focusedSceneValue(\.openDocument, { isImporterPresented = true })
+            .focusedSceneValue(\.saveDocument, { requestSave() })
+            .focusedSceneValue(\.saveDocumentAs, { requestSaveAs() })
+            .focusedSceneValue(\.findInDocument, { showSearch() })
+            .focusedSceneValue(\.findNextSearchResult, findNextSearchResultAction)
+            .focusedSceneValue(\.findPreviousSearchResult, findPreviousSearchResultAction)
+            .focusedSceneValue(\.highlightSelection, { _ = model.addMarkup(.highlight) })
+            .focusedSceneValue(\.underlineSelection, { _ = model.addMarkup(.underline) })
+            .focusedSceneValue(\.addNote, { beginNote() })
+    }
+
+    private var lifecycleReader: some View {
+        urlReader
+            .onChange(of: model.autoSaveFailureRevision) { _, _ in
+                presentLatestAutoSaveFailure()
+            }
+            .onChange(of: model.loadGeneration) { _, _ in
+                closeSearch()
+            }
+            .onChange(of: model.isLoaded) { _, isLoaded in
+                if !isLoaded { closeSearch() }
+            }
+            .onChange(of: searchQuery) { _, query in
+                updateSearch(query)
+            }
+    }
+
+    private var urlReader: some View {
+        importedReader
+            .onOpenURL(perform: requestOpen)
+            .task { openScreenshotPDFIfConfigured() }
+    }
+
+    private var importedReader: some View {
+        readerLayout
+            .frame(minWidth: 900, minHeight: 520)
+            .background(Color(nsColor: .windowBackgroundColor))
+            .fileImporter(
+                isPresented: $isImporterPresented,
+                allowedContentTypes: [.pdf],
+                allowsMultipleSelection: false
+            ) { result in
+                handleImportResult(result)
+            }
+    }
+
+    private func handleImportResult(_ result: Result<[URL], Error>) {
+        guard case let .success(urls) = result, let url = urls.first else { return }
+        requestOpen(url)
+    }
+
+    private func presentLatestAutoSaveFailure() {
+        // Do not replace an action prompt already on screen. The toolbar keeps
+        // the failure visible; dismissing the current prompt leaves the user
+        // free to retry or save a copy.
+        guard prompt == nil, let outcome = model.lastAutoSaveOutcome else { return }
+        _ = present(outcome)
+    }
+
+    private var promptPresentation: Binding<Bool> {
+        Binding(
+            get: { prompt != nil },
+            set: { if !$0 { prompt = nil } }
+        )
+    }
+
+    private func openScreenshotPDFIfConfigured() {
+        #if DEBUG
+        let environmentPath = ProcessInfo.processInfo.environment["YOPDF_SCREENSHOT_PDF"]
+        let preferencePath = UserDefaults.standard.string(forKey: "YOPDF_SCREENSHOT_PDF")
+        guard !didOpenScreenshotPDF,
+              let path = environmentPath ?? preferencePath
+        else { return }
+        didOpenScreenshotPDF = true
+        requestOpen(URL(fileURLWithPath: path))
+        #endif
+    }
+
+    private var readerLayout: some View {
+        VStack(spacing: 0) {
+            toolbar
+            Divider()
+            if isSearchPresented {
+                searchBar
+                Divider()
+            }
+            content
         }
     }
 
@@ -433,6 +495,169 @@ struct PDFReaderView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .background(.bar)
+    }
+
+    private var searchBar: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+
+            TextField("Find in PDF", text: $searchQuery)
+                .textFieldStyle(.plain)
+                .focused($isSearchFieldFocused)
+                .accessibilityIdentifier("pdf-search-field")
+                .onSubmit(showNextSearchResult)
+                .onExitCommand(perform: closeSearch)
+                .frame(minWidth: 220, maxWidth: 360)
+
+            if !searchQuery.isEmpty {
+                Button {
+                    searchQuery = ""
+                    isSearchFieldFocused = true
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Clear search")
+                .help("Clear search")
+            }
+
+            Text(searchResultSummary)
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 64, alignment: .leading)
+                .accessibilityLabel(searchResultAccessibilityLabel)
+
+            Button(action: showPreviousSearchResult) {
+                Image(systemName: "chevron.up")
+            }
+            .disabled(searchMatches.isEmpty)
+            .accessibilityLabel("Previous search result")
+            .help("Previous result (⇧⌘G)")
+
+            Button(action: showNextSearchResult) {
+                Image(systemName: "chevron.down")
+            }
+            .disabled(searchMatches.isEmpty)
+            .accessibilityLabel("Next search result")
+            .help("Next result (⌘G)")
+
+            Button(action: closeSearch) {
+                Image(systemName: "xmark")
+            }
+            .accessibilityLabel("Close search")
+            .help("Close search (Esc)")
+        }
+        .buttonStyle(.borderless)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(.bar)
+    }
+
+    private var findNextSearchResultAction: (@MainActor () -> Void)? {
+        guard !searchMatches.isEmpty else { return nil }
+        return { showNextSearchResult() }
+    }
+
+    private var findPreviousSearchResultAction: (@MainActor () -> Void)? {
+        guard !searchMatches.isEmpty else { return nil }
+        return { showPreviousSearchResult() }
+    }
+
+    private var searchResultSummary: String {
+        guard !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return ""
+        }
+        guard let currentSearchResultIndex, !searchMatches.isEmpty else {
+            return "No matches"
+        }
+        return "\(currentSearchResultIndex + 1) of \(searchMatches.count)"
+    }
+
+    private var searchResultAccessibilityLabel: String {
+        guard let currentSearchResultIndex, !searchMatches.isEmpty else {
+            return searchResultSummary.isEmpty ? "No search results" : searchResultSummary
+        }
+        return "Result \(currentSearchResultIndex + 1) of \(searchMatches.count)"
+    }
+
+    private func showSearch() {
+        guard model.isLoaded else { return }
+        isSearchPresented = true
+        updateSearch(searchQuery)
+        isSearchFieldFocused = true
+    }
+
+    private func closeSearch() {
+        if let pdfView = anchorResolver.pdfView {
+            pdfView.highlightedSelections = nil
+            pdfView.searchSelections = []
+            pdfView.activeSearchSelection = nil
+            if isSearchPresented {
+                pdfView.window?.makeFirstResponder(pdfView)
+            }
+        }
+        searchMatches = []
+        currentSearchResultIndex = nil
+        searchQuery = ""
+        isSearchPresented = false
+        isSearchFieldFocused = false
+    }
+
+    private func updateSearch(_ rawQuery: String) {
+        guard let document = model.document,
+              let pdfView = anchorResolver.pdfView,
+              pdfView.document === document
+        else {
+            searchMatches = []
+            currentSearchResultIndex = nil
+            anchorResolver.pdfView?.highlightedSelections = nil
+            anchorResolver.pdfView?.searchSelections = []
+            anchorResolver.pdfView?.activeSearchSelection = nil
+            return
+        }
+
+        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
+            searchMatches = []
+            currentSearchResultIndex = nil
+            pdfView.highlightedSelections = nil
+            pdfView.searchSelections = []
+            pdfView.activeSearchSelection = nil
+            return
+        }
+
+        let matches = document.findString(query, withOptions: [.caseInsensitive])
+        searchMatches = matches
+        currentSearchResultIndex = matches.isEmpty ? nil : 0
+        pdfView.highlightedSelections = nil
+        pdfView.searchSelections = matches
+        pdfView.activeSearchSelection = matches.first
+        if let firstMatch = matches.first {
+            pdfView.go(to: firstMatch)
+        }
+    }
+
+    private func showNextSearchResult() {
+        moveSearchResult(by: 1)
+    }
+
+    private func showPreviousSearchResult() {
+        moveSearchResult(by: -1)
+    }
+
+    private func moveSearchResult(by offset: Int) {
+        guard !searchMatches.isEmpty,
+              let pdfView = anchorResolver.pdfView,
+              pdfView.document === model.document
+        else { return }
+
+        let currentIndex = currentSearchResultIndex ?? 0
+        let nextIndex = (currentIndex + offset + searchMatches.count) % searchMatches.count
+        currentSearchResultIndex = nextIndex
+        pdfView.activeSearchSelection = searchMatches[nextIndex]
+        pdfView.go(to: searchMatches[nextIndex])
     }
 
     private var pageIndicator: some View {

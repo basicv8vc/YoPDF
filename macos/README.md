@@ -38,6 +38,14 @@ badge. Legacy stacks that lost their group ID are recognized when same-style,
 group marker moves its member notes together. Editing individual thoughts
 within a group remains a later stage.
 
+P3 adds **full-text PDF search**. Press ⌘F to open the find bar, type a literal
+phrase, and use the result count and previous/next controls to move through the
+matches. Search is case-insensitive and highlights every match on the pages;
+Return or ⌘G moves forward, ⇧⌘G moves backward, and results wrap at either end.
+Esc closes the find bar and removes the temporary search highlights. The
+search covers text extractable by PDFKit; image-only scans require OCR and are
+not included. Search uses PDFKit and does not require network access.
+
 ## Requirements
 
 - macOS 14.0 or later (deployment target)

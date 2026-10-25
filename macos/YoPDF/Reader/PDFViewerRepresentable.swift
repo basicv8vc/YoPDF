@@ -268,6 +268,12 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
             refreshOverlayViews()
         }
     }
+    var searchSelections: [PDFSelection] = [] {
+        didSet { refreshOverlayViews() }
+    }
+    var activeSearchSelection: PDFSelection? {
+        didSet { refreshOverlayViews() }
+    }
     var isPlacingNote = false {
         didSet {
             guard isPlacingNote != oldValue else { return }
@@ -553,6 +559,8 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
         }
         overlay.selectedMarkup = selectedMarkup
         overlay.markers = noteMarkers.filter { $0.pageIndex == pageIndex }
+        overlay.searchSelections = searchSelections
+        overlay.activeSearchSelection = activeSearchSelection
         overlay.onMarkerActivated = { [weak self] marker in
             guard let self,
                   let page = self.document?.page(at: marker.pageIndex),
@@ -618,6 +626,8 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
     private func refreshOverlayViews() {
         for overlay in overlayViews.values {
             overlay.selectedMarkup = selectedMarkup
+            overlay.searchSelections = searchSelections
+            overlay.activeSearchSelection = activeSearchSelection
             overlay.markers = noteMarkers.filter { $0.pageIndex == overlay.pageIndex }
         }
     }
@@ -638,6 +648,12 @@ private final class MarkupSelectionOverlayView: NSView {
     var pageBounds: CGRect = .zero
     var pagePointForOverlayPoint: ((CGPoint) -> CGPoint)?
     var selectedMarkup: MarkupSelection? {
+        didSet { needsDisplay = true }
+    }
+    var searchSelections: [PDFSelection] = [] {
+        didSet { needsDisplay = true }
+    }
+    var activeSearchSelection: PDFSelection? {
         didSet { needsDisplay = true }
     }
     var markers: [NoteMarker] = [] {
@@ -812,8 +828,46 @@ private final class MarkupSelectionOverlayView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         drawNoteMarkerMasks()
+        drawSearchSelections()
         drawSelectedMarkup()
         drawNoteStickerArtwork()
+    }
+
+    private func drawSearchSelections() {
+        for selection in searchSelections {
+            drawSearchSelection(selection, color: NSColor.yellow.withAlphaComponent(0.32))
+        }
+        if let activeSearchSelection {
+            drawSearchSelection(activeSearchSelection, color: NSColor.yellow.withAlphaComponent(0.64))
+        }
+    }
+
+    private func drawSearchSelection(_ selection: PDFSelection, color: NSColor) {
+        guard let page,
+              selection.pages.contains(where: { $0 === page })
+        else { return }
+
+        let lineSelections = selection.selectionsByLine()
+        let selections = lineSelections.isEmpty ? [selection] : lineSelections
+        color.setFill()
+
+        for lineSelection in selections {
+            let selectionRect = lineSelection.bounds(for: page)
+            guard !selectionRect.isNull,
+                  !selectionRect.isEmpty,
+                  selectionRect.origin.x.isFinite,
+                  selectionRect.origin.y.isFinite,
+                  selectionRect.width.isFinite,
+                  selectionRect.height.isFinite
+            else { continue }
+
+            let overlayRect = selectionRect.offsetBy(
+                dx: -pageBounds.minX,
+                dy: -pageBounds.minY
+            ).intersection(bounds)
+            guard !overlayRect.isNull, !overlayRect.isEmpty else { continue }
+            NSBezierPath(rect: overlayRect).fill()
+        }
     }
 
     private func drawSelectedMarkup() {
