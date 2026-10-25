@@ -37,6 +37,8 @@ public enum AnnotationMarkdownExporter {
                     blocks.append("**Underline**")
                 }
                 blocks.append(blockquote(quote))
+            } else {
+                blocks.append("**\(kind.title) (text unavailable)**")
             }
             if let comment = nonempty(annotation.contents) {
                 blocks.append(noteBlock(comment))
@@ -69,7 +71,7 @@ public enum AnnotationMarkdownExporter {
     }
 
     private static func blockquote(_ text: String) -> String {
-        text.components(separatedBy: .newlines)
+        lines(in: text)
             .map { line in
                 line.isEmpty ? ">" : "> \(escapeMarkdown(line))"
             }
@@ -87,24 +89,48 @@ public enum AnnotationMarkdownExporter {
     }
 
     private static func oneLine(_ value: String) -> String {
-        value.components(separatedBy: .newlines)
+        lines(in: value)
             .joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Treat CRLF as one separator before splitting on Foundation's full set
+    /// of newline characters; otherwise `\r\n` would create an empty line.
+    private static func lines(in text: String) -> [String] {
+        text.replacingOccurrences(of: "\r\n", with: "\n")
+            .components(separatedBy: .newlines)
     }
 
     /// Notes and extracted PDF text are plain text. Escaping Markdown syntax
     /// preserves that meaning and prevents annotation contents from creating
     /// headings, links, images, or HTML in the exported file.
     private static func escapeMarkdown(_ text: String) -> String {
-        let markdownPunctuation = Set("\\`*_{}[]<>()#+-.!|")
-        var escaped = ""
-        escaped.reserveCapacity(text.count)
-        for character in text {
-            if markdownPunctuation.contains(character) {
-                escaped.append("\\")
+        let markdownPunctuation = Set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+        return lines(in: text)
+            .map { line in
+                let indentation = line.prefix { $0 == " " || $0 == "\t" }
+                let content = line.dropFirst(indentation.count)
+                var escaped = ""
+
+                if indentation.count >= 4 || indentation.contains("\t") {
+                    // A line with four leading spaces or a tab would become a
+                    // Markdown code block. Character references preserve the
+                    // plain text while keeping the line in its paragraph.
+                    for character in indentation {
+                        escaped += character == "\t" ? "&#9;" : "&#32;"
+                    }
+                } else {
+                    escaped += indentation
+                }
+
+                for character in content {
+                    if markdownPunctuation.contains(character) {
+                        escaped.append("\\")
+                    }
+                    escaped.append(character)
+                }
+                return escaped
             }
-            escaped.append(character)
-        }
-        return escaped
+            .joined(separator: "\n")
     }
 }
