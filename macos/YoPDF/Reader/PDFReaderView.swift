@@ -14,8 +14,6 @@ struct PDFReaderView: View {
     @State private var prompt: Prompt?
     @State private var isSearchPresented = false
     @State private var searchQuery = ""
-    @State private var searchMatches: [PDFSelection] = []
-    @State private var currentSearchResultIndex: Int?
     @FocusState private var isSearchFieldFocused: Bool
     /// Installed on the window so closing it cannot drop unsaved edits.
     @State private var closeGuard = WindowCloseGuard()
@@ -25,6 +23,7 @@ struct PDFReaderView: View {
     /// enough — a save, another annotation edit, a click outside — that either
     /// would throw typed text away.
     @StateObject private var composerStore = NoteComposerStore()
+    @StateObject private var searchSession = PDFSearchSession()
     /// True while the next page click places a page note.
     @State private var isPlacingNote = false
     /// Converts page rectangles into popover anchors through the live PDFView.
@@ -216,9 +215,14 @@ struct PDFReaderView: View {
             .onChange(of: model.isLoaded) { _, isLoaded in
                 if !isLoaded { closeSearch() }
             }
-            .onChange(of: searchQuery) { _, query in
-                updateSearch(query)
+            .onChange(of: model.document.map(ObjectIdentifier.init)) { _, _ in
+                searchSession.documentWasReplaced(with: model.document)
             }
+            .onChange(of: searchQuery) { _, query in
+                guard isSearchPresented else { return }
+                searchSession.search(query, in: model.document)
+            }
+            .onDisappear(perform: closeSearch)
     }
 
     private var urlReader: some View {
@@ -526,20 +530,20 @@ struct PDFReaderView: View {
             Text(searchResultSummary)
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
-                .frame(minWidth: 64, alignment: .leading)
+                .frame(minWidth: 84, alignment: .leading)
                 .accessibilityLabel(searchResultAccessibilityLabel)
 
             Button(action: showPreviousSearchResult) {
                 Image(systemName: "chevron.up")
             }
-            .disabled(searchMatches.isEmpty)
+            .disabled(searchSession.results.isEmpty)
             .accessibilityLabel("Previous search result")
             .help("Previous result (⇧⌘G)")
 
             Button(action: showNextSearchResult) {
                 Image(systemName: "chevron.down")
             }
-            .disabled(searchMatches.isEmpty)
+            .disabled(searchSession.results.isEmpty)
             .accessibilityLabel("Next search result")
             .help("Next result (⌘G)")
 
@@ -556,12 +560,12 @@ struct PDFReaderView: View {
     }
 
     private var findNextSearchResultAction: (@MainActor () -> Void)? {
-        guard !searchMatches.isEmpty else { return nil }
+        guard !searchSession.results.isEmpty || searchSession.isSearching else { return nil }
         return { showNextSearchResult() }
     }
 
     private var findPreviousSearchResultAction: (@MainActor () -> Void)? {
-        guard !searchMatches.isEmpty else { return nil }
+        guard !searchSession.results.isEmpty || searchSession.isSearching else { return nil }
         return { showPreviousSearchResult() }
     }
 
@@ -569,73 +573,58 @@ struct PDFReaderView: View {
         guard !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return ""
         }
-        guard let currentSearchResultIndex, !searchMatches.isEmpty else {
+        if searchSession.isSearching {
+            return "Searching…"
+        }
+        guard let currentResultIndex = searchSession.currentResultIndex,
+              !searchSession.results.isEmpty
+        else {
             return "No matches"
         }
-        return "\(currentSearchResultIndex + 1) of \(searchMatches.count)"
+        return "\(currentResultIndex + 1) of \(searchSession.results.count)"
     }
 
     private var searchResultAccessibilityLabel: String {
-        guard let currentSearchResultIndex, !searchMatches.isEmpty else {
+        if searchSession.isSearching {
+            return "Searching"
+        }
+        guard let currentResultIndex = searchSession.currentResultIndex,
+              !searchSession.results.isEmpty
+        else {
             return searchResultSummary.isEmpty ? "No search results" : searchResultSummary
         }
-        return "Result \(currentSearchResultIndex + 1) of \(searchMatches.count)"
+        return "Result \(currentResultIndex + 1) of \(searchSession.results.count)"
     }
 
     private func showSearch() {
         guard model.isLoaded else { return }
+        if isSearchPresented {
+            focusSearchField(selectingQuery: true)
+            return
+        }
         isSearchPresented = true
-        updateSearch(searchQuery)
-        isSearchFieldFocused = true
+        searchSession.search(searchQuery, in: model.document)
+        focusSearchField(selectingQuery: false)
     }
 
     private func closeSearch() {
         if let pdfView = anchorResolver.pdfView {
-            pdfView.highlightedSelections = nil
-            pdfView.searchSelections = []
-            pdfView.activeSearchSelection = nil
             if isSearchPresented {
                 pdfView.window?.makeFirstResponder(pdfView)
             }
         }
-        searchMatches = []
-        currentSearchResultIndex = nil
+        searchSession.clear()
         searchQuery = ""
         isSearchPresented = false
         isSearchFieldFocused = false
     }
 
-    private func updateSearch(_ rawQuery: String) {
-        guard let document = model.document,
-              let pdfView = anchorResolver.pdfView,
-              pdfView.document === document
-        else {
-            searchMatches = []
-            currentSearchResultIndex = nil
-            anchorResolver.pdfView?.highlightedSelections = nil
-            anchorResolver.pdfView?.searchSelections = []
-            anchorResolver.pdfView?.activeSearchSelection = nil
-            return
-        }
-
-        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else {
-            searchMatches = []
-            currentSearchResultIndex = nil
-            pdfView.highlightedSelections = nil
-            pdfView.searchSelections = []
-            pdfView.activeSearchSelection = nil
-            return
-        }
-
-        let matches = document.findString(query, withOptions: [.caseInsensitive])
-        searchMatches = matches
-        currentSearchResultIndex = matches.isEmpty ? nil : 0
-        pdfView.highlightedSelections = nil
-        pdfView.searchSelections = matches
-        pdfView.activeSearchSelection = matches.first
-        if let firstMatch = matches.first {
-            pdfView.go(to: firstMatch)
+    private func focusSearchField(selectingQuery: Bool) {
+        isSearchFieldFocused = true
+        guard selectingQuery else { return }
+        Task { @MainActor in
+            await Task.yield()
+            (anchorResolver.pdfView?.window?.firstResponder as? NSTextView)?.selectAll(nil)
         }
     }
 
@@ -648,16 +637,15 @@ struct PDFReaderView: View {
     }
 
     private func moveSearchResult(by offset: Int) {
-        guard !searchMatches.isEmpty,
+        guard !searchSession.results.isEmpty || searchSession.isSearching,
               let pdfView = anchorResolver.pdfView,
               pdfView.document === model.document
         else { return }
 
-        let currentIndex = currentSearchResultIndex ?? 0
-        let nextIndex = (currentIndex + offset + searchMatches.count) % searchMatches.count
-        currentSearchResultIndex = nextIndex
-        pdfView.activeSearchSelection = searchMatches[nextIndex]
-        pdfView.go(to: searchMatches[nextIndex])
+        searchSession.move(by: offset)
+        guard let nextSelection = searchSession.currentSelection else { return }
+        pdfView.activeSearchSelection = nextSelection
+        pdfView.go(to: nextSelection)
     }
 
     private var pageIndicator: some View {
@@ -689,6 +677,7 @@ struct PDFReaderView: View {
     @ViewBuilder
     private var content: some View {
         if model.isLoaded {
+            let searchBelongsToDisplayedDocument = searchSession.document === model.document
             PDFViewerRepresentable(
                 document: model.document,
                 currentPageIndex: Binding(
@@ -725,6 +714,11 @@ struct PDFReaderView: View {
                     placePageNote(at: point, on: page, anchor: anchor)
                 },
                 onCancelPlacement: { isPlacingNote = false },
+                searchSelections: searchBelongsToDisplayedDocument ? searchSession.results : [],
+                activeSearchSelection: searchBelongsToDisplayedDocument
+                    ? searchSession.currentSelection
+                    : nil,
+                searchResultsRevision: searchSession.resultsRevision,
                 makeMenuItems: { context in
                     pageMenuItems(for: context)
                 },
