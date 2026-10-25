@@ -30,9 +30,9 @@ struct PDFReaderView: View {
     @State private var anchorResolver = PageAnchorResolver()
 
     #if DEBUG
-    /// Test-only launch hook for deterministic screenshot runs. It is compiled
-    /// out of Release builds and does nothing unless the environment variable is
-    /// present.
+    /// Test-only launch hook for deterministic screenshot and GUI runs. It is
+    /// compiled out of Release builds and does nothing unless the environment
+    /// variable is present.
     @State private var didOpenScreenshotPDF = false
     #endif
 
@@ -531,6 +531,7 @@ struct PDFReaderView: View {
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(minWidth: 84, alignment: .leading)
+                .accessibilityIdentifier("pdf-search-result-summary")
                 .accessibilityLabel(searchResultAccessibilityLabel)
 
             Button(action: showPreviousSearchResult) {

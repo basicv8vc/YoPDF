@@ -33,7 +33,8 @@ macos/
 ├── YoPDFCore/         # reader logic, no UI, unit-tested
 ├── YoPDF/             # SwiftUI app + sticker Asset Catalog
 ├── YoPDFTests/        # logic tests
-└── scripts/           # generate / build / test
+├── YoPDFUITests/      # macOS GUI regression tests
+└── scripts/           # generate / build / test / test-ui
 ```
 
 ## License
