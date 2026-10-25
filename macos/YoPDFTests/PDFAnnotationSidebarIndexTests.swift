@@ -107,6 +107,30 @@ final class PDFAnnotationSidebarIndexTests: XCTestCase {
         XCTAssertEqual(entries.first?.annotation.contents, "Rotated page note")
     }
 
+    func testPageThumbnailUsesPageRotationWhenChoosingItsRenderedOrientation() throws {
+        let document = try XCTUnwrap(PDFDocument(data: PDFFixtureFactory.makePDFData(pageCount: 4)))
+        let rotations = [0, 90, 180, 270]
+        for (pageIndex, rotation) in rotations.enumerated() {
+            try XCTUnwrap(document.page(at: pageIndex)).rotation = rotation
+        }
+
+        let url = try write(document, named: "thumbnail-page-rotations.pdf")
+        let reopened = try XCTUnwrap(PDFDocument(url: url))
+        let maximumSize = CGSize(width: 180, height: 234)
+
+        for (pageIndex, rotation) in rotations.enumerated() {
+            let page = try XCTUnwrap(reopened.page(at: pageIndex))
+            XCTAssertEqual(page.rotation, rotation)
+            let thumbnail = page.thumbnail(of: maximumSize, for: .cropBox)
+
+            if rotation == 90 || rotation == 270 {
+                XCTAssertGreaterThan(thumbnail.size.width, thumbnail.size.height, "Rotation \(rotation) should render landscape")
+            } else {
+                XCTAssertGreaterThan(thumbnail.size.height, thumbnail.size.width, "Rotation \(rotation) should render portrait")
+            }
+        }
+    }
+
     func testIndexCanBuildFor500And1000PageDocuments() throws {
         for pageCount in [500, 1_000] {
             let data = try PDFFixtureFactory.makePDFData(pageCount: pageCount)

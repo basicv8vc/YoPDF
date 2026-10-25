@@ -38,7 +38,6 @@ struct ReaderSidebarActions {
 struct ReaderSidebar: View {
 
     @ObservedObject var model: PDFDocumentModel
-    @ObservedObject var pdfViewHandle: PDFViewHandle
     @ObservedObject var navigationState: ReaderNavigationState
     @Binding var selection: ReaderSidebarSection
     let onSelectDestination: (PDFDestination) -> Void
@@ -184,14 +183,15 @@ struct ReaderSidebar: View {
             GeometryReader { geometry in
                 let thumbnailWidth = min(180, max(0, geometry.size.width - 40))
 
-                PDFThumbnailSidebarRepresentable(
-                    pdfViewHandle: pdfViewHandle,
+                PDFPageThumbnailList(
+                    document: model.document,
+                    currentPageIndex: model.currentPageIndex,
                     thumbnailSize: CGSize(
                         width: thumbnailWidth,
                         height: thumbnailWidth * 792 / 612
-                    )
+                    ),
+                    onSelectPage: model.goToPage
                 )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .accessibilityLabel("Page thumbnails")
             }
         case .annotations:
@@ -807,28 +807,121 @@ private struct SidebarEmptyState: View {
     }
 }
 
-private struct PDFThumbnailSidebarRepresentable: NSViewRepresentable {
-    @ObservedObject var pdfViewHandle: PDFViewHandle
+private struct PDFPageThumbnailList: View {
+    let document: PDFDocument?
+    let currentPageIndex: Int
     let thumbnailSize: CGSize
+    let onSelectPage: (Int) -> Void
 
-    func makeNSView(context: Context) -> PDFThumbnailView {
-        let view = PDFThumbnailView(frame: .zero)
-        view.thumbnailSize = thumbnailSize
-        view.maximumNumberOfColumns = 1
-        view.allowsDragging = false
-        view.labelFont = .monospacedDigitSystemFont(ofSize: 10, weight: .regular)
-        view.backgroundColor = .controlBackgroundColor
-        view.pdfView = pdfViewHandle.pdfView
-        return view
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 14) {
+                    if let document {
+                        ForEach(0..<document.pageCount, id: \.self) { pageIndex in
+                            if let page = document.page(at: pageIndex) {
+                                Button {
+                                    onSelectPage(pageIndex)
+                                } label: {
+                                    VStack(spacing: 5) {
+                                        PDFPageThumbnail(page: page, maximumSize: thumbnailSize)
+
+                                        Text("\(pageIndex + 1)")
+                                            .font(.system(size: 12, weight: .medium).monospacedDigit())
+                                            .foregroundStyle(isCurrentPage(pageIndex) ? Color.accentColor : Color.primary)
+                                    }
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 5)
+                                    .background {
+                                        if isCurrentPage(pageIndex) {
+                                            RoundedRectangle(cornerRadius: 7)
+                                                .fill(Color.accentColor.opacity(0.09))
+                                        }
+                                    }
+                                    .contentShape(RoundedRectangle(cornerRadius: 7))
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Page \(pageIndex + 1)")
+                                .accessibilityValue(isCurrentPage(pageIndex) ? "Current page" : "")
+                                .id(pageIndex)
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 8)
+            }
+            .onAppear {
+                scrollToCurrentPage(using: proxy, animated: false)
+            }
+            .onChange(of: currentPageIndex) { _, _ in
+                scrollToCurrentPage(using: proxy, animated: true)
+            }
+        }
     }
 
-    func updateNSView(_ view: PDFThumbnailView, context: Context) {
-        if view.thumbnailSize != thumbnailSize {
-            view.thumbnailSize = thumbnailSize
+    private func isCurrentPage(_ pageIndex: Int) -> Bool {
+        pageIndex == currentPageIndex
+    }
+
+    private func scrollToCurrentPage(using proxy: ScrollViewProxy, animated: Bool) {
+        guard let document,
+              currentPageIndex >= 0,
+              currentPageIndex < document.pageCount
+        else { return }
+
+        let scroll = {
+            proxy.scrollTo(currentPageIndex, anchor: .center)
+        }
+        if animated {
+            withAnimation(.easeInOut(duration: 0.18), scroll)
+        } else {
+            scroll()
+        }
+    }
+}
+
+private struct PDFPageThumbnail: View {
+    let page: PDFPage
+    let maximumSize: CGSize
+
+    @State private var image: NSImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+                    .frame(width: image.size.width, height: image.size.height)
+                    .background(Color.white)
+                    .overlay(Rectangle().stroke(Color.black.opacity(0.16), lineWidth: 0.6))
+                    .shadow(color: .black.opacity(0.2), radius: 3, y: 2)
+            } else {
+                Rectangle()
+                    .fill(Color.white)
+                    .frame(width: placeholderSize.width, height: placeholderSize.height)
+                    .overlay(Rectangle().stroke(Color.black.opacity(0.12), lineWidth: 0.6))
+            }
+        }
+        .task(id: maximumSize) {
+            image = page.thumbnail(of: maximumSize, for: .cropBox)
+        }
+    }
+
+    private var placeholderSize: CGSize {
+        var pageBounds = page.bounds(for: .cropBox)
+        let rotation = ((page.rotation % 360) + 360) % 360
+        if rotation == 90 || rotation == 270 {
+            pageBounds.size = CGSize(width: pageBounds.height, height: pageBounds.width)
         }
 
-        if view.pdfView !== pdfViewHandle.pdfView {
-            view.pdfView = pdfViewHandle.pdfView
-        }
+        guard pageBounds.width > 0, pageBounds.height > 0,
+              maximumSize.width > 0, maximumSize.height > 0
+        else { return maximumSize }
+
+        let scale = min(maximumSize.width / pageBounds.width, maximumSize.height / pageBounds.height)
+        return CGSize(width: pageBounds.width * scale, height: pageBounds.height * scale)
     }
 }

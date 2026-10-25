@@ -15,7 +15,6 @@ struct PDFReaderView: View {
     @State private var isSidebarVisible = true
     @State private var sidebarSection: ReaderSidebarSection = .thumbnails
     @StateObject private var readerNavigationState = ReaderNavigationState()
-    @StateObject private var pdfViewHandle = PDFViewHandle()
     @State private var pendingNavigationDestination: PDFDestination?
     @State private var navigationRevision = 0
     /// Installed on the window so closing it cannot drop unsaved edits.
@@ -515,7 +514,6 @@ struct PDFReaderView: View {
                 if isSidebarVisible {
                     ReaderSidebar(
                         model: model,
-                        pdfViewHandle: pdfViewHandle,
                         navigationState: readerNavigationState,
                         selection: $sidebarSection,
                         onSelectDestination: { navigate(to: $0) }
@@ -527,7 +525,6 @@ struct PDFReaderView: View {
 
                 PDFViewerRepresentable(
                     document: model.document,
-                    pdfViewHandle: pdfViewHandle,
                     currentPageIndex: Binding(
                         get: { model.currentPageIndex },
                         set: { model.goToPage($0) }

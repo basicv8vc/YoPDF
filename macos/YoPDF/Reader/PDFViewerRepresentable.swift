@@ -18,23 +18,6 @@ struct PageMenuContext {
     let anchorRect: CGRect
 }
 
-/// Shares the live PDFView with native PDFKit sidebar controls such as
-/// PDFThumbnailView without giving the sidebar ownership of the view.
-@MainActor
-final class PDFViewHandle: ObservableObject {
-    @Published private(set) var pdfView: PDFView?
-
-    func attach(_ view: PDFView) {
-        guard pdfView !== view else { return }
-        pdfView = view
-    }
-
-    func detach(_ view: PDFView) {
-        guard pdfView === view else { return }
-        pdfView = nil
-    }
-}
-
 /// Bridges PDFView into SwiftUI.
 ///
 /// The wrapper owns no reader state: page index, zoom, annotation selection and
@@ -45,7 +28,6 @@ final class PDFViewHandle: ObservableObject {
 struct PDFViewerRepresentable: NSViewRepresentable {
 
     let document: PDFDocument?
-    let pdfViewHandle: PDFViewHandle
     @Binding var currentPageIndex: Int
     @Binding var selection: PDFSelection?
     let autoScales: Bool
@@ -81,7 +63,6 @@ struct PDFViewerRepresentable: NSViewRepresentable {
         if !autoScales {
             view.scaleFactor = zoomScale
         }
-        pdfViewHandle.attach(view)
         view.displayMode = .singlePageContinuous
         view.displayDirection = .vertical
         view.displaysPageBreaks = true
@@ -98,7 +79,6 @@ struct PDFViewerRepresentable: NSViewRepresentable {
 
     func updateNSView(_ view: MarkupPDFView, context: Context) {
         context.coordinator.parent = self
-        pdfViewHandle.attach(view)
         context.coordinator.updateHandlers(on: view, parent: self)
         anchorResolver.pdfView = view
 
@@ -168,10 +148,6 @@ struct PDFViewerRepresentable: NSViewRepresentable {
         Coordinator(parent: self)
     }
 
-    static func dismantleNSView(_ view: MarkupPDFView, coordinator: Coordinator) {
-        coordinator.pdfViewHandle?.detach(view)
-    }
-
     @MainActor
     final class Coordinator: NSObject {
         var parent: PDFViewerRepresentable
@@ -179,11 +155,9 @@ struct PDFViewerRepresentable: NSViewRepresentable {
         var lastNavigationRevision = -1
         let zoomSynchronizer = PDFViewZoomSynchronizer()
         private weak var pdfView: MarkupPDFView?
-        weak var pdfViewHandle: PDFViewHandle?
 
         init(parent: PDFViewerRepresentable) {
             self.parent = parent
-            self.pdfViewHandle = parent.pdfViewHandle
         }
 
         func attach(to view: MarkupPDFView) {
@@ -973,9 +947,8 @@ private final class MarkupSelectionOverlayView: NSView {
         if let pageRef = page.pageRef {
             // Draw the immutable PDF page content and its non-sticker
             // annotations directly. Removing annotations from a PDFPage copy
-            // posts PDFKit page-change notifications while AppKit is drawing;
-            // PDFThumbnailView can then reload an invalid collection index and
-            // crash when a reader navigates from its thumbnail sidebar.
+            // posts PDFKit page-change notifications while AppKit is drawing,
+            // which can reenter PDFKit's page observers during rendering.
             page.transform(context, for: .cropBox)
             context.drawPDFPage(pageRef)
 
