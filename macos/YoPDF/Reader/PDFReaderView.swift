@@ -912,7 +912,8 @@ struct PDFReaderView: View {
                         .help(item.lastKnownPath)
                     }
                 }
-                .frame(maxWidth: 360, alignment: .leading)
+                .fixedSize(horizontal: true, vertical: false)
+                .frame(maxWidth: 360, alignment: .center)
                 .padding(.top, 14)
             }
         }
