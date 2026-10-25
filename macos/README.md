@@ -349,17 +349,23 @@ note. ⌘S and the Save button remain available for an immediate save.
   stays on the original, still dirty), an unclassifiable replacement is reported
   as "uncertain" with the recovery files listed, and only a write that did not
   happen is reported as a failure.
-- The toolbar, Open panel, drag and drop, and Finder's AppKit
-  `application(_:open:)` callback all funnel through `PDFReaderView.requestOpen`,
+- The toolbar, Open panel, drag and drop, SwiftUI's `onOpenURL` and Finder's
+  AppKit callbacks all funnel through `PDFReaderView.requestOpen`,
   which is where the unsaved-changes prompt lives. Finder has one request slot;
-  it stays occupied until the key reader handles the URL and any unsaved-work
+  it stays occupied until the chosen reader handles the URL and any unsaved-work
   prompt is resolved. A second event is refused instead of being left in a queue
   to open unexpectedly later. If all reader windows are closed while YoPDF is
   still running, the AppKit delegate opens a new reader scene for the next
-  accepted Finder request. `WindowGroup` declines to claim external events so it
-  cannot create an empty scene before AppKit receives the file. A request
+  accepted Finder request. `WindowGroup` permits external events to create a
+  reader on cold launch, and existing readers prefer subsequent events. Both
+  URL entry points share the same request slot. An AppKit request
   containing multiple files is refused because the app does not yet route each
   file to a separate window.
+  The recipient is the key reader, then the main reader, then the frontmost
+  available reader. A recreated window is brought forward before opening the
+  PDF; it does not have to become key first to take the queued request.
+  Closed windows cannot re-register through a late SwiftUI view update and
+  prevent the next Finder request from creating a reader.
 
 ### Markup editing (P2b)
 

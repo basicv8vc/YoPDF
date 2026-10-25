@@ -307,25 +307,47 @@ struct PDFReaderView: View {
 
     private var urlReader: some View {
         importedReader
+            // SwiftUI URL delivery must use the same admission and unsaved-work
+            // checks as the AppKit file-open callbacks.
+            .onOpenURL { url in
+                guard url.isFileURL else { return }
+                fileOpenRequests.enqueue(url)
+                openFileRequestIfReady()
+            }
             .task {
                 openScreenshotPDFIfConfigured()
                 openFileRequestIfReady()
             }
     }
 
-    /// Only the key reader window consumes Finder requests. On a cold launch,
-    /// the URL may be queued before SwiftUI creates this view; on an already
-    /// running app, the queue revision wakes the active reader. Becoming key
-    /// retries a request that arrived before a window was ready.
+    /// Prefer the key reader, then the main/frontmost reader. Finder can create
+    /// a visible window without making it key; requiring key status strands
+    /// the URL indefinitely. All readers use the same choice so only one takes
+    /// the request, including while the app is inactive.
     private func openFileRequestIfReady() {
-        let window = closeGuard.window
-        let isKeyWindow = window.map { NSApp.keyWindow === $0 } ?? false
+        let readers = WindowCloseGuard.installedGuards(among: NSApp.windows).compactMap(\.window)
+        let readerIDs = Set(readers.map(ObjectIdentifier.init))
+        let orderedReaders = (NSApp.orderedWindows + readers).filter {
+            readerIDs.contains(ObjectIdentifier($0))
+        }
+        let target = FileOpenRequestQueue.preferredReader(
+            key: NSApp.keyWindow.map(ObjectIdentifier.init),
+            main: NSApp.mainWindow.map(ObjectIdentifier.init),
+            orderedReaders: orderedReaders.map(ObjectIdentifier.init)
+        )
         guard prompt == nil,
               !isImporterPresented,
-              window != nil,
-              isKeyWindow,
+              let window = closeGuard.window,
+              target == ObjectIdentifier(window),
               let url = fileOpenRequests.takeNext()
         else { return }
+
+        // Finder may deliver a file while the application is inactive or a
+        // recreated reader has not become key. Taking the URL first prevents
+        // the ensuing key notification from delivering the same request twice.
+        window.deminiaturize(nil)
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
 
         finderOpenRequestAwaitingResolution = promptKind(for: .open(url)) != .none
         requestOpen(url)

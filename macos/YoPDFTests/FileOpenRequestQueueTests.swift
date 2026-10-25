@@ -3,6 +3,28 @@ import XCTest
 @MainActor
 final class FileOpenRequestQueueTests: XCTestCase {
 
+    func testPrefersKeyReaderThenMainReaderThenFrontmostReader() {
+        let readers = ["front", "back"]
+        XCTAssertEqual(FileOpenRequestQueue.preferredReader(
+            key: "back", main: "front", orderedReaders: readers
+        ), "back")
+        XCTAssertEqual(FileOpenRequestQueue.preferredReader(
+            key: nil, main: "back", orderedReaders: readers
+        ), "back")
+        XCTAssertEqual(FileOpenRequestQueue.preferredReader(
+            key: nil, main: nil, orderedReaders: readers
+        ), "front", "A recreated window must receive the file even before it becomes key.")
+    }
+
+    func testIgnoresPanelsAndClosedReadersWhenChoosingARecipient() {
+        XCTAssertEqual(FileOpenRequestQueue.preferredReader(
+            key: "panel", main: "closed", orderedReaders: ["reader"]
+        ), "reader")
+        XCTAssertNil(FileOpenRequestQueue.preferredReader(
+            key: "closed", main: "closed", orderedReaders: [String]()
+        ), "An event must wait for a reader that is actually available.")
+    }
+
     func testRejectsAdditionalFinderEventsUntilTheCurrentRequestFinishes() {
         let queue = FileOpenRequestQueue()
         let first = URL(fileURLWithPath: "/tmp/first.pdf")

@@ -31,6 +31,10 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
     }
 
     private(set) weak var window: NSWindow?
+    /// SwiftUI can update a representable after its windowWillClose callback.
+    /// Never re-register that closed window as an available reader. Keep only
+    /// weak references so this does not extend any window's lifetime.
+    private let closedWindows = NSHashTable<NSWindow>.weakObjects()
     private var work: () -> UnsavedWork = {
         UnsavedWork(
             documentRevision: 0,
@@ -84,6 +88,7 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
         discardDocumentChanges: @escaping () -> Void,
         onUnsavedChanges: @escaping (Intent) -> Void
     ) {
+        guard !closedWindows.contains(window) else { return }
         // The closures read live state, so they are refreshed on every update.
         self.work = unsavedWork
         self.onDiscardDraft = discardDraft
@@ -131,6 +136,9 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        if let closingWindow = notification.object as? NSWindow {
+            closedWindows.add(closingWindow)
+        }
         // Forward first, then let go: the previous delegate is what tears the
         // scene down, and it must still be alive while it runs.
         let previous = previousDelegate

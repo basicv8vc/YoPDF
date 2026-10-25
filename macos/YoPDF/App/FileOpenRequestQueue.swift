@@ -15,6 +15,14 @@ final class FileOpenRequestQueue: ObservableObject {
     private var readerWindowOpener: (@MainActor () -> Void)?
     private(set) var hasHadReaderWindow = false
 
+    /// A Finder event need not make a reader key. Ignore non-reader windows
+    /// (such as panels), then fall back to the frontmost available reader.
+    static func preferredReader<ID: Hashable>(key: ID?, main: ID?, orderedReaders: [ID]) -> ID? {
+        if let key, orderedReaders.contains(key) { return key }
+        if let main, orderedReaders.contains(main) { return main }
+        return orderedReaders.first
+    }
+
     /// Accepts one request. Further events fail until `finishRequest()` is
     /// called, including while the first request is being confirmed.
     @discardableResult
