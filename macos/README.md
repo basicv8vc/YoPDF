@@ -77,6 +77,13 @@ Esc closes the find bar and removes the temporary search highlights. The
 search covers text extractable by PDFKit; image-only scans require OCR and are
 not included. Search uses PDFKit and does not require network access.
 
+The File menu's **Export Annotations as Markdown…** writes a local `.md` reading
+log grouped by page. It includes Highlight and Underline text, Note excerpts and
+bodies, and comments attached to markup annotations. Plain annotation text is
+escaped as Markdown text; unsupported annotation types are omitted. Markups
+whose text cannot be extracted remain visible with a placeholder. Exporting
+does not modify the PDF.
+
 ## Requirements
 
 - macOS 14.0 or later (deployment target)
@@ -91,7 +98,7 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (354)
+./scripts/test.sh                     # unit tests (359)
 ./scripts/test-ui.sh                  # GUI tests (interactive logged-in desktop session)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```

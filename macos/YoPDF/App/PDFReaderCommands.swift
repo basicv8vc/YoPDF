@@ -17,6 +17,7 @@ struct PDFReaderCommands: Commands {
     @FocusedValue(\.openRecentDocument) private var openRecentDocument
     @FocusedValue(\.saveDocument) private var saveDocument
     @FocusedValue(\.saveDocumentAs) private var saveDocumentAs
+    @FocusedValue(\.exportAnnotations) private var exportAnnotations
     @FocusedValue(\.findInDocument) private var findInDocument
     @FocusedValue(\.findNextSearchResult) private var findNextSearchResult
     @FocusedValue(\.findPreviousSearchResult) private var findPreviousSearchResult
@@ -104,6 +105,13 @@ struct PDFReaderCommands: Commands {
             }
             .keyboardShortcut("s", modifiers: [.command, .shift])
             .disabled(model?.isLoaded != true)
+
+            Divider()
+
+            Button("Export Annotations as Markdown…") {
+                exportAnnotations?()
+            }
+            .disabled(exportAnnotations == nil || model?.isLoaded != true)
         }
 
         CommandGroup(after: .pasteboard) {
