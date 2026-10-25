@@ -6,14 +6,21 @@ struct YoPDFApp: App {
 
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var updateController = SparkleUpdateController.shared
+    @StateObject private var recentDocuments = RecentDocumentsStore.shared
 
     var body: some Scene {
         WindowGroup {
-            ReaderWindow(updateController: updateController)
+            ReaderWindow(
+                updateController: updateController,
+                recentDocuments: recentDocuments
+            )
         }
         .defaultSize(width: 1100, height: 820)
         .commands {
-            PDFReaderCommands(updateController: updateController)
+            PDFReaderCommands(
+                updateController: updateController,
+                recentDocuments: recentDocuments
+            )
         }
     }
 }
@@ -32,9 +39,23 @@ struct YoPDFApp: App {
 private struct ReaderWindow: View {
 
     @ObservedObject var updateController: SparkleUpdateController
-    @StateObject private var model = PDFDocumentModel()
+    @ObservedObject var recentDocuments: RecentDocumentsStore
+    @StateObject private var model: PDFDocumentModel
+
+    init(
+        updateController: SparkleUpdateController,
+        recentDocuments: RecentDocumentsStore
+    ) {
+        self.updateController = updateController
+        self.recentDocuments = recentDocuments
+        _model = StateObject(wrappedValue: PDFDocumentModel(recentDocuments: recentDocuments))
+    }
 
     var body: some View {
-        PDFReaderView(model: model, updateController: updateController)
+        PDFReaderView(
+            model: model,
+            updateController: updateController,
+            recentDocuments: recentDocuments
+        )
     }
 }

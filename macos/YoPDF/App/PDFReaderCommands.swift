@@ -10,9 +10,11 @@ import YoPDFCore
 struct PDFReaderCommands: Commands {
 
     @ObservedObject private var updateController: SparkleUpdateController
+    @ObservedObject private var recentDocuments: RecentDocumentsStore
 
     @FocusedValue(\.documentModel) private var model
     @FocusedValue(\.openDocument) private var openDocument
+    @FocusedValue(\.openRecentDocument) private var openRecentDocument
     @FocusedValue(\.saveDocument) private var saveDocument
     @FocusedValue(\.saveDocumentAs) private var saveDocumentAs
     @FocusedValue(\.findInDocument) private var findInDocument
@@ -22,8 +24,9 @@ struct PDFReaderCommands: Commands {
     @FocusedValue(\.underlineSelection) private var underlineSelection
     @FocusedValue(\.addNote) private var addNote
 
-    init(updateController: SparkleUpdateController) {
+    init(updateController: SparkleUpdateController, recentDocuments: RecentDocumentsStore) {
         self.updateController = updateController
+        self.recentDocuments = recentDocuments
     }
 
     var body: some Commands {
@@ -33,6 +36,29 @@ struct PDFReaderCommands: Commands {
             }
             .keyboardShortcut("o", modifiers: .command)
             .disabled(openDocument == nil)
+
+            Menu("Open Recent") {
+                if recentDocuments.items.isEmpty {
+                    Button("No Recent Documents") {}
+                        .disabled(true)
+                }
+
+                ForEach(recentDocuments.items) { item in
+                    Button(item.displayName) {
+                        openRecentDocument?(item)
+                    }
+                    .help(item.lastKnownPath)
+                    .disabled(openRecentDocument == nil)
+                }
+
+                if recentDocuments.canClear {
+                    Divider()
+                    Button("Clear Menu", role: .destructive) {
+                        recentDocuments.clear()
+                    }
+                }
+            }
+            .disabled(!recentDocuments.canClear)
 
             // Replacing `.newItem` and `.saveItem` removes the standard Close
             // item, so it is added back. Closing goes through `performClose:`

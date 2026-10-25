@@ -8,8 +8,10 @@ struct PDFReaderView: View {
 
     @ObservedObject var model: PDFDocumentModel
     @ObservedObject var updateController: SparkleUpdateController
+    @ObservedObject var recentDocuments: RecentDocumentsStore
 
     @State private var isImporterPresented = false
+    @State private var pendingRecentRelink: RecentDocument?
     @State private var isDropTargeted = false
     @State private var prompt: Prompt?
     @State private var isSearchPresented = false
@@ -39,6 +41,7 @@ struct PDFReaderView: View {
     /// Something the reader was asked to do that could discard work.
     private enum PendingAction: Equatable {
         case open(URL)
+        case relink(URL, RecentDocument)
         case save
         case saveAs
         case closeWindow
@@ -55,6 +58,7 @@ struct PDFReaderView: View {
         var readerAction: ReaderAction {
             switch self {
             case let .open(url): return .open(url)
+            case let .relink(url, _): return .open(url)
             case .save: return .save
             case .saveAs: return .saveAs
             case .closeWindow: return .closeWindow
@@ -69,6 +73,7 @@ struct PDFReaderView: View {
         case draftChanges(PendingAction)
         case unsavedChanges(PendingAction)
         case saveProblem(title: String, message: String, offersSaveAs: Bool)
+        case recentDocumentUnavailable(RecentDocument)
 
         var id: String {
             switch self {
@@ -78,6 +83,8 @@ struct PDFReaderView: View {
                 return "unsaved-\(String(describing: action))"
             case let .saveProblem(title, _, _):
                 return "problem-\(title)"
+            case let .recentDocumentUnavailable(item):
+                return "recent-\(item.id)"
             }
         }
 
@@ -89,6 +96,8 @@ struct PDFReaderView: View {
                 return "Save changes before continuing?"
             case let .saveProblem(title, _, _):
                 return title
+            case .recentDocumentUnavailable:
+                return "Couldn’t open recent document"
             }
         }
 
@@ -100,6 +109,8 @@ struct PDFReaderView: View {
                 switch action {
                 case let .open(url):
                     return "“\(url.lastPathComponent)” cannot be opened while this document has unsaved changes."
+                case let .relink(url, _):
+                    return "“\(url.lastPathComponent)” cannot be opened while this document has unsaved changes."
                 case .closeWindow, .quit:
                     return "This document has changes that are not in the file yet."
                 case .save, .saveAs, .compose:
@@ -107,6 +118,8 @@ struct PDFReaderView: View {
                 }
             case let .saveProblem(_, message, _):
                 return message
+            case let .recentDocumentUnavailable(item):
+                return "YoPDF can no longer resolve the saved location for “\(item.displayName)”. Locate the PDF to reconnect this recent item."
             }
         }
 
@@ -120,6 +133,8 @@ struct PDFReaderView: View {
             case .saveAs:
                 return base + " Save the note, or discard it, before saving a copy of the file."
             case let .open(url):
+                return base + " “\(url.lastPathComponent)” cannot be opened until you save or discard it."
+            case let .relink(url, _):
                 return base + " “\(url.lastPathComponent)” cannot be opened until you save or discard it."
             case .closeWindow, .quit:
                 return base + " Saving it puts the note in the document; the file itself still has to be saved."
@@ -156,6 +171,9 @@ struct PDFReaderView: View {
                     }
                 }
                 Button("OK", role: .cancel) { self.prompt = nil }
+            case let .recentDocumentUnavailable(item):
+                Button("Relink…") { beginRecentRelink(item) }
+                Button("Cancel", role: .cancel) { self.prompt = nil }
             }
         } message: { prompt in
             Text(prompt.message)
@@ -194,6 +212,7 @@ struct PDFReaderView: View {
         lifecycleReader
             .focusedSceneValue(\.documentModel, model)
             .focusedSceneValue(\.openDocument, { isImporterPresented = true })
+            .focusedSceneValue(\.openRecentDocument, { requestOpenRecent($0) })
             .focusedSceneValue(\.saveDocument, { requestSave() })
             .focusedSceneValue(\.saveDocumentAs, { requestSaveAs() })
             .focusedSceneValue(\.findInDocument, { showSearch() })
@@ -227,7 +246,7 @@ struct PDFReaderView: View {
 
     private var urlReader: some View {
         importedReader
-            .onOpenURL(perform: requestOpen)
+            .onOpenURL { url in requestOpen(url) }
             .task { openScreenshotPDFIfConfigured() }
     }
 
@@ -245,6 +264,12 @@ struct PDFReaderView: View {
     }
 
     private func handleImportResult(_ result: Result<[URL], Error>) {
+        if let item = pendingRecentRelink {
+            pendingRecentRelink = nil
+            guard case let .success(urls) = result, let url = urls.first else { return }
+            requestOpen(url, relinking: item)
+            return
+        }
         guard case let .success(urls) = result, let url = urls.first else { return }
         requestOpen(url)
     }
@@ -775,6 +800,17 @@ struct PDFReaderView: View {
             }
         } else {
             emptyState
+                .alert(
+                    "Couldn’t open this document",
+                    isPresented: Binding(
+                        get: { model.lastError != nil },
+                        set: { if !$0 { model.dismissError() } }
+                    )
+                ) {
+                    Button("OK", role: .cancel) { model.dismissError() }
+                } message: {
+                    Text(model.lastError?.errorDescription ?? "Unknown error.")
+                }
         }
     }
 
@@ -796,6 +832,23 @@ struct PDFReaderView: View {
                 isImporterPresented = true
             }
             .keyboardShortcut("o", modifiers: .command)
+
+            if !recentDocuments.items.isEmpty {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Recent Documents")
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(.secondary)
+                    ForEach(Array(recentDocuments.items.prefix(5))) { item in
+                        Button(item.displayName) {
+                            requestOpenRecent(item)
+                        }
+                        .buttonStyle(.plain)
+                        .help(item.lastKnownPath)
+                    }
+                }
+                .frame(maxWidth: 360, alignment: .leading)
+                .padding(.top, 14)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(40)
@@ -823,14 +876,32 @@ struct PDFReaderView: View {
     /// Everything that can open a file goes through here so that neither a
     /// document with unsaved edits nor a note that is still only in the composer
     /// is replaced without the user choosing what happens to it.
-    private func requestOpen(_ url: URL) {
-        switch promptKind(for: .open(url)) {
+    private func requestOpen(_ url: URL, relinking item: RecentDocument? = nil) {
+        let action: PendingAction = item.map { .relink(url, $0) } ?? .open(url)
+        switch promptKind(for: action) {
         case .none:
-            model.open(url: url)
+            perform(action)
         case .draft:
-            prompt = .draftChanges(.open(url))
+            prompt = .draftChanges(action)
         case .document:
-            prompt = .unsavedChanges(.open(url))
+            prompt = .unsavedChanges(action)
+        }
+    }
+
+    private func beginRecentRelink(_ item: RecentDocument) {
+        pendingRecentRelink = item
+        prompt = nil
+        Task { @MainActor in
+            await Task.yield()
+            isImporterPresented = true
+        }
+    }
+
+    private func requestOpenRecent(_ item: RecentDocument) {
+        do {
+            requestOpen(try recentDocuments.resolveURL(for: item))
+        } catch {
+            prompt = .recentDocumentUnavailable(item)
         }
     }
 
@@ -1289,6 +1360,8 @@ struct PDFReaderView: View {
             // failed open cannot leave a document on screen whose edits nothing
             // is protecting any more.
             model.open(url: url, discardingUnsavedChanges: true)
+        case let .relink(url, item):
+            model.open(url: url, discardingUnsavedChanges: true, relinking: item)
         case .closeWindow:
             // The window is closing now, so the edits really are being discarded.
             model.abandonUnsavedChanges()
@@ -1312,6 +1385,8 @@ struct PDFReaderView: View {
         switch action {
         case let .open(url):
             model.open(url: url)
+        case let .relink(url, item):
+            model.open(url: url, relinking: item)
         case .save:
             performSave()
         case .saveAs:

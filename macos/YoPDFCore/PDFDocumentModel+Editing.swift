@@ -67,8 +67,10 @@ final class AutoSaveWorkCompletion: @unchecked Sendable {
     private let lock = NSLock()
     private var writeHasStarted = false
     private var wasCancelledBeforeWrite = false
+    private var completedOutcome: SaveOutcome?
 
     var didStartWrite: Bool { lock.withLock { writeHasStarted } }
+    var outcome: SaveOutcome? { lock.withLock { completedOutcome } }
 
     /// Resolves the Save As/close race at a single boundary: if cancellation
     /// wins before this point, the worker will not touch the original file. If
@@ -90,7 +92,10 @@ final class AutoSaveWorkCompletion: @unchecked Sendable {
         }
     }
 
-    func signal() { semaphore.signal() }
+    func complete(with outcome: SaveOutcome) {
+        lock.withLock { completedOutcome = outcome }
+        semaphore.signal()
+    }
     func wait() { semaphore.wait() }
 }
 
@@ -253,6 +258,36 @@ extension PDFDocumentModel {
         }
     }
 
+    /// Restores automatic saving after a failed replacement. A matching writer
+    /// that finished while the candidate was loading is applied by its result;
+    /// otherwise the still-dirty current document gets a fresh debounce.
+    func restoreAutoSaveAfterFailedOpen(
+        wasScheduled: Bool,
+        activeWorkMatchesSchedule: Bool,
+        writeWasCancelledBeforeStart: Bool?,
+        completedOutcome: SaveOutcome?
+    ) {
+        guard wasScheduled, document != nil else { return }
+
+        if activeWorkMatchesSchedule, writeWasCancelledBeforeStart == false,
+           let completedOutcome {
+            if completedOutcome.editsAreOnDisk {
+                markSaved(preservingMarkupHistory: true)
+            }
+            lastAutoSaveOutcome = completedOutcome
+            if case .saved = completedOutcome {
+                autoSaveStatus = .saved
+            } else {
+                autoSaveStatus = .failed(completedOutcome)
+                autoSaveFailureRevision &+= 1
+            }
+            return
+        }
+
+        guard hasUnsavedChanges else { return }
+        scheduleAutoSave()
+    }
+
     /// Runs a synchronous modal workflow while pausing the pending debounce.
     /// An in-flight write is allowed to finish; a pending write resumes after
     /// the workflow only if the document is still dirty.
@@ -346,17 +381,22 @@ extension PDFDocumentModel {
         let pageCount = document.pageCount
         let completion = AutoSaveWorkCompletion()
         let worker = Task.detached(priority: .utility) {
-            defer { completion.signal() }
             guard let data = serializer(snapshot) else {
-                return SaveOutcome.failed(.serializationFailed)
+                let outcome = SaveOutcome.failed(.serializationFailed)
+                completion.complete(with: outcome)
+                return outcome
             }
             // Save As, manual Save, close or discard may cancel a worker while
             // PDFKit is serializing. Atomically claim the file-write phase so
             // cancellation cannot slip between the check and DocumentSession.
             guard completion.beginWriteUnlessCancelled() else {
-                return .failed(.sessionUnavailable)
+                let outcome = SaveOutcome.failed(.sessionUnavailable)
+                completion.complete(with: outcome)
+                return outcome
             }
-            return AutomaticSaveWorker.save(data, to: session, pageCount: pageCount)
+            let outcome = AutomaticSaveWorker.save(data, to: session, pageCount: pageCount)
+            completion.complete(with: outcome)
+            return outcome
         }
 
         autoSaveWorkTask = worker
@@ -410,28 +450,34 @@ extension PDFDocumentModel {
 
     /// Cancels a pending automatic save when the user saves, discards, closes,
     /// or successfully replaces the open document.
-    func cancelPendingAutoSave(cancelInFlightWork: Bool = false) {
+    @discardableResult
+    func cancelPendingAutoSave(cancelInFlightWork: Bool = false) -> Bool? {
         autoSaveGeneration &+= 1
         autoSaveTask?.cancel()
         autoSaveTask = nil
+        var writeWasCancelledBeforeStart: Bool?
         if cancelInFlightWork {
-            autoSaveWorkCompletion?.cancelBeforeWrite()
+            writeWasCancelledBeforeStart = autoSaveWorkCompletion?.cancelBeforeWrite()
             autoSaveWorkTask?.cancel()
         }
         if autoSaveStatus == .pending || autoSaveStatus == .saving {
             autoSaveStatus = .idle
         }
+        return writeWasCancelledBeforeStart
     }
 
     /// Waits only for an already-started snapshot write. Debounce cancellation
     /// is immediate; this prevents a later manual save, Save As or close from
     /// racing the file session while its worker is active.
-    func waitForAutoSaveWork() {
-        guard let completion = autoSaveWorkCompletion else { return }
+    @discardableResult
+    func waitForAutoSaveWork() -> SaveOutcome? {
+        guard let completion = autoSaveWorkCompletion else { return nil }
         completion.wait()
+        let outcome = completion.outcome
         autoSaveWorkTask = nil
         autoSaveWorkGeneration = nil
         autoSaveWorkCompletion = nil
+        return outcome
     }
 
     /// Writes the document to another file and continues editing there.

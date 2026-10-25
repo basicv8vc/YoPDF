@@ -264,6 +264,7 @@ final class AutoSaveTests: XCTestCase {
         try addHighlight(to: model)
 
         XCTAssertTrue(model.open(url: second, discardingUnsavedChanges: true))
+        XCTAssertNil(model.autoSaveTask, "a successful switch does not restore the old document's debounce")
         try await Task.sleep(nanoseconds: 400_000_000)
         XCTAssertEqual(annotationCount(inFileAt: first), 0)
         XCTAssertEqual(annotationCount(inFileAt: second), 0)
@@ -272,6 +273,139 @@ final class AutoSaveTests: XCTestCase {
         model.close()
         try await Task.sleep(nanoseconds: 400_000_000)
         XCTAssertEqual(annotationCount(inFileAt: second), 0, "closing cancels the pending save")
+    }
+
+    func testFailedRelinkRestoresPendingAutoSaveForStillOpenDocument() async throws {
+        let original = try makeFixture(named: "relink-autosave-original")
+        let target = try makeFixture(named: "relink-autosave-target")
+        let suiteName = "YoPDFAutoSaveRelinkTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = makeRelinkStore(defaults: defaults, original: original)
+        let io = ScriptedDocumentStoreIO()
+        let model = PDFDocumentModel(
+            access: SecurityScopeSpy(),
+            io: io,
+            recentDocuments: store
+        )
+        model.autoSaveDebounceNanoseconds = 500_000_000
+        XCTAssertTrue(model.open(url: original))
+        let recentItem = try XCTUnwrap(store.items.first)
+
+        try addHighlight(to: model)
+        let canceledTask = try XCTUnwrap(model.autoSaveTask)
+        XCTAssertEqual(model.autoSaveStatus, .pending)
+        XCTAssertTrue(model.hasUnsavedChanges)
+
+        XCTAssertFalse(model.open(
+            url: target,
+            discardingUnsavedChanges: true,
+            relinking: recentItem
+        ))
+
+        XCTAssertEqual(model.lastError, .couldNotRelinkRecentDocument)
+        XCTAssertEqual(model.fileURL?.standardizedFileURL, original.standardizedFileURL)
+        XCTAssertTrue(model.hasUnsavedChanges)
+        XCTAssertTrue(canceledTask.isCancelled)
+        XCTAssertEqual(model.autoSaveStatus, .pending)
+        XCTAssertNotNil(model.autoSaveTask, "the failed Relink schedules the original document's save again")
+
+        await assertSaved(model)
+        XCTAssertFalse(model.hasUnsavedChanges)
+        XCTAssertEqual(io.replacementCount, 1)
+        XCTAssertEqual(annotationCount(inFileAt: original), 1)
+        XCTAssertEqual(store.items.first?.id, recentItem.id)
+        model.close()
+    }
+
+    func testFailedRelinkDuringSerializationRestoresAutoSave() async throws {
+        let original = try makeFixture(named: "relink-serialization-original")
+        let target = try makeFixture(named: "relink-serialization-target")
+        let suiteName = "YoPDFAutoSaveRelinkSerializationTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = makeRelinkStore(defaults: defaults, original: original)
+        let serializerGate = AutoSaveGate()
+        let io = ScriptedDocumentStoreIO()
+        let model = PDFDocumentModel(
+            access: SecurityScopeSpy(),
+            io: io,
+            recentDocuments: store
+        )
+        model.autoSaveDebounceNanoseconds = 30_000_000
+        model.autoSaveSerializer = { snapshot in
+            serializerGate.pause()
+            return PDFDocumentSaveSerializer.dataRepresentationPreservingShuaGroups(in: snapshot.document)
+        }
+        XCTAssertTrue(model.open(url: original))
+        let recentItem = try XCTUnwrap(store.items.first)
+        try addHighlight(to: model)
+        await waitUntilEntered(serializerGate)
+        XCTAssertEqual(model.autoSaveStatus, .saving)
+
+        let serializerReleaser = Task.detached {
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            serializerGate.release()
+        }
+        XCTAssertFalse(model.open(
+            url: target,
+            discardingUnsavedChanges: true,
+            relinking: recentItem
+        ))
+        await serializerReleaser.value
+
+        XCTAssertEqual(model.lastError, .couldNotRelinkRecentDocument)
+        XCTAssertEqual(model.fileURL?.standardizedFileURL, original.standardizedFileURL)
+        XCTAssertTrue(model.hasUnsavedChanges)
+        XCTAssertEqual(model.autoSaveStatus, .pending)
+        XCTAssertNotNil(model.autoSaveTask)
+        await assertSaved(model)
+        XCTAssertEqual(io.replacementCount, 1, "only the resumed automatic save writes the source")
+        XCTAssertEqual(annotationCount(inFileAt: original), 1)
+        model.close()
+    }
+
+    func testFailedRelinkUsesCompletedInFlightAutoSaveOutcome() async throws {
+        let original = try makeFixture(named: "relink-completed-save-original")
+        let target = try makeFixture(named: "relink-completed-save-target")
+        let suiteName = "YoPDFAutoSaveRelinkCompletedTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = makeRelinkStore(defaults: defaults, original: original)
+        let writeGate = AutoSaveGate()
+        let model = PDFDocumentModel(
+            access: SecurityScopeSpy(),
+            io: AutoSaveBlockingIO(gate: writeGate),
+            recentDocuments: store
+        )
+        model.autoSaveDebounceNanoseconds = 30_000_000
+        XCTAssertTrue(model.open(url: original))
+        let recentItem = try XCTUnwrap(store.items.first)
+        try addHighlight(to: model)
+        await waitUntilEntered(writeGate)
+        XCTAssertEqual(model.autoSaveStatus, .saving)
+
+        let writeReleaser = Task.detached {
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            writeGate.release()
+        }
+        XCTAssertFalse(model.open(
+            url: target,
+            discardingUnsavedChanges: true,
+            relinking: recentItem
+        ))
+        await writeReleaser.value
+
+        XCTAssertEqual(model.lastError, .couldNotRelinkRecentDocument)
+        XCTAssertEqual(model.fileURL?.standardizedFileURL, original.standardizedFileURL)
+        XCTAssertFalse(model.hasUnsavedChanges, "the completed save's result clears the dirty state")
+        XCTAssertEqual(model.autoSaveStatus, .saved)
+        XCTAssertNil(model.autoSaveTask, "a completed write does not schedule a duplicate save")
+        XCTAssertEqual(annotationCount(inFileAt: original), 1)
+        model.close()
     }
 
     func testAutomaticSerializationAndFileIODoNotBlockMainActor() async throws {
@@ -386,6 +520,15 @@ final class AutoSaveTests: XCTestCase {
         let url = try PDFFixtureFactory.writeTemporaryParagraphPDF(named: name)
         temporaryFiles.append(url)
         return url
+    }
+
+    private func makeRelinkStore(defaults: UserDefaults, original: URL) -> RecentDocumentsStore {
+        RecentDocumentsStore(defaults: defaults) { url in
+            guard url.standardizedFileURL == original.standardizedFileURL else {
+                throw RecentDocumentsError.bookmarkCouldNotBeCreated
+            }
+            return Data([0x01, 0x02, 0x03])
+        }
     }
 
     private func addHighlight(
