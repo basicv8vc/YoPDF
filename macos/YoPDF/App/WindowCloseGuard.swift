@@ -23,6 +23,9 @@ import YoPDFCore
 @MainActor
 final class WindowCloseGuard: NSObject, NSWindowDelegate {
 
+    /// Stable ownership identity for a reader window's Finder open request.
+    let readerID = UUID()
+
     enum Intent {
         /// The window's close button, ⌘W, or `performClose:`.
         case windowClose

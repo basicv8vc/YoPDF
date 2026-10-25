@@ -9,12 +9,19 @@ import Foundation
 @MainActor
 final class FileOpenRequestQueue: ObservableObject {
 
+    struct Request: Equatable, Identifiable {
+        let id: UUID
+        let url: URL
+        /// `nil` while the URL is waiting for a reader to take it.
+        let readerID: UUID?
+    }
+
     @Published private(set) var revision = 0
-    private var pendingURL: URL?
-    /// The URL currently being handled by a reader. Keep it until the reader
-    /// finishes so a window that closes mid-request can hand it back.
-    private var inFlightURL: URL?
-    private var requestIsActive = false
+    private var pendingRequest: Request?
+    /// Keep the current owner and request identity until it finishes. If that
+    /// reader closes, the same request can be reassigned without letting a
+    /// different reader's close or a stale completion mutate it.
+    private var inFlightRequest: Request?
     private var readerWindowOpener: (@MainActor () -> Void)?
     private(set) var hasHadReaderWindow = false
 
@@ -26,44 +33,55 @@ final class FileOpenRequestQueue: ObservableObject {
         return orderedReaders.first
     }
 
-    /// Accepts one request. Further events fail until `finishRequest()` is
-    /// called, including while the first request is being confirmed.
+    /// Accepts one request. Further events fail until its owner finishes it,
+    /// including while the first request is being confirmed.
     @discardableResult
     func enqueue(_ url: URL) -> Bool {
-        guard !requestIsActive else { return false }
-        pendingURL = url
-        requestIsActive = true
+        guard pendingRequest == nil, inFlightRequest == nil else { return false }
+        pendingRequest = Request(id: UUID(), url: url, readerID: nil)
         revision &+= 1
         return true
     }
 
-    func takeNext() -> URL? {
-        guard inFlightURL == nil, let url = pendingURL else { return nil }
-        pendingURL = nil
-        inFlightURL = url
+    func takeNext(readerID: UUID) -> Request? {
+        guard inFlightRequest == nil, let pendingRequest else { return nil }
+        let request = Request(id: pendingRequest.id, url: pendingRequest.url, readerID: readerID)
+        self.pendingRequest = nil
+        inFlightRequest = request
         revision &+= 1
-        return url
+        return request
     }
 
-    /// Re-queues the request when its reader closes before finishing it. The
-    /// revision also wakes any other reader that can take over the request.
+    /// Re-queues an in-flight request only when its owner closes. A reader
+    /// closing while a request is still unclaimed also wakes other readers so
+    /// one can take it, or opens a replacement if none remain.
     @discardableResult
-    func readerWindowDidClose() -> Bool {
-        guard requestIsActive else { return false }
-        if let inFlightURL {
-            pendingURL = inFlightURL
-            self.inFlightURL = nil
+    func readerWindowDidClose(readerID: UUID) -> Bool {
+        if let inFlightRequest {
+            guard inFlightRequest.readerID == readerID else { return false }
+            pendingRequest = Request(
+                id: inFlightRequest.id,
+                url: inFlightRequest.url,
+                readerID: nil
+            )
+            self.inFlightRequest = nil
+        } else if pendingRequest == nil {
+            return false
         }
         revision &+= 1
         return true
     }
 
-    func finishRequest() {
-        guard requestIsActive else { return }
-        pendingURL = nil
-        inFlightURL = nil
-        requestIsActive = false
+    /// A stale reader cannot finish a request after it has been handed to
+    /// another window.
+    @discardableResult
+    func finishRequest(requestID: UUID, readerID: UUID) -> Bool {
+        guard inFlightRequest?.id == requestID,
+              inFlightRequest?.readerID == readerID
+        else { return false }
+        inFlightRequest = nil
         revision &+= 1
+        return true
     }
 
     func registerReaderWindowOpener(_ opener: @escaping @MainActor () -> Void) {

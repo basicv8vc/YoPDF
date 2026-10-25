@@ -356,9 +356,11 @@ note. ⌘S and the Save button remain available for an immediate save.
   one request slot; it stays occupied until the chosen reader handles the URL
   and any unsaved-work prompt is resolved. A second event is refused instead
   of being left in a queue to open unexpectedly later. If a reader closes
-  before finishing its request, the URL is restored to the slot; another reader
-  can take it, or a new reader scene is opened when the closed window was the
-  last reader. `WindowGroup` permits external events to create a reader on cold
+  before finishing its request, only that request's owner can restore the URL
+  to the slot; another reader can take it, or a new reader scene is opened when
+  the closed window was the last reader. Request IDs and reader IDs also prevent
+  a stale window from finishing a request after it has moved to another reader.
+  `WindowGroup` permits external events to create a reader on cold
   launch, and existing readers prefer subsequent events. An AppKit request
   containing multiple files is refused because the app does not yet route each
   file to a separate window.

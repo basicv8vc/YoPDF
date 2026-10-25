@@ -16,6 +16,7 @@ struct PDFReaderView: View {
     /// A Finder request stays reserved while its Save / Discard / Cancel prompt
     /// is visible, so another event cannot replace the action in that prompt.
     @State private var finderOpenRequestAwaitingResolution = false
+    @State private var finderOpenRequestID: UUID?
     @State private var isDropTargeted = false
     @State private var prompt: Prompt?
     @State private var isSidebarVisible = true
@@ -206,7 +207,8 @@ struct PDFReaderView: View {
     }
 
     private var closeGuardReader: some View {
-        focusedReader.background(
+        let readerID = closeGuard.readerID
+        return focusedReader.background(
             WindowCloseGuardInstaller(
                 guardObject: closeGuard,
                 unsavedWork: { unsavedWork },
@@ -231,7 +233,7 @@ struct PDFReaderView: View {
                     }
                 },
                 onWindowClosed: {
-                    guard fileOpenRequests.readerWindowDidClose() else { return }
+                    guard fileOpenRequests.readerWindowDidClose(readerID: readerID) else { return }
                     if WindowCloseGuard.installedGuards(among: NSApp.windows).isEmpty {
                         fileOpenRequests.openReaderWindowIfAvailable()
                     }
@@ -338,7 +340,7 @@ struct PDFReaderView: View {
               !isImporterPresented,
               let window = closeGuard.window,
               target == ObjectIdentifier(window),
-              let url = fileOpenRequests.takeNext()
+              let request = fileOpenRequests.takeNext(readerID: closeGuard.readerID)
         else { return }
 
         // Finder may deliver a file while the application is inactive or a
@@ -348,17 +350,27 @@ struct PDFReaderView: View {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 
-        finderOpenRequestAwaitingResolution = promptKind(for: .open(url)) != .none
-        requestOpen(url)
+        finderOpenRequestID = request.id
+        finderOpenRequestAwaitingResolution = promptKind(for: .open(request.url)) != .none
+        requestOpen(request.url)
         if !finderOpenRequestAwaitingResolution {
-            fileOpenRequests.finishRequest()
+            finishFinderOpenRequest(requestID: request.id)
         }
     }
 
     private func finishFinderOpenRequestIfResolved() {
-        guard finderOpenRequestAwaitingResolution, prompt == nil else { return }
+        guard finderOpenRequestAwaitingResolution,
+              prompt == nil,
+              let requestID = finderOpenRequestID
+        else { return }
         finderOpenRequestAwaitingResolution = false
-        fileOpenRequests.finishRequest()
+        finishFinderOpenRequest(requestID: requestID)
+    }
+
+    private func finishFinderOpenRequest(requestID: UUID) {
+        guard finderOpenRequestID == requestID else { return }
+        finderOpenRequestID = nil
+        fileOpenRequests.finishRequest(requestID: requestID, readerID: closeGuard.readerID)
     }
 
     private var importedReader: some View {
