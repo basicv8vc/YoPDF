@@ -61,6 +61,12 @@ struct AddNoteActionKey: FocusedValueKey {
     typealias Value = @MainActor () -> Void
 }
 
+/// Sidebar controls are reader actions because each window owns its own
+/// visibility and selected document view.
+struct ReaderSidebarActionsFocusKey: FocusedValueKey {
+    typealias Value = ReaderSidebarActions
+}
+
 extension FocusedValues {
     var documentModel: PDFDocumentModel? {
         get { self[DocumentModelFocusKey.self] }
@@ -120,5 +126,10 @@ extension FocusedValues {
     var addNote: (@MainActor () -> Void)? {
         get { self[AddNoteActionKey.self] }
         set { self[AddNoteActionKey.self] = newValue }
+    }
+
+    var readerSidebarActions: ReaderSidebarActions? {
+        get { self[ReaderSidebarActionsFocusKey.self] }
+        set { self[ReaderSidebarActionsFocusKey.self] = newValue }
     }
 }

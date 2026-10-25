@@ -33,6 +33,8 @@ struct PDFViewerRepresentable: NSViewRepresentable {
     let autoScales: Bool
     let zoomScale: CGFloat
     let zoomCommandRevision: Int
+    let navigationDestination: PDFDestination?
+    let navigationRevision: Int
     let onScaleChange: (CGFloat) -> Void
     let onManualMagnification: () -> Void
     let selectedMarkup: MarkupSelection?
@@ -144,6 +146,15 @@ struct PDFViewerRepresentable: NSViewRepresentable {
             view.go(to: target)
         }
 
+        if context.coordinator.lastNavigationRevision != navigationRevision {
+            context.coordinator.lastNavigationRevision = navigationRevision
+            if let navigationDestination,
+               let page = navigationDestination.page,
+               document.index(for: page) != NSNotFound {
+                view.go(to: navigationDestination)
+            }
+        }
+
         if view.activeSearchSelection !== activeSearchSelection {
             view.activeSearchSelection = activeSearchSelection
             if let activeSearchSelection {
@@ -160,6 +171,7 @@ struct PDFViewerRepresentable: NSViewRepresentable {
     final class Coordinator: NSObject {
         var parent: PDFViewerRepresentable
         var lastAnnotationRevision = -1
+        var lastNavigationRevision = -1
         var lastSearchResultsRevision = -1
         let zoomSynchronizer = PDFViewZoomSynchronizer()
         private weak var pdfView: MarkupPDFView?
@@ -993,33 +1005,26 @@ private final class MarkupSelectionOverlayView: NSView {
     /// application's note annotations inside the marker rectangle only. The rest
     /// of PDFKit's rendering, text selection and links stay untouched.
     private func drawPageBackground(in rect: CGRect, page: PDFPage) {
-        guard let context = NSGraphicsContext.current?.cgContext,
-              let pageCopy = page.copy() as? PDFPage
-        else { return }
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
 
-        pageCopy.rotation = 0
-        pageCopy.displaysAnnotations = page.displaysAnnotations
-        for annotation in pageCopy.annotations.reversed() {
-            if NoteService.usesStickerPresentation(annotation)
-                || annotation.type == "Popup"
-                || annotation.type == "/Popup"
-            {
-                pageCopy.removeAnnotation(annotation)
-            }
-        }
-
-        let crop = pageCopy.bounds(for: .cropBox)
+        let crop = page.bounds(for: .cropBox)
         guard crop.width > 0, crop.height > 0, bounds.width > 0, bounds.height > 0 else {
             return
         }
 
-        let scale = min(bounds.width / crop.width, bounds.height / crop.height)
+        let rotation = ((page.rotation % 360) + 360) % 360
+        let isQuarterTurn = rotation == 90 || rotation == 270
+        let displayWidth = isQuarterTurn ? crop.height : crop.width
+        let displayHeight = isQuarterTurn ? crop.width : crop.height
+        let scale = min(bounds.width / displayWidth, bounds.height / displayHeight)
         let renderedSize = CGSize(
-            width: crop.width * scale,
-            height: crop.height * scale
+            width: displayWidth * scale,
+            height: displayHeight * scale
         )
+        let maskPageBounds = pageSpaceBounds(forOverlayRect: rect)
 
         context.saveGState()
+        defer { context.restoreGState() }
         context.clip(to: rect)
         // PDF pages are transparent by default. Repainting only their content
         // would leave transparent pixels in this overlay, allowing PDFKit's
@@ -1029,12 +1034,52 @@ private final class MarkupSelectionOverlayView: NSView {
         context.setFillColor(NSColor.white.cgColor)
         context.fill(rect)
         context.translateBy(
-            x: bounds.midX - renderedSize.width / 2 - crop.minX * scale,
-            y: bounds.midY - renderedSize.height / 2 - crop.minY * scale
+            x: bounds.midX - renderedSize.width / 2,
+            y: bounds.midY - renderedSize.height / 2
         )
         context.scaleBy(x: scale, y: scale)
-        pageCopy.draw(with: .cropBox, to: context)
-        context.restoreGState()
+
+        if let pageRef = page.pageRef {
+            // Draw the immutable PDF page content and its non-sticker
+            // annotations directly. Removing annotations from a PDFPage copy
+            // posts PDFKit page-change notifications while AppKit is drawing,
+            // which can reenter PDFKit's page observers during rendering.
+            page.transform(context, for: .cropBox)
+            context.drawPDFPage(pageRef)
+
+            if page.displaysAnnotations {
+                for annotation in page.annotations where annotation.shouldDisplay {
+                    let type = annotation.type?.lowercased()
+                    guard !NoteService.usesStickerPresentation(annotation),
+                          type != "popup", type != "/popup",
+                          annotation.bounds.intersects(maskPageBounds)
+                    else { continue }
+
+                    annotation.draw(with: .cropBox, in: context)
+                }
+            }
+        } else if let pageCopy = page.copy() as? PDFPage {
+            // Pages created in memory may have no CGPDFPageRef. Keep this
+            // fallback read-only with respect to the source document; the
+            // marker itself is drawn over the result immediately afterward.
+            pageCopy.displaysAnnotations = false
+            pageCopy.draw(with: .cropBox, to: context)
+        }
+    }
+
+    private func pageSpaceBounds(forOverlayRect rect: CGRect) -> CGRect {
+        let points = [
+            CGPoint(x: rect.minX, y: rect.minY),
+            CGPoint(x: rect.maxX, y: rect.minY),
+            CGPoint(x: rect.minX, y: rect.maxY),
+            CGPoint(x: rect.maxX, y: rect.maxY)
+        ].map { pagePoint(for: $0) }
+
+        let minX = points.map(\.x).min() ?? 0
+        let maxX = points.map(\.x).max() ?? minX
+        let minY = points.map(\.y).min() ?? 0
+        let maxY = points.map(\.y).max() ?? minY
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
     }
 
     private func drawSticker(
