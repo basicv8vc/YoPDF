@@ -16,6 +16,9 @@ with automatic saving for committed annotation edits. Full-text search is
 available, and annotations can be exported as page-grouped Markdown. AI-assisted
 reading is not implemented yet.
 
+Each reader window owns one PDF. When a reader already has a PDF, opening
+another creates a new reader window, so documents already open stay available.
+
 ## Design constraints
 
 - **Local-first.** Reading and annotating must work without a network, an

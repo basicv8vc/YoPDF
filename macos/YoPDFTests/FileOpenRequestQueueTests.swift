@@ -49,6 +49,28 @@ final class FileOpenRequestQueueTests: XCTestCase {
         XCTAssertTrue(queue.finishRequest(requestID: secondRequest.id, readerID: readerID))
     }
 
+    func testPendingSceneRequestCannotTakeALaterFinderOpen() throws {
+        let queue = FileOpenRequestQueue()
+        let existingReader = UUID()
+        let pendingSceneReader = UUID()
+        let laterPDF = URL(fileURLWithPath: "/tmp/later.pdf")
+
+        queue.setReaderCanReceiveFinderRequests(readerID: pendingSceneReader, canReceive: false)
+        XCTAssertTrue(queue.enqueue(laterPDF))
+
+        XCTAssertNil(
+            queue.takeNext(readerID: pendingSceneReader),
+            "A scene must finish its initial UUID request before receiving another Finder URL."
+        )
+        let request = try XCTUnwrap(queue.takeNext(readerID: existingReader))
+        XCTAssertEqual(request.url, laterPDF)
+        XCTAssertTrue(queue.finishRequest(requestID: request.id, readerID: existingReader))
+
+        queue.setReaderCanReceiveFinderRequests(readerID: pendingSceneReader, canReceive: true)
+        XCTAssertTrue(queue.enqueue(laterPDF))
+        XCTAssertEqual(queue.takeNext(readerID: pendingSceneReader)?.url, laterPDF)
+    }
+
     func testUnrelatedReaderCloseDoesNotReassignAnotherReadersRequest() throws {
         let queue = FileOpenRequestQueue()
         let first = URL(fileURLWithPath: "/tmp/first.pdf")
