@@ -4,6 +4,17 @@ import SwiftUI
 import UniformTypeIdentifiers
 import YoPDFCore
 
+private struct RecentDocumentsHeadingWidthPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 110
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        let nextWidth = nextValue()
+        if nextWidth > 0 {
+            value = nextWidth
+        }
+    }
+}
+
 struct PDFReaderView: View {
 
     @ObservedObject var model: PDFDocumentModel
@@ -12,6 +23,7 @@ struct PDFReaderView: View {
     @ObservedObject var fileOpenRequests: FileOpenRequestQueue
 
     @State private var isImporterPresented = false
+    @State private var recentDocumentsHeadingWidth = RecentDocumentsHeadingWidthPreferenceKey.defaultValue
     @State private var pendingRecentRelink: RecentDocument?
     /// A Finder request stays reserved while its Save / Discard / Cancel prompt
     /// is visible, so another event cannot replace the action in that prompt.
@@ -1011,13 +1023,21 @@ struct PDFReaderView: View {
             .keyboardShortcut("o", modifiers: .command)
 
             if !recentDocuments.items.isEmpty {
-                HStack(spacing: 0) {
-                    Spacer(minLength: 0)
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Recent Documents")
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .background {
+                            GeometryReader { geometry in
+                                Color.clear.preference(
+                                    key: RecentDocumentsHeadingWidthPreferenceKey.self,
+                                    value: geometry.size.width
+                                )
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .center)
                     VStack(alignment: .leading, spacing: 7) {
-                        Text("Recent Documents")
-                            .font(.callout.weight(.medium))
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
                         ForEach(Array(recentDocuments.items.prefix(5))) { item in
                             Button {
                                 requestOpenRecent(item)
@@ -1032,11 +1052,14 @@ struct PDFReaderView: View {
                             .help(item.lastKnownPath)
                         }
                     }
-                    .frame(maxWidth: 360, alignment: .leading)
-                    Spacer(minLength: 0)
+                    .padding(.leading, max(0, (360 - recentDocumentsHeadingWidth) / 2))
                 }
-                .frame(maxWidth: .infinity)
+                .frame(maxWidth: 360, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.top, 14)
+                .onPreferenceChange(RecentDocumentsHeadingWidthPreferenceKey.self) {
+                    recentDocumentsHeadingWidth = $0
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
