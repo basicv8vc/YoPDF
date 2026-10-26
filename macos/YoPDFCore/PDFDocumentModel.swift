@@ -595,11 +595,17 @@ public final class PDFDocumentModel: ObservableObject {
         updateEffectiveScale(scale)
     }
 
+    /// Stepping is a no-op at the document boundaries. Bumping the navigation
+    /// revision there would replay the current page and reset its scroll offset.
     public func goToNextPage() {
+        guard currentPageIndex + 1 < pageCount else { return }
         goToPage(currentPageIndex + 1)
     }
 
+    /// See `goToNextPage()`. An explicit `goToPage` of the current page still
+    /// issues a command so callers can deliberately re-center it.
     public func goToPreviousPage() {
+        guard currentPageIndex > 0 else { return }
         goToPage(currentPageIndex - 1)
     }
 

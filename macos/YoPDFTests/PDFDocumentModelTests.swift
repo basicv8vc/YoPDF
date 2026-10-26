@@ -128,6 +128,25 @@ final class PDFDocumentModelTests: XCTestCase {
         XCTAssertEqual(model.currentPageIndex, 2, "cannot move past the last page")
     }
 
+    func testPageSteppingAtDocumentBoundariesDoesNotIssueNavigationCommand() throws {
+        let url = try makeFixture(pageCount: 3)
+        let model = PDFDocumentModel()
+        XCTAssertTrue(model.open(url: url))
+
+        let firstPageRevision = model.pageNavigationRevision
+        model.goToPreviousPage()
+        XCTAssertEqual(model.currentPageIndex, 0)
+        XCTAssertEqual(model.pageNavigationRevision, firstPageRevision,
+                       "a no-op step at the first page must not issue a navigation command")
+
+        model.goToPage(2)
+        let lastPageRevision = model.pageNavigationRevision
+        model.goToNextPage()
+        XCTAssertEqual(model.currentPageIndex, 2)
+        XCTAssertEqual(model.pageNavigationRevision, lastPageRevision,
+                       "a no-op step at the last page must not issue a navigation command")
+    }
+
     func testGoToPageClampsOutOfRangeValues() throws {
         let url = try makeFixture(pageCount: 3)
         let model = PDFDocumentModel()

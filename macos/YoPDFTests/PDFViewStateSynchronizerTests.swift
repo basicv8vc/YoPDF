@@ -184,6 +184,40 @@ final class PDFViewStateSynchronizerTests: XCTestCase {
         XCTAssertEqual(model.zoomScale, 1.75)
     }
 
+    func testSteppingPastLastPageKeepsInPageScrollOffset() throws {
+        let url = try PDFFixtureFactory.writeTemporaryPDF()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let model = PDFDocumentModel(access: SecurityScopeSpy())
+        XCTAssertTrue(model.open(url: url))
+        let document = try XCTUnwrap(model.document)
+        let view = makeView()
+        let synchronizer = PDFViewStateSynchronizer()
+        update(synchronizer, view, document, autoScales: true)
+
+        let lastIndex = model.pageCount - 1
+        model.goToPage(lastIndex)
+        update(synchronizer, view, document,
+               pageIndex: lastIndex,
+               pageRevision: model.pageNavigationRevision,
+               autoScales: true)
+        let lastPage = try XCTUnwrap(document.page(at: lastIndex))
+        view.go(to: PDFDestination(page: lastPage, at: CGPoint(x: 0, y: 520)))
+        let before = try XCTUnwrap(view.currentDestination)
+        let revision = model.pageNavigationRevision
+
+        // The thumbnail sidebar arrow key path when already on the last page.
+        model.goToNextPage()
+        XCTAssertEqual(model.pageNavigationRevision, revision)
+        update(synchronizer, view, document,
+               pageIndex: model.currentPageIndex,
+               pageRevision: model.pageNavigationRevision,
+               autoScales: true)
+
+        XCTAssertTrue(view.currentPage === lastPage)
+        XCTAssertEqual(try XCTUnwrap(view.currentDestination).point.y, before.point.y, accuracy: 1,
+                       "a no-op page step must not reset the in-page scroll offset")
+    }
+
     func testMirroringNativePageDoesNotIssueNavigationCommand() throws {
         let url = try PDFFixtureFactory.writeTemporaryPDF()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
