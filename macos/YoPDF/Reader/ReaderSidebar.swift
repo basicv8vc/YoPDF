@@ -42,7 +42,8 @@ struct ReaderSidebar: View {
     @Binding var selection: ReaderSidebarSection
     let onSelectDestination: (PDFDestination) -> Void
 
-    @State private var outlineKeyboardFocus = OutlineKeyboardFocusController()
+    @State private var outlineKeyboardFocus = SidebarKeyboardFocusController()
+    @State private var thumbnailKeyboardFocus = SidebarKeyboardFocusController()
 
     private var annotationItems: [SidebarAnnotationItem] {
         get { navigationState.annotationItems }
@@ -80,11 +81,17 @@ struct ReaderSidebar: View {
         .onChange(of: model.loadGeneration) { _, _ in
             navigationState.prepare(for: model.loadGeneration)
             outlineKeyboardFocus.clearFocus()
+            thumbnailKeyboardFocus.clearFocus()
             prepareNavigationState()
         }
         .onChange(of: selection) { _, newSelection in
             if newSelection != .outline {
                 outlineKeyboardFocus.clearFocus()
+            }
+            if newSelection != .thumbnails {
+                thumbnailKeyboardFocus.clearFocus()
+            } else {
+                requestThumbnailKeyboardFocus()
             }
             if newSelection == .annotations {
                 indexAnnotationsIfNeeded()
@@ -140,6 +147,9 @@ struct ReaderSidebar: View {
                         withAnimation(.easeInOut(duration: 0.14)) {
                             selection = section
                         }
+                        if section == .thumbnails {
+                            requestThumbnailKeyboardFocus()
+                        }
                     } label: {
                         Image(systemName: section.symbolName)
                             .font(.system(size: 14, weight: .medium))
@@ -192,8 +202,19 @@ struct ReaderSidebar: View {
                         width: thumbnailWidth,
                         height: thumbnailWidth * 792 / 612
                     ),
-                    onSelectPage: model.goToPage
+                    onSelectPage: { pageIndex in
+                        model.goToPage(pageIndex)
+                        requestThumbnailKeyboardFocus()
+                    }
                 )
+                .overlay(alignment: .topLeading) {
+                    SidebarKeyboardCaptureRepresentable(focusController: thumbnailKeyboardFocus) { keyCode in
+                        handleThumbnailArrowKey(keyCode)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+                }
                 .accessibilityLabel("Page thumbnails")
             }
         case .annotations:
@@ -227,7 +248,7 @@ struct ReaderSidebar: View {
                     .padding(.vertical, 8)
                 }
                 .overlay(alignment: .topLeading) {
-                    OutlineKeyboardCaptureRepresentable(focusController: outlineKeyboardFocus) { keyCode in
+                    SidebarKeyboardCaptureRepresentable(focusController: outlineKeyboardFocus) { keyCode in
                         handleOutlineArrowKey(keyCode, scrollProxy: proxy)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -315,7 +336,7 @@ struct ReaderSidebar: View {
     private func handleOutlineArrowKey(
         _ keyCode: UInt16,
         scrollProxy: ScrollViewProxy
-    ) {
+    ) -> Bool {
         switch keyCode {
         case 126: // Up
             moveOutlineSelection(by: -1, scrollProxy: scrollProxy)
@@ -326,8 +347,21 @@ struct ReaderSidebar: View {
         case 124: // Right
             moveOutlineSelectionToChild(scrollProxy: scrollProxy)
         default:
-            break
+            return false
         }
+        return true
+    }
+
+    private func handleThumbnailArrowKey(_ keyCode: UInt16) -> Bool {
+        switch keyCode {
+        case 126: // Up
+            model.goToPreviousPage()
+        case 125: // Down
+            model.goToNextPage()
+        default:
+            return false
+        }
+        return true
     }
 
     private func moveOutlineSelection(by offset: Int, scrollProxy: ScrollViewProxy) {
@@ -389,6 +423,12 @@ struct ReaderSidebar: View {
     private func requestOutlineKeyboardFocus() {
         DispatchQueue.main.async {
             outlineKeyboardFocus.focus()
+        }
+    }
+
+    private func requestThumbnailKeyboardFocus() {
+        DispatchQueue.main.async {
+            thumbnailKeyboardFocus.focus()
         }
     }
 
@@ -570,12 +610,12 @@ private struct OutlineSidebarRow: View {
 }
 
 @MainActor
-private final class OutlineKeyboardFocusController {
-    private weak var captureView: OutlineKeyboardCaptureView?
+private final class SidebarKeyboardFocusController {
+    private weak var captureView: SidebarKeyboardCaptureView?
     private var focusRequested = false
     private var keyMonitor: Any?
 
-    func attach(_ view: OutlineKeyboardCaptureView) {
+    func attach(_ view: SidebarKeyboardCaptureView) {
         captureView = view
         if focusRequested {
             removeKeyMonitor()
@@ -600,7 +640,7 @@ private final class OutlineKeyboardFocusController {
         }
     }
 
-    func detach(_ view: OutlineKeyboardCaptureView) {
+    func detach(_ view: SidebarKeyboardCaptureView) {
         guard captureView === view else { return }
         clearFocus()
         captureView = nil
@@ -613,7 +653,7 @@ private final class OutlineKeyboardFocusController {
         else { return }
 
         let windowNumber = window.windowNumber
-        let outlineFrameInWindow = view.convert(view.bounds, to: nil)
+        let captureFrameInWindow = view.convert(view.bounds, to: nil)
         keyMonitor = NSEvent.addLocalMonitorForEvents(
             matching: [.keyDown, .leftMouseDown, .rightMouseDown]
         ) { [weak self] event in
@@ -622,7 +662,7 @@ private final class OutlineKeyboardFocusController {
 
             if event.type == .leftMouseDown || event.type == .rightMouseDown {
                 let clickLocation = event.locationInWindow
-                if !outlineFrameInWindow.contains(clickLocation) {
+                if !captureFrameInWindow.contains(clickLocation) {
                     MainActor.assumeIsolated {
                         self?.clearFocus()
                     }
@@ -646,52 +686,52 @@ private final class OutlineKeyboardFocusController {
                   [123, 124, 125, 126].contains(keyCode)
             else { return event }
 
-            MainActor.assumeIsolated {
-                self?.handleArrowKey(keyCode, windowNumber: windowNumber)
+            let didHandleKey = MainActor.assumeIsolated {
+                self?.handleArrowKey(keyCode, windowNumber: windowNumber) ?? false
             }
-            return nil
+            return didHandleKey ? nil : event
         }
     }
 
-    private func handleArrowKey(_ keyCode: UInt16, windowNumber: Int) {
+    private func handleArrowKey(_ keyCode: UInt16, windowNumber: Int) -> Bool {
         guard focusRequested,
               captureView?.window?.windowNumber == windowNumber
-        else { return }
-        captureView?.onArrowKey?(keyCode)
+        else { return false }
+        return captureView?.onArrowKey?(keyCode) ?? false
     }
 }
 
-/// Supplies the Outline viewport bounds and arrow-key callback to the scoped
+/// Supplies a sidebar viewport's bounds and arrow-key callback to the scoped
 /// local event monitor.
 @MainActor
-private final class OutlineKeyboardCaptureView: NSView {
-    var onArrowKey: ((UInt16) -> Void)?
+private final class SidebarKeyboardCaptureView: NSView {
+    var onArrowKey: ((UInt16) -> Bool)?
 }
 
 @MainActor
-private struct OutlineKeyboardCaptureRepresentable: NSViewRepresentable {
-    let focusController: OutlineKeyboardFocusController
-    let onArrowKey: (UInt16) -> Void
+private struct SidebarKeyboardCaptureRepresentable: NSViewRepresentable {
+    let focusController: SidebarKeyboardFocusController
+    let onArrowKey: (UInt16) -> Bool
 
-    func makeCoordinator() -> OutlineKeyboardFocusController {
+    func makeCoordinator() -> SidebarKeyboardFocusController {
         focusController
     }
 
-    func makeNSView(context: Context) -> OutlineKeyboardCaptureView {
-        let view = OutlineKeyboardCaptureView(frame: .zero)
+    func makeNSView(context: Context) -> SidebarKeyboardCaptureView {
+        let view = SidebarKeyboardCaptureView(frame: .zero)
         view.onArrowKey = onArrowKey
         focusController.attach(view)
         return view
     }
 
-    func updateNSView(_ view: OutlineKeyboardCaptureView, context: Context) {
+    func updateNSView(_ view: SidebarKeyboardCaptureView, context: Context) {
         view.onArrowKey = onArrowKey
         focusController.attach(view)
     }
 
     static func dismantleNSView(
-        _ view: OutlineKeyboardCaptureView,
-        coordinator: OutlineKeyboardFocusController
+        _ view: SidebarKeyboardCaptureView,
+        coordinator: SidebarKeyboardFocusController
     ) {
         coordinator.detach(view)
     }
