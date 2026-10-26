@@ -49,6 +49,15 @@ private struct ReaderWindow: View {
     @ObservedObject var recentDocuments: RecentDocumentsStore
     let fileOpenRequests: FileOpenRequestQueue
     @StateObject private var model: PDFDocumentModel
+    @State private var initialReaderWindowRequestDidResolve = false
+    @State private var completedReaderWindowRequestID: UUID?
+
+    private var canReceiveFinderOpenRequest: Bool {
+        guard let readerWindowRequestID else {
+            return initialReaderWindowRequestDidResolve
+        }
+        return completedReaderWindowRequestID == readerWindowRequestID
+    }
 
     init(
         readerWindowRequestID: Binding<UUID?>,
@@ -70,6 +79,7 @@ private struct ReaderWindow: View {
             updateController: updateController,
             recentDocuments: recentDocuments,
             fileOpenRequests: fileOpenRequests,
+            canReceiveFinderOpenRequest: canReceiveFinderOpenRequest,
             openReaderWindow: { url, relinkingRecentDocumentID in
                 let requestID = fileOpenRequests.enqueueReaderWindowRequest(
                     url: url,
@@ -79,11 +89,29 @@ private struct ReaderWindow: View {
             }
         )
         .task(id: readerWindowRequestID) {
-            guard let readerWindowRequestID,
-                  let request = fileOpenRequests.takeReaderWindowRequest(
-                    id: readerWindowRequestID
-                  )
-            else { return }
+            guard let readerWindowRequestID else {
+                initialReaderWindowRequestDidResolve = true
+                return
+            }
+
+            #if DEBUG
+            // UI tests hold a newly created scene before consuming its UUID
+            // request, exercising back-to-back Finder events deterministically.
+            let delayArgument = "--yopdf-test-reader-request-delay-ms="
+            let delay = ProcessInfo.processInfo.arguments.first(where: {
+                $0.hasPrefix(delayArgument)
+            }).flatMap { Int($0.dropFirst(delayArgument.count)) } ?? 0
+            if delay > 0 {
+                try? await Task.sleep(for: .milliseconds(delay))
+            }
+            #endif
+
+            guard let request = fileOpenRequests.takeReaderWindowRequest(
+                id: readerWindowRequestID
+            ) else {
+                completedReaderWindowRequestID = readerWindowRequestID
+                return
+            }
 
             let relinkingRecentDocument = request.relinkingRecentDocumentID.flatMap { id in
                 recentDocuments.items.first(where: { $0.id == id })
@@ -93,11 +121,16 @@ private struct ReaderWindow: View {
             } else {
                 _ = model.open(url: request.url)
             }
+            completedReaderWindowRequestID = readerWindowRequestID
         }
         .onAppear {
             fileOpenRequests.registerReaderWindowOpener {
                 openWindowAction(id: "reader")
             }
+        }
+        .onDisappear {
+            guard let readerWindowRequestID else { return }
+            fileOpenRequests.discardReaderWindowRequest(id: readerWindowRequestID)
         }
     }
 }

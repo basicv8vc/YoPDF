@@ -4,6 +4,29 @@ import SwiftUI
 import UniformTypeIdentifiers
 import YoPDFCore
 
+private struct ReaderPDFDropDestination: ViewModifier {
+    @Binding var isTargeted: Bool
+    let openPDF: (URL) -> Bool
+
+    func body(content: Content) -> some View {
+        content
+            .contentShape(Rectangle())
+            .overlay {
+                RoundedRectangle(cornerRadius: 12)
+                    .strokeBorder(
+                        isTargeted ? Color.accentColor : Color.secondary.opacity(0.25),
+                        style: StrokeStyle(lineWidth: 2, dash: [8, 6])
+                    )
+                    .padding(24)
+                    .allowsHitTesting(false)
+            }
+            .dropDestination(for: URL.self) { urls, _ in
+                guard let url = urls.first, url.isFileURL else { return false }
+                return openPDF(url)
+            } isTargeted: { isTargeted = $0 }
+    }
+}
+
 private struct RecentDocumentsHeadingWidthPreferenceKey: PreferenceKey {
     static let defaultValue: CGFloat = 110
 
@@ -21,6 +44,7 @@ struct PDFReaderView: View {
     @ObservedObject var updateController: SparkleUpdateController
     @ObservedObject var recentDocuments: RecentDocumentsStore
     @ObservedObject var fileOpenRequests: FileOpenRequestQueue
+    let canReceiveFinderOpenRequest: Bool
     let openReaderWindow: @MainActor (URL, UUID?) -> Void
 
     @State private var isImporterPresented = false
@@ -247,6 +271,10 @@ struct PDFReaderView: View {
                     // first key event. Retry after the view update so a file
                     // queued during launch is not stranded in that case.
                     fileOpenRequests.readerWindowDidBecomeAvailable()
+                    fileOpenRequests.setReaderCanReceiveFinderRequests(
+                        readerID: readerID,
+                        canReceive: canReceiveFinderOpenRequest
+                    )
                     Task { @MainActor in
                         await Task.yield()
                         openFileRequestIfReady()
@@ -287,6 +315,21 @@ struct PDFReaderView: View {
 
     private var lifecycleReader: some View {
         urlReader
+            .modifier(ReaderPDFDropDestination(isTargeted: $isDropTargeted) { url in
+                requestOpen(url)
+                return true
+            })
+            .onChange(of: canReceiveFinderOpenRequest) { _, canReceive in
+                fileOpenRequests.setReaderCanReceiveFinderRequests(
+                    readerID: closeGuard.readerID,
+                    canReceive: canReceive
+                )
+                guard canReceive else { return }
+                Task { @MainActor in
+                    await Task.yield()
+                    openFileRequestIfReady()
+                }
+            }
             .onChange(of: fileOpenRequests.revision) { _, _ in
                 openFileRequestIfReady()
             }
@@ -346,7 +389,12 @@ struct PDFReaderView: View {
     /// the URL indefinitely. All readers use the same choice so only one takes
     /// the request, including while the app is inactive.
     private func openFileRequestIfReady() {
-        let readers = WindowCloseGuard.installedGuards(among: NSApp.windows).compactMap(\.window)
+        guard canReceiveFinderOpenRequest else { return }
+        let readers = WindowCloseGuard.installedGuards(among: NSApp.windows)
+            .filter {
+                fileOpenRequests.readerCanReceiveFinderRequests(readerID: $0.readerID)
+            }
+            .compactMap(\.window)
         let readerIDs = Set(readers.map(ObjectIdentifier.init))
         let orderedReaders = (NSApp.orderedWindows + readers).filter {
             readerIDs.contains(ObjectIdentifier($0))
@@ -1073,21 +1121,6 @@ struct PDFReaderView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(40)
-        .contentShape(Rectangle())
-        .overlay {
-            RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(
-                    isDropTargeted ? Color.accentColor : Color.secondary.opacity(0.25),
-                    style: StrokeStyle(lineWidth: 2, dash: [8, 6])
-                )
-                .padding(24)
-                .allowsHitTesting(false)
-        }
-        .dropDestination(for: URL.self) { urls, _ in
-            guard let url = urls.first else { return false }
-            requestOpen(url)
-            return true
-        } isTargeted: { isDropTargeted = $0 }
     }
 
     // MARK: - Opening

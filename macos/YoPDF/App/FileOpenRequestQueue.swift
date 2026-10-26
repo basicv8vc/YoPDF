@@ -28,6 +28,9 @@ final class FileOpenRequestQueue: ObservableObject {
     /// different reader's close or a stale completion mutate it.
     private var inFlightRequest: Request?
     private var readerWindowOpener: (@MainActor () -> Void)?
+    /// New WindowGroup scenes are not available for Finder events until their
+    /// one-shot scene request has been consumed.
+    private var readerRequestAvailability: [UUID: Bool] = [:]
     /// WindowGroup values use UUIDs so the actual file URL stays in-process.
     /// This preserves security-scoped URL state across scene creation.
     private var readerWindowRequests: [UUID: ReaderWindowRequest] = [:]
@@ -52,7 +55,10 @@ final class FileOpenRequestQueue: ObservableObject {
     }
 
     func takeNext(readerID: UUID) -> Request? {
-        guard inFlightRequest == nil, let pendingRequest else { return nil }
+        guard readerRequestAvailability[readerID] != false,
+              inFlightRequest == nil,
+              let pendingRequest
+        else { return nil }
         let request = Request(id: pendingRequest.id, url: pendingRequest.url, readerID: readerID)
         self.pendingRequest = nil
         inFlightRequest = request
@@ -65,6 +71,7 @@ final class FileOpenRequestQueue: ObservableObject {
     /// one can take it, or opens a replacement if none remain.
     @discardableResult
     func readerWindowDidClose(readerID: UUID) -> Bool {
+        readerRequestAvailability.removeValue(forKey: readerID)
         if let inFlightRequest {
             guard inFlightRequest.readerID == readerID else { return false }
             pendingRequest = Request(
@@ -100,6 +107,16 @@ final class FileOpenRequestQueue: ObservableObject {
         hasHadReaderWindow = true
     }
 
+    func setReaderCanReceiveFinderRequests(readerID: UUID, canReceive: Bool) {
+        guard readerRequestAvailability[readerID] != canReceive else { return }
+        readerRequestAvailability[readerID] = canReceive
+        revision &+= 1
+    }
+
+    func readerCanReceiveFinderRequests(readerID: UUID) -> Bool {
+        readerRequestAvailability[readerID] ?? true
+    }
+
     func openReaderWindowIfAvailable() {
         readerWindowOpener?()
     }
@@ -120,31 +137,8 @@ final class FileOpenRequestQueue: ObservableObject {
         readerWindowRequests.removeValue(forKey: id)
     }
 
-    /// Debug UI tests use this trace to confirm how LaunchServices routes each
-    /// file-open action. Release builds compile out both the argument and I/O.
-    func recordOpenCallback(_ source: String, urls: [URL]) {
-        #if DEBUG
-        guard let argument = ProcessInfo.processInfo.arguments.first(where: {
-            $0.hasPrefix("--yopdf-open-trace=")
-        }) else { return }
-        let path = String(argument.dropFirst("--yopdf-open-trace=".count))
-        guard !path.isEmpty else { return }
-
-        do {
-            let traceURL = URL(fileURLWithPath: path)
-            let entry: [String: Any] = ["source": source, "paths": urls.map(\.path)]
-            var data = try JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys])
-            data.append(0x0A)
-            if !FileManager.default.fileExists(atPath: path) {
-                FileManager.default.createFile(atPath: path, contents: Data())
-            }
-            let handle = try FileHandle(forWritingTo: traceURL)
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            try handle.write(contentsOf: data)
-        } catch {
-            NSLog("YoPDF test open trace failed: %@", error.localizedDescription)
-        }
-        #endif
+    func discardReaderWindowRequest(id: UUID) {
+        _ = readerWindowRequests.removeValue(forKey: id)
     }
+
 }
