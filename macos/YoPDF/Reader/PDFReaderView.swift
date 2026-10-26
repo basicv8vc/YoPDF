@@ -198,12 +198,19 @@ struct PDFReaderView: View {
     }
 
     private var titlebarReader: some View {
-        closeGuardReader.background(
-            TitlebarUpdateIndicatorInstaller(updateController: updateController)
-                .frame(width: 0, height: 0)
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
-        )
+        closeGuardReader
+            .background(
+                TitlebarUpdateIndicatorInstaller(updateController: updateController)
+                    .frame(width: 0, height: 0)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            )
+            .background(
+                WindowTitleInstaller(title: model.fileURL?.lastPathComponent ?? "YoPDF")
+                    .frame(width: 0, height: 0)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            )
     }
 
     private var closeGuardReader: some View {
@@ -670,15 +677,6 @@ struct PDFReaderView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
                     .help("The edits are still in memory. See the save details and retry or save a copy.")
-            }
-
-            if let fileURL = model.fileURL {
-                Text(fileURL.lastPathComponent)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .help(fileURL.path)
             }
         }
         .buttonStyle(.borderless)
