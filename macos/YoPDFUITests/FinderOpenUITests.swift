@@ -4,6 +4,60 @@ import XCTest
 @MainActor
 final class FinderOpenUITests: XCTestCase {
 
+    func testFinderOpenFromColdLaunchLoadsRequestedPDF() async throws {
+        let runID = UUID().uuidString
+        let first = try PDFFixtureFactory.writeTemporaryPDF(named: "finder-cold-\(runID)")
+        defer { try? FileManager.default.removeItem(at: first.deletingLastPathComponent()) }
+
+        let applicationURL = try applicationURL()
+        let app = XCUIApplication(url: applicationURL)
+        defer { app.terminate() }
+        app.launchArguments = ["-ApplePersistenceIgnoreState", "YES"]
+
+        // `XCUIApplication.open(_:)` launches the app through LaunchServices
+        // with a document, exercising the same open-document path as Finder's
+        // Open With command without first starting an empty reader.
+        app.open(first)
+        XCTAssertTrue(app.staticTexts[first.lastPathComponent].waitForExistence(timeout: 15),
+                      "A cold Finder launch must load the requested PDF.")
+        assertReaderWindows([first], in: app)
+    }
+
+    func testFinderBatchOpenIsRejectedWithoutReplacingTheOpenDocument() async throws {
+        let runID = UUID().uuidString
+        let first = try PDFFixtureFactory.writeTemporaryPDF(named: "finder-batch-first-\(runID)")
+        let second = try PDFFixtureFactory.writeTemporaryPDF(named: "finder-batch-second-\(runID)")
+        defer {
+            try? FileManager.default.removeItem(at: first.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: second.deletingLastPathComponent())
+        }
+
+        let applicationURL = try applicationURL()
+        let app = XCUIApplication(url: applicationURL)
+        defer { app.terminate() }
+        app.launchArguments = ["-ApplePersistenceIgnoreState", "YES"]
+        app.launch()
+        XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 10))
+
+        try await open([first], with: applicationURL)
+        XCTAssertTrue(app.staticTexts[first.lastPathComponent].waitForExistence(timeout: 10))
+        assertReaderWindows([first], in: app)
+
+        // One LaunchServices action with two files is a batch. YoPDF currently
+        // declines multi-file batches, so it must leave the current document
+        // alone rather than opening only one item or keeping only the last one.
+        try await open(
+            [first, second],
+            with: applicationURL,
+            allowLaunchServicesFailure: true
+        )
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertTrue(app.staticTexts[first.lastPathComponent].exists)
+        XCTAssertFalse(app.staticTexts[second.lastPathComponent].exists,
+                       "A rejected batch must not open any of its PDFs.")
+        assertReaderWindows([first], in: app)
+    }
+
     func testFinderOpenIntoExistingThenRapidAndClosedWindows() async throws {
         let runID = UUID().uuidString
         let first = try PDFFixtureFactory.writeTemporaryPDF(named: "finder-first-\(runID)")
@@ -54,15 +108,16 @@ final class FinderOpenUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts[first.lastPathComponent].exists)
         XCTAssertTrue(app.staticTexts[second.lastPathComponent].exists)
         assertReaderWindows([first, second, third, fourth], in: app)
-        closeReaderWindow(titled: fourth.lastPathComponent, in: app)
-        closeReaderWindow(titled: third.lastPathComponent, in: app)
-        assertReaderWindows([first, second], in: app)
-        XCTAssertTrue(app.staticTexts[first.lastPathComponent].exists)
-        XCTAssertTrue(app.staticTexts[second.lastPathComponent].exists)
-        closeReaderWindow(titled: second.lastPathComponent, in: app)
-        assertReaderWindows([first], in: app)
-        XCTAssertTrue(app.staticTexts[first.lastPathComponent].exists)
-        closeReaderWindow(titled: first.lastPathComponent, in: app)
+        var remainingTitles = Set([first, second, third, fourth].map(\.lastPathComponent))
+        for _ in 0..<4 {
+            guard let closedTitle = closeActiveReaderWindow(in: app) else { break }
+            XCTAssertTrue(remainingTitles.remove(closedTitle) != nil,
+                          "⌘W closed unexpected window \(closedTitle).")
+            let remainingDocuments = [first, second, third, fourth].filter {
+                remainingTitles.contains($0.lastPathComponent)
+            }
+            assertReaderWindows(remainingDocuments, in: app)
+        }
         assertReaderWindows([], in: app)
         try await open([first], with: applicationURL)
         XCTAssertTrue(app.staticTexts[first.lastPathComponent].waitForExistence(timeout: 10),
@@ -97,30 +152,51 @@ final class FinderOpenUITests: XCTestCase {
 
     private func open(
         _ urls: [URL],
-        with applicationURL: URL
+        with applicationURL: URL,
+        allowLaunchServicesFailure: Bool = false
     ) async throws {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.arguments = ["-ApplePersistenceIgnoreState", "YES"]
-        _ = try await NSWorkspace.shared.open(
-            urls, withApplicationAt: applicationURL, configuration: configuration
-        )
+        do {
+            _ = try await NSWorkspace.shared.open(
+                urls, withApplicationAt: applicationURL, configuration: configuration
+            )
+        } catch {
+            guard allowLaunchServicesFailure else { throw error }
+        }
     }
 
-    private func closeReaderWindow(titled title: String, in app: XCUIApplication) {
-        let window = app.windows.matching(NSPredicate(format: "title == %@", title)).firstMatch
-        XCTAssertTrue(window.waitForExistence(timeout: 5), "Expected reader window \(title).")
-        window.click()
+    private func closeActiveReaderWindow(in app: XCUIApplication) -> String? {
+        app.activate()
+        let before = Set(app.windows.allElementsBoundByIndex.map(\.title))
+        XCTAssertFalse(before.isEmpty, "Expected a reader window to close.")
+
         app.typeKey("w", modifierFlags: .command)
+
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < deadline {
+            let after = Set(app.windows.allElementsBoundByIndex.map(\.title))
+            if after.count == before.count - 1 {
+                let closed = before.subtracting(after)
+                XCTAssertEqual(closed.count, 1,
+                               "⌘W must close exactly one window. Before: \(before), after: \(after).")
+                return closed.first
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+        XCTFail("⌘W did not close a reader window. Windows: \(before).")
+        return nil
     }
 
     private func assertReaderWindows(_ documents: [URL], in app: XCUIApplication) {
         let expectedTitles = Set(documents.map(\.lastPathComponent))
-        let matchingTitles = app.windows.allElementsBoundByIndex
-            .map(\.title)
-            .filter(expectedTitles.contains)
+        let windowTitles = app.windows.allElementsBoundByIndex.map(\.title)
+        let matchingTitles = windowTitles.filter(expectedTitles.contains)
         XCTAssertEqual(Set(matchingTitles), expectedTitles)
         XCTAssertEqual(matchingTitles.count, expectedTitles.count,
                        "Each requested PDF should appear in exactly one reader window.")
+        XCTAssertEqual(windowTitles.count, expectedTitles.count,
+                       "Unexpected reader window(s): \(windowTitles).")
     }
 
 }

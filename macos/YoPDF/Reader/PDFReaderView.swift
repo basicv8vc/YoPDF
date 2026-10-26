@@ -6,19 +6,24 @@ import YoPDFCore
 
 private struct ReaderPDFDropDestination: ViewModifier {
     @Binding var isTargeted: Bool
+    /// An empty reader advertises that it accepts a drop. A reader that already
+    /// shows a document only draws the border while a file is over it.
+    let showsPersistentHint: Bool
     let openPDF: (URL) -> Bool
 
     func body(content: Content) -> some View {
         content
             .contentShape(Rectangle())
             .overlay {
-                RoundedRectangle(cornerRadius: 12)
-                    .strokeBorder(
-                        isTargeted ? Color.accentColor : Color.secondary.opacity(0.25),
-                        style: StrokeStyle(lineWidth: 2, dash: [8, 6])
-                    )
-                    .padding(24)
-                    .allowsHitTesting(false)
+                if isTargeted || showsPersistentHint {
+                    RoundedRectangle(cornerRadius: 12)
+                        .strokeBorder(
+                            isTargeted ? Color.accentColor : Color.secondary.opacity(0.25),
+                            style: StrokeStyle(lineWidth: 2, dash: [8, 6])
+                        )
+                        .padding(24)
+                        .allowsHitTesting(false)
+                }
             }
             .dropDestination(for: URL.self) { urls, _ in
                 guard let url = urls.first, url.isFileURL else { return false }
@@ -315,7 +320,10 @@ struct PDFReaderView: View {
 
     private var lifecycleReader: some View {
         urlReader
-            .modifier(ReaderPDFDropDestination(isTargeted: $isDropTargeted) { url in
+            .modifier(ReaderPDFDropDestination(
+                isTargeted: $isDropTargeted,
+                showsPersistentHint: !model.isLoaded
+            ) { url in
                 requestOpen(url)
                 return true
             })
