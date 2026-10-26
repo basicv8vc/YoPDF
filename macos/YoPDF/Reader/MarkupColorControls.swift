@@ -29,7 +29,6 @@ struct MarkupColorButton: View {
                         .strokeBorder(Color.primary.opacity(0.22), lineWidth: 1)
                 }
         }
-        .buttonStyle(.borderless)
         .help(help)
         .accessibilityLabel(help)
         .popover(isPresented: $isPopoverPresented, arrowEdge: .bottom) {
@@ -110,7 +109,7 @@ private struct MarkupColorPopover: View {
                     }
                 }
         }
-        .buttonStyle(.plain)
+        .buttonStyle(ReaderInteractiveButtonStyle())
         .help(preset.name)
         .accessibilityLabel(preset.name)
         .accessibilityAddTraits(isSelected ? .isSelected : [])

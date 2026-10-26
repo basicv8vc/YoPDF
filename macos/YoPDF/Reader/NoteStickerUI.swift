@@ -191,7 +191,7 @@ struct NoteStickerMotifPicker: View {
                                 )
                         }
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(ReaderInteractiveButtonStyle(insets: .init()))
                     .accessibilityLabel(motif.title)
                     .accessibilityAddTraits(selection == motif ? .isSelected : [])
                 }
@@ -265,7 +265,7 @@ struct NoteStickerStyleControls: View {
                                 }
                                 .padding(2)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(ReaderInteractiveButtonStyle(insets: .init()))
                         .accessibilityLabel(palette.title)
                         .accessibilityAddTraits(style.palette == palette ? .isSelected : [])
                     }
