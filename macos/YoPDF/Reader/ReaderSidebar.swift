@@ -163,7 +163,7 @@ struct ReaderSidebar: View {
                             }
                             .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(ReaderInteractiveButtonStyle(insets: .init()))
                     .help(section.title)
                     .accessibilityLabel(section.title)
                     .accessibilityValue(isSelected ? "Selected" : "")
@@ -578,7 +578,7 @@ private struct OutlineSidebarRow: View {
                         .frame(width: 20, height: 25)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(ReaderInteractiveButtonStyle(insets: .init()))
                 .help(item.isExpanded ? "Collapse section" : "Expand section")
             } else {
                 Color.clear.frame(width: 20, height: 25)
@@ -602,7 +602,7 @@ private struct OutlineSidebarRow: View {
                         }
                     }
             }
-            .buttonStyle(.plain)
+            .buttonStyle(ReaderInteractiveButtonStyle(insets: .init()))
             .help(item.destination == nil ? "This outline item has no page destination" : item.title)
         }
         .padding(.leading, CGFloat(min(item.depth, 8) * 12))
@@ -835,7 +835,7 @@ private struct AnnotationSidebarRow: View {
             }
             .contentShape(RoundedRectangle(cornerRadius: 6))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(ReaderInteractiveButtonStyle(insets: .init()))
         .help("Go to page \(item.pageIndex + 1)")
     }
 }
@@ -909,7 +909,7 @@ private struct PDFPageThumbnailList: View {
                                     }
                                     .contentShape(RoundedRectangle(cornerRadius: 7))
                                 }
-                                .buttonStyle(.plain)
+                                .buttonStyle(ReaderInteractiveButtonStyle(insets: .init()))
                                 .accessibilityLabel("Page \(pageIndex + 1)")
                                 .accessibilityValue(isCurrentPage(pageIndex) ? "Current page" : "")
                                 .id(pageIndex)

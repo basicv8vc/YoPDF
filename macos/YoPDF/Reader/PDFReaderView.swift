@@ -502,6 +502,7 @@ struct PDFReaderView: View {
             } label: {
                 Image(systemName: "sidebar.left")
             }
+            .buttonStyle(ReaderInteractiveButtonStyle(isSelected: isSidebarVisible))
             .disabled(!model.isLoaded)
             .help(isSidebarVisible ? "Hide Sidebar" : "Show Sidebar")
             .accessibilityLabel(isSidebarVisible ? "Hide Sidebar" : "Show Sidebar")
@@ -600,6 +601,7 @@ struct PDFReaderView: View {
                     systemImage: isPlacingNote ? "xmark.circle" : "note.text.badge.plus"
                 )
             }
+            .buttonStyle(ReaderInteractiveButtonStyle(isSelected: isPlacingNote))
             .disabled(!model.canCreateNote)
             .help(
                 isPlacingNote
@@ -691,7 +693,7 @@ struct PDFReaderView: View {
                     .help("The edits are still in memory. See the save details and retry or save a copy.")
             }
         }
-        .buttonStyle(.borderless)
+        .buttonStyle(ReaderInteractiveButtonStyle())
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .background(.bar)
@@ -717,7 +719,6 @@ struct PDFReaderView: View {
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                 }
-                .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
                 .accessibilityLabel("Clear search")
                 .help("Clear search")
@@ -750,7 +751,7 @@ struct PDFReaderView: View {
             .accessibilityLabel("Close search")
             .help("Close search (Esc)")
         }
-        .buttonStyle(.borderless)
+        .buttonStyle(ReaderInteractiveButtonStyle())
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .background(.bar)
@@ -1020,6 +1021,12 @@ struct PDFReaderView: View {
             Button("Open PDF…") {
                 isImporterPresented = true
             }
+            .buttonStyle(
+                ReaderInteractiveButtonStyle(
+                    isProminent: true,
+                    insets: EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16)
+                )
+            )
             .keyboardShortcut("o", modifiers: .command)
 
             if !recentDocuments.items.isEmpty {
@@ -1047,7 +1054,7 @@ struct PDFReaderView: View {
                                     .truncationMode(.middle)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(ReaderInteractiveButtonStyle(insets: .init()))
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .help(item.lastKnownPath)
                         }

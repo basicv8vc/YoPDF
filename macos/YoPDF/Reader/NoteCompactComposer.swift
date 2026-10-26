@@ -31,7 +31,7 @@ struct NoteCompactComposer: View {
                 NoteStickerArtwork(motif: style.motif)
                     .frame(width: 29, height: 29)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(ReaderInteractiveButtonStyle(insets: .init()))
             .disabled(!canChangeStyle)
             .help("Note appearance")
             .accessibilityLabel("Note appearance")
@@ -63,7 +63,7 @@ struct NoteCompactComposer: View {
                     Image(systemName: "xmark")
                         .frame(width: 22, height: 27)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(ReaderInteractiveButtonStyle(insets: .init()))
                 .foregroundStyle(.secondary)
                 .help("Cancel")
                 .accessibilityLabel("Cancel")
@@ -106,7 +106,7 @@ struct NoteCompactComposer: View {
                         in: Circle()
                     )
             }
-            .buttonStyle(.plain)
+            .buttonStyle(ReaderInteractiveButtonStyle(insets: .init()))
             .disabled(!canSubmit)
             .keyboardShortcut(.return, modifiers: .command)
             .accessibilityLabel(submitTitle)

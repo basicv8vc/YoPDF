@@ -191,7 +191,7 @@ struct NoteStickerMotifPicker: View {
                                 )
                         }
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(ReaderInteractiveButtonStyle(insets: .init()))
                     .accessibilityLabel(motif.title)
                     .accessibilityAddTraits(selection == motif ? .isSelected : [])
                 }
@@ -219,58 +219,7 @@ struct NoteStickerStyleControls: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Menu {
-                    Section("Built-in Templates") {
-                        ForEach(NoteTemplate.builtIns()) { template in
-                            Button {
-                                apply(template)
-                            } label: {
-                                Label(template.style.displayTitle, systemImage: template.style.symbol)
-                            }
-                        }
-                    }
-                    if !library.templates.isEmpty {
-                        Section("My Templates") {
-                            ForEach(library.templates) { template in
-                                Button(template.style.displayTitle) {
-                                    apply(template)
-                                }
-                            }
-                        }
-                    }
-                    Divider()
-                    Button("Manage Templates…") { showsLibrary = true }
-                } label: {
-                    Label("Templates", systemImage: "square.stack")
-                }
-                .fixedSize()
-                .accessibilityIdentifier("pdf-sticker-templates")
-
-                Spacer()
-
-                HStack(spacing: 5) {
-                    ForEach(NotePaperColor.allCases, id: \.self) { palette in
-                        Button {
-                            style.palette = palette
-                        } label: {
-                            Circle()
-                                .fill(Color(nsColor: palette.color))
-                                .frame(width: 15, height: 15)
-                                .overlay {
-                                    Circle().strokeBorder(
-                                        style.palette == palette ? Color.primary : .clear,
-                                        lineWidth: 2
-                                    )
-                                }
-                                .padding(2)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel(palette.title)
-                        .accessibilityAddTraits(style.palette == palette ? .isSelected : [])
-                    }
-                }
-            }
+            controlsHeader
 
             NoteStickerMotifPicker(selection: Binding(
                 get: { style.motif },
@@ -290,6 +239,74 @@ struct NoteStickerStyleControls: View {
         }
         .sheet(isPresented: $showsLibrary) {
             NoteTemplateLibrary(seedText: text, seedStyle: style, onUse: apply)
+        }
+    }
+
+    private var controlsHeader: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 6) {
+                templateMenu
+                Spacer(minLength: 0)
+                paperPalettePicker
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                templateMenu
+                paperPalettePicker
+            }
+        }
+    }
+
+    private var templateMenu: some View {
+        Menu {
+            Section("Built-in Templates") {
+                ForEach(NoteTemplate.builtIns()) { template in
+                    Button {
+                        apply(template)
+                    } label: {
+                        Label(template.style.displayTitle, systemImage: template.style.symbol)
+                    }
+                }
+            }
+            if !library.templates.isEmpty {
+                Section("My Templates") {
+                    ForEach(library.templates) { template in
+                        Button(template.style.displayTitle) {
+                            apply(template)
+                        }
+                    }
+                }
+            }
+            Divider()
+            Button("Manage Templates…") { showsLibrary = true }
+        } label: {
+            Label("Templates", systemImage: "square.stack")
+        }
+        .fixedSize()
+        .accessibilityIdentifier("pdf-sticker-templates")
+    }
+
+    private var paperPalettePicker: some View {
+        HStack(spacing: 5) {
+            ForEach(NotePaperColor.allCases, id: \.self) { palette in
+                Button {
+                    style.palette = palette
+                } label: {
+                    Circle()
+                        .fill(Color(nsColor: palette.color))
+                        .frame(width: 15, height: 15)
+                        .overlay {
+                            Circle().strokeBorder(
+                                style.palette == palette ? Color.primary : .clear,
+                                lineWidth: 2
+                            )
+                        }
+                        .padding(2)
+                }
+                .buttonStyle(ReaderInteractiveButtonStyle(insets: .init()))
+                .accessibilityLabel(palette.title)
+                .accessibilityAddTraits(style.palette == palette ? .isSelected : [])
+            }
         }
     }
 
