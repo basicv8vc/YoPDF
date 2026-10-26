@@ -3,7 +3,7 @@ import XCTest
 @MainActor
 final class ThumbnailNavigationUITests: XCTestCase {
 
-    func testThumbnailArrowKeysNavigatePreviousAndNextPage() throws {
+    func testThumbnailArrowKeysNavigatePagesAndStopAfterTab() throws {
         let fixtureURL = try PDFFixtureFactory.writeTemporaryPDF(
             pageCount: 3,
             named: "thumbnail-arrows"
@@ -42,5 +42,23 @@ final class ThumbnailNavigationUITests: XCTestCase {
 
         app.typeKey(.upArrow, modifierFlags: [])
         XCTAssertTrue(firstPage.waitForExistence(timeout: 5), "Up Arrow should return to page 1.")
+
+        app.typeKey(.downArrow, modifierFlags: [])
+        XCTAssertTrue(secondPage.waitForExistence(timeout: 5), "Down Arrow should advance to page 2 again.")
+
+        app.typeKey(.tab, modifierFlags: [])
+        app.typeKey(.downArrow, modifierFlags: [])
+
+        let thirdPage = app.staticTexts["Page 3 of 3"]
+        let unexpectedPageAdvance = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true"),
+            object: thirdPage
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [unexpectedPageAdvance], timeout: 1),
+            .timedOut,
+            "Down Arrow should not navigate pages after Tab moves keyboard focus out of the sidebar."
+        )
+        XCTAssertTrue(secondPage.exists, "The reader should remain on page 2 after focus leaves the sidebar.")
     }
 }

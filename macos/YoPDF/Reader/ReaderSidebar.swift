@@ -670,6 +670,15 @@ private final class SidebarKeyboardFocusController {
                 return event
             }
 
+            // Tab moves keyboard focus without a mouse event. Release the
+            // sidebar's arrow handling before AppKit dispatches that transfer.
+            if event.keyCode == 48 { // Tab
+                MainActor.assumeIsolated {
+                    self?.clearFocus()
+                }
+                return event
+            }
+
             // The local monitor runs before AppKit dispatches the key to its
             // first responder. Let text-field editors keep their caret keys,
             // including the PDF search field opened with ⌘F.
