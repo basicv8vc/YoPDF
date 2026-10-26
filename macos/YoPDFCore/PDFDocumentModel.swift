@@ -33,6 +33,8 @@ public final class PDFDocumentModel: ObservableObject {
     @Published public private(set) var title: String = ""
     @Published public private(set) var pageCount: Int = 0
     @Published public private(set) var currentPageIndex: Int = 0
+    /// Changes only for explicit page commands, never for PDFView feedback.
+    @Published public private(set) var pageNavigationRevision = 0
     /// The zoom the user asked for. Only meaningful while `isAutoScaling` is false.
     @Published public private(set) var zoomScale: CGFloat = 1
     /// What the view is actually showing. Mirrored from PDFView so that the
@@ -423,9 +425,9 @@ public final class PDFDocumentModel: ObservableObject {
     /// the user chose.
     ///
     /// Deliberately does **not** bump `loadGeneration`: the view keeps its
-    /// `PDFView` and re-attaches the new document, so scroll position within the
-    /// page survives a save. Bumping the generation would rebuild the view and
-    /// jump back to the top of the page.
+    /// `PDFView` and lets its state synchronizer capture and restore the viewport
+    /// while attaching the replacement. Keeping the view alone is insufficient:
+    /// assigning PDFView.document resets its navigation.
     func swapDocument(_ newDocument: PDFDocument, at position: ReadingPosition) {
         document = newDocument
         pageCount = newDocument.pageCount
@@ -477,9 +479,9 @@ public final class PDFDocumentModel: ObservableObject {
         autoSaveStatus = .idle
         lastAutoSaveOutcome = nil
         editRevision &+= 1
-        // Manual saves replace the PDFDocument below and therefore clear its
-        // annotation-object history. Automatic saves keep the live document,
-        // so the same entries can still undo and redo edits after persistence.
+        // In-place manual and automatic saves keep the live document and its
+        // history. Save As and explicit document replacements clear references
+        // to the old annotation objects.
         if !preservingMarkupHistory {
             resetMarkupState()
         }
@@ -489,9 +491,9 @@ public final class PDFDocumentModel: ObservableObject {
     ///
     /// The undo entries hold `PDFAnnotation` objects, and an annotation belongs
     /// to the `PDFDocument` that created it. Keeping them after an open, close,
-    /// manual save reload or Save As would leave a menu action able to mutate
-    /// an old in-memory document that is no longer on screen. Auto-save retains
-    /// the live document and can safely preserve the history.
+    /// Save As would leave a menu action able to mutate an old in-memory
+    /// document that is no longer on screen. In-place saves retain the live
+    /// document and can safely preserve the history.
     func resetMarkupState() {
         markupUndoStack.removeAll()
         markupRedoStack.removeAll()
@@ -561,9 +563,36 @@ public final class PDFDocumentModel: ObservableObject {
     public func goToPage(_ index: Int) {
         guard pageCount > 0 else { return }
         let clampedIndex = min(max(index, 0), pageCount - 1)
-        guard clampedIndex != currentPageIndex else { return }
-        currentPageIndex = clampedIndex
+        if currentPageIndex != clampedIndex {
+            currentPageIndex = clampedIndex
+        }
+        pageNavigationRevision &+= 1
         persistReadingPosition()
+    }
+
+    /// Native scrolling and zoom reflow report state, rather than requesting a
+    /// jump. Keeping this separate prevents a refresh from interrupting a pinch.
+    public func updateCurrentPageIndex(_ index: Int) {
+        guard index >= 0, index < pageCount, index != currentPageIndex else { return }
+        currentPageIndex = index
+        persistReadingPosition()
+    }
+
+    /// A queued viewport report must not supersede a newer command or document.
+    public func updateViewState(
+        document: PDFDocument?,
+        pageIndex: Int?,
+        scale: CGFloat,
+        pageNavigationRevision: Int,
+        zoomCommandRevision: Int
+    ) {
+        guard self.document === document,
+              self.pageNavigationRevision == pageNavigationRevision,
+              self.zoomCommandRevision == zoomCommandRevision else { return }
+        if let pageIndex {
+            updateCurrentPageIndex(pageIndex)
+        }
+        updateEffectiveScale(scale)
     }
 
     public func goToNextPage() {
@@ -613,10 +642,15 @@ public final class PDFDocumentModel: ObservableObject {
     /// `isAutoScaling`: the view is the only source of truth while fitting.
     public func updateEffectiveScale(_ scale: CGFloat) {
         guard scale.isFinite, scale > 0 else { return }
-        effectiveScale = scale
+        if effectiveScale != scale {
+            effectiveScale = scale
+        }
         if !isAutoScaling {
-            zoomScale = min(max(scale, Self.minimumZoomScale), Self.maximumZoomScale)
-            persistReadingPosition()
+            let manualScale = min(max(scale, Self.minimumZoomScale), Self.maximumZoomScale)
+            if zoomScale != manualScale {
+                zoomScale = manualScale
+                persistReadingPosition()
+            }
         }
     }
 
@@ -624,6 +658,7 @@ public final class PDFDocumentModel: ObservableObject {
         if enabled {
             fitToWindow()
         } else {
+            guard isAutoScaling else { return }
             // PDFKit already owns the live PDFView scale during a magnify
             // gesture. Record that manual zoom has started without sending a
             // scale command back through NSViewRepresentable.updateNSView.

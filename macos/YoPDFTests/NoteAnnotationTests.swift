@@ -327,17 +327,17 @@ final class NoteAnnotationTests: XCTestCase {
         XCTAssertTrue(raw.contains("/Text"))
     }
 
-    func testNoteSurvivesAReloadAndClearsHistory() throws {
+    func testNoteSurvivesSaveAndKeepsHistory() throws {
         let model = openModel(at: try makeFixture())
         try addPageNote(to: model, contents: "Saved body")
         XCTAssertTrue(model.canUndoMarkup)
 
         XCTAssertEqual(model.save(), .saved)
 
-        XCTAssertFalse(model.canUndoMarkup, "a save reloads the document and its history")
+        XCTAssertTrue(model.canUndoMarkup, "an in-place save keeps the live document and its history")
         XCTAssertFalse(model.canRedoMarkup)
         XCTAssertFalse(model.hasUnsavedChanges)
-        XCTAssertEqual(model.noteMarkers.count, 1, "the marker is rebuilt from the reloaded file")
+        XCTAssertEqual(model.noteMarkers.count, 1, "the marker is rebuilt from the live annotations")
         XCTAssertEqual(try note(on: 0, in: model).contents, "Saved body")
     }
 

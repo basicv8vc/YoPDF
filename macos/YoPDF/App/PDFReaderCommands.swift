@@ -75,7 +75,7 @@ struct PDFReaderCommands: Commands {
 
         // Annotation edits use the model's own history rather than PDFKit's
         // UndoManager. A cross-page mark is one entry, a recolour gesture is one
-        // entry, and the history is cleared when a save reloads the document.
+        // entry, and the history is cleared when Save As replaces the document.
         CommandGroup(replacing: .undoRedo) {
             Button("Undo") {
                 model?.undoMarkup()

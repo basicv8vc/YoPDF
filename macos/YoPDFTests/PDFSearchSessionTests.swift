@@ -151,7 +151,7 @@ final class PDFSearchSessionTests: XCTestCase {
         XCTAssertFalse(session.isSearching)
     }
 
-    func testSaveReplacesDocumentAndSearchRebindPreservesHighlightAnnotation() async throws {
+    func testInPlaceSaveKeepsDocumentAndSearchSelections() async throws {
         let url = try makeTemporaryPDF(named: "save-search") { _ in
             "KV Cache appears twice: KV Cache"
         }
@@ -179,7 +179,7 @@ final class PDFSearchSessionTests: XCTestCase {
 
         XCTAssertEqual(model.save(), .saved)
         let savedDocument = try XCTUnwrap(model.document)
-        XCTAssertFalse(savedDocument === originalDocument, "Manual Save reloads the PDFDocument object.")
+        XCTAssertTrue(savedDocument === originalDocument, "An in-place Save keeps the live PDFDocument.")
         session.documentWasReplaced(with: savedDocument)
         try await waitForSearchCompletion(session)
 

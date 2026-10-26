@@ -893,7 +893,7 @@ struct PDFReaderView: View {
                     document: model.document,
                     currentPageIndex: Binding(
                         get: { model.currentPageIndex },
-                        set: { model.goToPage($0) }
+                        set: { model.updateCurrentPageIndex($0) }
                     ),
                     selection: Binding(
                         get: { model.currentSelection },
@@ -902,9 +902,19 @@ struct PDFReaderView: View {
                     autoScales: model.isAutoScaling,
                     zoomScale: model.zoomScale,
                     zoomCommandRevision: model.zoomCommandRevision,
+                    pageNavigationRevision: model.pageNavigationRevision,
                     navigationDestination: pendingNavigationDestination,
                     navigationRevision: navigationRevision,
                     onScaleChange: { model.updateEffectiveScale($0) },
+                    onSettledViewState: { document, pageIndex, scale, pageRevision, zoomRevision in
+                        model.updateViewState(
+                            document: document,
+                            pageIndex: pageIndex,
+                            scale: scale,
+                            pageNavigationRevision: pageRevision,
+                            zoomCommandRevision: zoomRevision
+                        )
+                    },
                     onManualMagnification: { model.setAutoScaling(false) },
                     selectedMarkup: model.selectedMarkup,
                     noteMarkers: model.noteMarkers,

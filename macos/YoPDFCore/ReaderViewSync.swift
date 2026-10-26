@@ -23,36 +23,71 @@ public enum ReaderViewSync {
     }
 }
 
-/// Keeps PDFView's native gesture state separate from explicit zoom commands.
-/// A document replacement always reapplies the model's current zoom state;
-/// ordinary SwiftUI refreshes only apply when the user issued a new command.
+/// Applies explicit reader commands without replaying state mirrored from native
+/// scrolling or magnification. A document replacement restores the viewport in
+/// the replacement's page objects, while intermediate PDFKit notifications are
+/// excluded from model feedback by `isApplyingUpdate`.
 @MainActor
-public final class PDFViewZoomSynchronizer {
+public final class PDFViewStateSynchronizer {
 
     private var lastAppliedZoomCommandRevision: Int?
+    private var lastAppliedPageNavigationRevision: Int?
+    public private(set) var isApplyingUpdate = false
 
     public init() {}
 
     public func update(
         pdfView: PDFView,
         document: PDFDocument?,
+        currentPageIndex: Int,
+        pageNavigationRevision: Int,
         autoScales: Bool,
         zoomScale: CGFloat,
         zoomCommandRevision: Int
     ) {
         let documentChanged = pdfView.document !== document
+        let pageCommandChanged = lastAppliedPageNavigationRevision != pageNavigationRevision
+        let zoomCommandChanged = lastAppliedZoomCommandRevision != zoomCommandRevision
+
+        // The same PDFView survives Save / Save As. Capture its page-space
+        // viewport before assignment resets PDFKit to the beginning. A pending
+        // navigation command takes precedence over that previous viewport.
+        let previousDestination = documentChanged && !pageCommandChanged
+            ? pdfView.currentDestination : nil
+        let previousPageIndex = previousDestination?.page.flatMap { page in
+            pdfView.document?.index(for: page)
+        }
+
+        isApplyingUpdate = true
+        defer { isApplyingUpdate = false }
+
         if documentChanged {
             pdfView.document = document
         }
 
-        guard documentChanged || lastAppliedZoomCommandRevision != zoomCommandRevision else {
-            return
-        }
-
-        pdfView.autoScales = autoScales
-        if !autoScales {
-            pdfView.scaleFactor = zoomScale
+        if documentChanged || zoomCommandChanged {
+            pdfView.autoScales = autoScales
+            if !autoScales {
+                pdfView.scaleFactor = zoomScale
+            }
         }
         lastAppliedZoomCommandRevision = zoomCommandRevision
+        lastAppliedPageNavigationRevision = pageNavigationRevision
+
+        guard documentChanged || pageCommandChanged,
+              let document,
+              let index = ReaderViewSync.clampedPageIndex(currentPageIndex, pageCount: document.pageCount),
+              let page = document.page(at: index)
+        else { return }
+
+        if let previousDestination, let previousPageIndex,
+           previousPageIndex >= 0, previousPageIndex < document.pageCount,
+           let previousPage = document.page(at: previousPageIndex) {
+            let destination = PDFDestination(page: previousPage, at: previousDestination.point)
+            destination.zoom = kPDFDestinationUnspecifiedValue
+            pdfView.go(to: destination)
+        } else {
+            pdfView.go(to: page)
+        }
     }
 }
