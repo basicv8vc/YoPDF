@@ -49,9 +49,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
         let urls = filenames.map { URL(fileURLWithPath: $0) }
         fileOpenRequests.recordOpenCallback("AppKit.openFiles", urls: urls)
-        // YoPDF currently has one document per reader window, but no app-level
-        // multi-window routing for a batch of Finder documents. Refuse a batch
-        // instead of silently replacing one PDF with another.
+        // Finder can deliver several files in one callback. The reader routes
+        // one request at a time, so refuse a batch instead of silently opening
+        // only one of its PDFs.
         guard filenames.count == 1, let filename = filenames.first else {
             sender.reply(toOpenOrPrint: .failure)
             return

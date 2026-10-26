@@ -56,11 +56,16 @@ final class FinderOpenUITests: XCTestCase {
         try clear(callbackTrace)
         try await open([second], with: applicationURL, callbackTrace: callbackTrace)
         XCTAssertTrue(app.staticTexts[second.lastPathComponent].waitForExistence(timeout: 10))
-        XCTAssertEqual(app.windows.count, 1, "A warm file open should reuse the reader.")
+        XCTAssertTrue(app.staticTexts[first.lastPathComponent].exists,
+                      "Opening another PDF must leave the first reader open.")
+        XCTAssertEqual(app.windows.count, 2, "A warm file open should create a second reader.")
         let warmCallbacks = try await callbacksAfterSettling(in: callbackTrace)
         XCTAssertEqual(warmCallbacks.count, 1, "Warm open must not be delivered twice.")
         XCTAssertEqual(warmCallbacks.first?.paths, [second.path])
 
+        app.typeKey("w", modifierFlags: .command)
+        XCTAssertEqual(app.windows.count, 1, "Closing the new reader must leave the first reader open.")
+        XCTAssertTrue(app.staticTexts[first.lastPathComponent].exists)
         app.typeKey("w", modifierFlags: .command)
         XCTAssertTrue(app.windows.firstMatch.waitForNonExistence(timeout: 5))
         try clear(callbackTrace)

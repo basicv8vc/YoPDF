@@ -3,11 +3,16 @@ import Foundation
 
 /// Keeps the app's Finder-open policy to one request at a time.
 ///
-/// The slot stays occupied after the reader takes the URL, until it finishes
-/// opening it or the user resolves/cancels the unsaved-work prompt. This avoids
-/// both stranded URLs and replacing the action underneath a visible prompt.
+/// The slot stays occupied after the reader takes the URL until it opens the
+/// file itself or hands it to a dedicated reader window. This avoids stranded
+/// URLs and duplicate delivery while the new scene is being created.
 @MainActor
 final class FileOpenRequestQueue: ObservableObject {
+
+    struct ReaderWindowRequest {
+        let url: URL
+        let relinkingRecentDocumentID: UUID?
+    }
 
     struct Request: Equatable, Identifiable {
         let id: UUID
@@ -23,6 +28,9 @@ final class FileOpenRequestQueue: ObservableObject {
     /// different reader's close or a stale completion mutate it.
     private var inFlightRequest: Request?
     private var readerWindowOpener: (@MainActor () -> Void)?
+    /// WindowGroup values use UUIDs so the actual file URL stays in-process.
+    /// This preserves security-scoped URL state across scene creation.
+    private var readerWindowRequests: [UUID: ReaderWindowRequest] = [:]
     private(set) var hasHadReaderWindow = false
 
     /// A Finder event need not make a reader key. Ignore non-reader windows
@@ -94,6 +102,22 @@ final class FileOpenRequestQueue: ObservableObject {
 
     func openReaderWindowIfAvailable() {
         readerWindowOpener?()
+    }
+
+    func enqueueReaderWindowRequest(
+        url: URL,
+        relinkingRecentDocumentID: UUID? = nil
+    ) -> UUID {
+        let id = UUID()
+        readerWindowRequests[id] = ReaderWindowRequest(
+            url: url,
+            relinkingRecentDocumentID: relinkingRecentDocumentID
+        )
+        return id
+    }
+
+    func takeReaderWindowRequest(id: UUID) -> ReaderWindowRequest? {
+        readerWindowRequests.removeValue(forKey: id)
     }
 
     /// Debug UI tests use this trace to confirm how LaunchServices routes each

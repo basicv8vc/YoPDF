@@ -9,8 +9,9 @@ struct YoPDFApp: App {
     @StateObject private var recentDocuments = RecentDocumentsStore.shared
 
     var body: some Scene {
-        WindowGroup(id: "reader") {
+        WindowGroup(id: "reader", for: UUID.self) { $readerWindowRequestID in
             ReaderWindow(
+                readerWindowRequestID: $readerWindowRequestID,
                 updateController: updateController,
                 recentDocuments: recentDocuments,
                 fileOpenRequests: appDelegate.fileOpenRequests
@@ -38,21 +39,24 @@ struct YoPDFApp: App {
 /// security-scoped access.
 ///
 /// Finder's AppKit open-file callbacks enqueue URLs before or after this window
-/// exists. `PDFReaderView` consumes them when this window is key and routes them
-/// through its normal unsaved-work prompt.
+/// exists. A reader with no PDF consumes the request itself; an already-loaded
+/// reader opens it in a separate scene so both documents remain available.
 private struct ReaderWindow: View {
 
     @Environment(\.openWindow) private var openWindow
+    @Binding var readerWindowRequestID: UUID?
     @ObservedObject var updateController: SparkleUpdateController
     @ObservedObject var recentDocuments: RecentDocumentsStore
     let fileOpenRequests: FileOpenRequestQueue
     @StateObject private var model: PDFDocumentModel
 
     init(
+        readerWindowRequestID: Binding<UUID?>,
         updateController: SparkleUpdateController,
         recentDocuments: RecentDocumentsStore,
         fileOpenRequests: FileOpenRequestQueue
     ) {
+        _readerWindowRequestID = readerWindowRequestID
         self.updateController = updateController
         self.recentDocuments = recentDocuments
         self.fileOpenRequests = fileOpenRequests
@@ -65,8 +69,31 @@ private struct ReaderWindow: View {
             model: model,
             updateController: updateController,
             recentDocuments: recentDocuments,
-            fileOpenRequests: fileOpenRequests
+            fileOpenRequests: fileOpenRequests,
+            openReaderWindow: { url, relinkingRecentDocumentID in
+                let requestID = fileOpenRequests.enqueueReaderWindowRequest(
+                    url: url,
+                    relinkingRecentDocumentID: relinkingRecentDocumentID
+                )
+                openWindowAction(value: requestID)
+            }
         )
+        .task(id: readerWindowRequestID) {
+            guard let readerWindowRequestID,
+                  let request = fileOpenRequests.takeReaderWindowRequest(
+                    id: readerWindowRequestID
+                  )
+            else { return }
+
+            let relinkingRecentDocument = request.relinkingRecentDocumentID.flatMap { id in
+                recentDocuments.items.first(where: { $0.id == id })
+            }
+            if let relinkingRecentDocument {
+                _ = model.open(url: request.url, relinking: relinkingRecentDocument)
+            } else {
+                _ = model.open(url: request.url)
+            }
+        }
         .onAppear {
             fileOpenRequests.registerReaderWindowOpener {
                 openWindowAction(id: "reader")

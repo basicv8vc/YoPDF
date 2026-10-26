@@ -51,14 +51,21 @@ The File menu's **Open Recent** list and the empty reader window make the last
 and the last page and zoom mode. This is a small preference value, not a
 document database or managed library.
 
+Each reader window owns one PDF. When the current window already has a PDF,
+opening a different one from the File menu, Open Recent, the file picker, drag
+and drop, or Finder creates another reader window and leaves the current PDF
+open. An empty reader window can be reused for its first PDF. Closing a reader
+still uses that window's normal unsaved-work prompts.
+
 Opening a recent item resolves its bookmark and then uses the normal
 `DocumentStore` path, which acquires and holds the security scope for the open
 window. Stale bookmarks are refreshed after that session has acquired access.
 The reader saves the current page and either Fit mode or the manual zoom factor
 as navigation changes. Reopened page indices are clamped to the PDF's current
-page count; Fit is recalculated for the current window size. Recent items still
-go through the usual unsaved-document and note-draft prompts. YoPDF does not
-automatically reopen every window at launch.
+page count; Fit is recalculated for the current window size. Opening a recent
+PDF from a reader that already has a document leaves that window's annotations
+and note draft in place. YoPDF does not automatically reopen every window at
+launch.
 
 If macOS can no longer resolve a saved bookmark, YoPDF keeps the recent entry
 and offers **Relink…**. Choosing the moved PDF validates and opens it before
@@ -350,20 +357,22 @@ note. ⌘S and the Save button remain available for an immediate save.
   as "uncertain" with the recovery files listed, and only a write that did not
   happen is reported as a failure.
 - The toolbar, Open panel, drag and drop, and Finder's AppKit callbacks all
-  funnel through `PDFReaderView.requestOpen`, which is where the unsaved-changes
-  prompt lives. AppKit is the single Finder file-open entry point; this avoids
-  routing one LaunchServices action through both AppKit and SwiftUI. Finder has
-  one request slot; it stays occupied until the chosen reader handles the URL
-  and any unsaved-work prompt is resolved. A second event is refused instead
-  of being left in a queue to open unexpectedly later. If a reader closes
+  funnel through `PDFReaderView.requestOpen`. If the current reader already has
+  a PDF, this hands the URL to a separate `WindowGroup` scene; the original
+  document and any note draft remain in their window. AppKit is the single
+  Finder file-open entry point; this avoids routing one LaunchServices action
+  through both AppKit and SwiftUI. Finder has one request slot; it stays
+  occupied until the reader handles the URL or hands it to its new scene. A
+  second event is refused instead of being left in a queue to open unexpectedly
+  later. If a reader closes
   before finishing its request, only that request's owner can restore the URL
   to the slot; another reader can take it, or a new reader scene is opened when
   the closed window was the last reader. Request IDs and reader IDs also prevent
   a stale window from finishing a request after it has moved to another reader.
   `WindowGroup` permits external events to create a reader on cold
   launch, and existing readers prefer subsequent events. An AppKit request
-  containing multiple files is refused because the app does not yet route each
-  file to a separate window.
+  containing multiple files is still refused because the Finder request queue
+  admits one URL per event.
   The recipient is the key reader, then the main reader, then the frontmost
   available reader. A recreated window is brought forward before opening the
   PDF; it does not have to become key first to take the queued request.

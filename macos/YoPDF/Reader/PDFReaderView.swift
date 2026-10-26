@@ -21,6 +21,7 @@ struct PDFReaderView: View {
     @ObservedObject var updateController: SparkleUpdateController
     @ObservedObject var recentDocuments: RecentDocumentsStore
     @ObservedObject var fileOpenRequests: FileOpenRequestQueue
+    let openReaderWindow: @MainActor (URL, UUID?) -> Void
 
     @State private var isImporterPresented = false
     @State private var recentDocumentsHeadingWidth = RecentDocumentsHeadingWidthPreferenceKey.defaultValue
@@ -370,7 +371,8 @@ struct PDFReaderView: View {
         NSApp.activate(ignoringOtherApps: true)
 
         finderOpenRequestID = request.id
-        finderOpenRequestAwaitingResolution = promptKind(for: .open(request.url)) != .none
+        finderOpenRequestAwaitingResolution = !model.isLoaded
+            && promptKind(for: .open(request.url)) != .none
         requestOpen(request.url)
         if !finderOpenRequestAwaitingResolution {
             finishFinderOpenRequest(requestID: request.id)
@@ -1090,12 +1092,15 @@ struct PDFReaderView: View {
 
     // MARK: - Opening
 
-    /// The single entry point for opening a document.
-    ///
-    /// Everything that can open a file goes through here so that neither a
-    /// document with unsaved edits nor a note that is still only in the composer
-    /// is replaced without the user choosing what happens to it.
+    /// The single entry point for opening a document. An already-loaded reader
+    /// keeps its document and sends the new PDF to its own window. An empty
+    /// reader can use its existing window directly.
     private func requestOpen(_ url: URL, relinking item: RecentDocument? = nil) {
+        if model.isLoaded {
+            openReaderWindow(url, item?.id)
+            return
+        }
+
         let action: PendingAction = item.map { .relink(url, $0) } ?? .open(url)
         switch promptKind(for: action) {
         case .none:
