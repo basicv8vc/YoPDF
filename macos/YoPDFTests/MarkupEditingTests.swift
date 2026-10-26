@@ -854,7 +854,7 @@ final class MarkupEditingTests: XCTestCase {
         XCTAssertEqual(action.url?.absoluteString, "https://example.com/yopdf")
     }
 
-    func testSuccessfulSaveClearsUndoAndSelectionWithoutTouchingTheNewDocument() throws {
+    func testSuccessfulSaveKeepsUndoAndSelectionWithLiveDocument() throws {
         let url = try makeFixture(pageCount: 1, linesPerPage: 3)
         let model = makeModel()
         XCTAssertTrue(model.open(url: url))
@@ -871,16 +871,15 @@ final class MarkupEditingTests: XCTestCase {
         XCTAssertEqual(model.save(), .saved)
 
         XCTAssertFalse(model.hasUnsavedChanges)
-        XCTAssertFalse(model.canUndoMarkup)
+        XCTAssertTrue(model.canUndoMarkup, "an in-place save keeps the undo history")
         XCTAssertFalse(model.canRedoMarkup)
-        XCTAssertNil(model.selectedMarkup)
-        XCTAssertFalse(model.undoMarkup(), "the saved document has no history to replay")
-        XCTAssertFalse(model.document === documentBeforeSave)
+        XCTAssertNotNil(model.selectedMarkup)
+        XCTAssertTrue(model.document === documentBeforeSave)
         XCTAssertEqual(model.document?.page(at: 0)?.annotations.filter(\.isMarkup).count, 1)
         XCTAssertEqual(PDFDocument(url: url)?.page(at: 0)?.annotations.filter(\.isMarkup).count, 1)
 
         // The persisted /QuadPoints are relative to the annotation in the file
-        // too, so hit-testing must still find the mark after the reload.
+        // too, so hit-testing must still find the mark after the save.
         let reloaded = try firstMarkup(on: 0, in: model)
         try selectMarkup(reloaded, in: model)
         XCTAssertEqual(model.selectedMarkup?.kind, .highlight)

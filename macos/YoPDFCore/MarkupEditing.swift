@@ -7,8 +7,8 @@ import PDFKit
 /// entry can be validated against whatever document is currently loaded. It is
 /// cleared whenever the document is replaced: an annotation object belongs to
 /// the `PDFDocument` that created it, and replaying an edit after a document
-/// reload would otherwise mutate an old in-memory document. Auto-save keeps the
-/// live document loaded, so it can retain this history.
+/// reload would otherwise mutate an old in-memory document. In-place saves
+/// keep the live document loaded, so they can retain this history.
 enum MarkupEditChange {
     case insert(annotation: PDFAnnotation, pageIndex: Int)
     case remove(annotation: PDFAnnotation, pageIndex: Int)

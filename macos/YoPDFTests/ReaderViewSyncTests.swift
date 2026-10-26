@@ -1,8 +1,8 @@
 import XCTest
 @testable import YoPDFCore
 
-/// Covers the pure decisions the `PDFView` bridge applies. The bridge itself
-/// still needs a window server, so the AppKit calls are not exercised here.
+/// Covers the pure decisions the `PDFView` bridge applies. Native viewport
+/// synchronization is exercised in PDFViewStateSynchronizerTests.
 final class ReaderViewSyncTests: XCTestCase {
 
     func testClampedPageIndexReturnsNilForEmptyDocument() {

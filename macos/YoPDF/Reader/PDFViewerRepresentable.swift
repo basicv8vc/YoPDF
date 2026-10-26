@@ -33,9 +33,11 @@ struct PDFViewerRepresentable: NSViewRepresentable {
     let autoScales: Bool
     let zoomScale: CGFloat
     let zoomCommandRevision: Int
+    let pageNavigationRevision: Int
     let navigationDestination: PDFDestination?
     let navigationRevision: Int
     let onScaleChange: (CGFloat) -> Void
+    let onSettledViewState: (PDFDocument?, Int?, CGFloat, Int, Int) -> Void
     let onManualMagnification: () -> Void
     let selectedMarkup: MarkupSelection?
     let noteMarkers: [NoteMarker]
@@ -62,6 +64,8 @@ struct PDFViewerRepresentable: NSViewRepresentable {
 
     func makeNSView(context: Context) -> MarkupPDFView {
         let view = MarkupPDFView(frame: .zero)
+        view.minScaleFactor = PDFDocumentModel.minimumZoomScale
+        view.maxScaleFactor = PDFDocumentModel.maximumZoomScale
         view.autoScales = autoScales
         if !autoScales {
             view.scaleFactor = zoomScale
@@ -93,17 +97,19 @@ struct PDFViewerRepresentable: NSViewRepresentable {
             context.coordinator.lastSearchResultsRevision = -1
         }
 
-        // Apply after document assignment. Replacements (including Save and
-        // Save As) must restore the model's current Fit/manual zoom state.
-        // Ordinary scale notifications still avoid writing back into PDFKit's
-        // active native gesture.
-        context.coordinator.zoomSynchronizer.update(
+        // Restore replacements as one transaction. Native gesture feedback is
+        // never interpreted as a page or zoom command on an ordinary refresh.
+        context.coordinator.stateSynchronizer.update(
             pdfView: view,
             document: document,
+            currentPageIndex: currentPageIndex,
+            pageNavigationRevision: pageNavigationRevision,
             autoScales: autoScales,
             zoomScale: zoomScale,
             zoomCommandRevision: zoomCommandRevision
         )
+
+        context.coordinator.reportSettledViewState(on: view)
 
         // The model cleared the selection: the markup consumed it, or a new
         // document replaced it. PDFView keeps drawing its own selection until
@@ -139,12 +145,7 @@ struct PDFViewerRepresentable: NSViewRepresentable {
             view.documentView?.needsDisplay = true
         }
 
-        guard let document,
-              let clamped = ReaderViewSync.clampedPageIndex(currentPageIndex, pageCount: document.pageCount)
-        else { return }
-        if let target = document.page(at: clamped), view.currentPage !== target {
-            view.go(to: target)
-        }
+        guard let document else { return }
 
         if context.coordinator.lastNavigationRevision != navigationRevision {
             context.coordinator.lastNavigationRevision = navigationRevision
@@ -163,6 +164,10 @@ struct PDFViewerRepresentable: NSViewRepresentable {
         }
     }
 
+    static func dismantleNSView(_ view: MarkupPDFView, coordinator: Coordinator) {
+        view.magnificationController.detach()
+    }
+
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
     }
@@ -173,7 +178,7 @@ struct PDFViewerRepresentable: NSViewRepresentable {
         var lastAnnotationRevision = -1
         var lastNavigationRevision = -1
         var lastSearchResultsRevision = -1
-        let zoomSynchronizer = PDFViewZoomSynchronizer()
+        let stateSynchronizer = PDFViewStateSynchronizer()
         private weak var pdfView: MarkupPDFView?
 
         init(parent: PDFViewerRepresentable) {
@@ -223,30 +228,63 @@ struct PDFViewerRepresentable: NSViewRepresentable {
             view.onCancelPlacement = { [weak self] in
                 self?.parent.onCancelPlacement()
             }
-            view.onManualMagnification = { [weak self] in
-                self?.parent.onManualMagnification()
+            view.magnificationController.onScaleChanged = { [weak self] scale in
+                guard let self else { return }
+                self.parent.onScaleChange(scale)
+                self.parent.onManualMagnification()
             }
             view.makeMenuItems = { [weak self] context in
                 self?.parent.makeMenuItems(context) ?? []
             }
         }
 
+        /// Mirror the settled viewport after SwiftUI's update. The model also
+        /// validates command revisions so a queued report cannot overwrite a
+        /// newer navigation or zoom command.
+        func reportSettledViewState(on view: MarkupPDFView) {
+            let pageRevision = parent.pageNavigationRevision
+            let zoomRevision = parent.zoomCommandRevision
+            DispatchQueue.main.async { [weak self, weak view] in
+                guard let self, let view,
+                      !self.stateSynchronizer.isApplyingUpdate,
+                      view.document === self.parent.document
+                else { return }
+                let pageIndex = view.currentPage.flatMap { page in
+                    view.document?.index(for: page)
+                }
+                self.parent.onSettledViewState(
+                    view.document, pageIndex, view.scaleFactor, pageRevision, zoomRevision
+                )
+            }
+        }
+
         @objc private func pageDidChange(_ notification: Notification) {
-            guard let view = pdfView, let page = view.currentPage, let document = view.document else {
+            guard !stateSynchronizer.isApplyingUpdate,
+                  let view = pdfView, view.document === parent.document,
+                  let page = view.currentPage, let document = view.document else {
                 return
             }
             let index = document.index(for: page)
-            guard index >= 0, index != parent.currentPageIndex else { return }
+            guard index >= 0, index < document.pageCount, index != parent.currentPageIndex else { return }
             parent.currentPageIndex = index
         }
 
         @objc private func scaleDidChange(_ notification: Notification) {
-            guard let view = pdfView else { return }
+            guard !stateSynchronizer.isApplyingUpdate,
+                  let view = pdfView, view.document === parent.document else { return }
             parent.onScaleChange(view.scaleFactor)
+            // PDFKit can handle magnification in an internal child view, so
+            // magnify(with:) is not the only path out of Fit mode. Preserve the
+            // native manual scale in the model before a later Save As or open
+            // replaces the document.
+            if !view.autoScales {
+                parent.onManualMagnification()
+            }
         }
 
         @objc private func selectionDidChange(_ notification: Notification) {
-            guard let view = pdfView else { return }
+            guard !stateSynchronizer.isApplyingUpdate,
+                  let view = pdfView, view.document === parent.document else { return }
             let current = view.currentSelection
             guard current !== parent.selection else { return }
             parent.selection = current
@@ -321,7 +359,7 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
     var onNoteMoved: ((NoteSelection, CGPoint) -> Void)?
     var onPlaceNote: ((CGPoint, PDFPage, CGRect) -> Void)?
     var onCancelPlacement: (() -> Void)?
-    var onManualMagnification: (() -> Void)?
+    let magnificationController = PDFViewMagnificationController()
     var makeMenuItems: ((PageMenuContext) -> [NSMenuItem])?
 
     private var mouseDownPoint: CGPoint?
@@ -375,14 +413,13 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
         }
     }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        magnificationController.attach(to: self)
+    }
+
     override func magnify(with event: NSEvent) {
-        if autoScales {
-            // Keep the fitted scale as the starting point for manual zoom, then
-            // let PDFKit apply the trackpad gesture with auto-scaling disabled.
-            onManualMagnification?()
-            autoScales = false
-        }
-        super.magnify(with: event)
+        magnificationController.magnify(with: event, in: self)
     }
 
     override func mouseDown(with event: NSEvent) {

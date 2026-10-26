@@ -313,12 +313,15 @@ note. ⌘S and the Save button remain available for an immediate save.
   session can confirm the bytes it wrote, the save is a normal success; if it
   cannot, the edits stay marked unsaved and the user is told the result is
   unconfirmed.
-- After a successful manual write the document is re-opened from the file. The
-  replacement gives the file a new inode, so the `PDFDocument` that was
-  memory-mapping the old one no longer describes the file the session owns.
-  Automatic saves also reopen the file to verify it is readable, but keep the
-  live document so Undo and Redo still target the displayed annotations. A
-  manual save preserves the page index, zoom and `PDFView` instance.
+- Both manual and automatic saves re-open the written file only to verify it is
+  readable, and keep the live document so Undo and Redo still target the
+  displayed annotations. Because PDFKit keeps the same page objects, a ⌘S does
+  not rebuild the view or reset the reader. An in-place save preserves the page
+  index, zoom, position within the page and `PDFView` instance. When Save As
+  replaces the document instead, the bridge ignores PDFKit's temporary reset
+  notifications and restores the viewport using the replacement pages. Native
+  scrolling and pinch magnification report state without issuing new navigation
+  commands, so SwiftUI refreshes do not interrupt those gestures.
 - Closing the window, opening another document and quitting all check for unsaved
   edits first and offer Save / Don't Save / Cancel. Opening another document is
   also refused by the model itself (`LoadError.unsavedChanges`), so no caller can
@@ -402,8 +405,8 @@ annotation per page.
   gesture. Every accepted edit bumps `hasUnsavedChanges` and `editRevision`;
   Undo and Redo count as edits too. Automatic saves keep the live
   `PDFDocument`, selected annotation and history, so ⌘Z remains available after
-  each saved checkpoint. A manual save or Save As reload replaces the document
-  and clears that history. Failed, conflicting and uncertain-replacement saves
+  each saved checkpoint. An in-place manual save keeps that history; Save As
+  replaces the document and clears it. Failed, conflicting and uncertain-replacement saves
   leave the history and selection in place.
 - **Permissions are checked at mutation time — including Undo/Redo.** `/F`
   ReadOnly (bit 7) and Locked (bit 8) annotations can be selected and
@@ -491,8 +494,8 @@ database — the saved PDF is the whole document.
 - **Notes share the markup edit pipeline.** `addNote`, `updateNote` and
   `deleteNote` build one `MarkupEdit`, so a body change and a paper change in
   one editing gesture are a single Undo entry, and automatic saves preserve
-  that history exactly as they do for highlights. Manual save reloads the
-  document and rebuilds the markers from the file.
+  that history exactly as they do for highlights. In-place manual save keeps
+  the live annotations and history; Save As rebuilds the markers from the copy.
 - **Permissions are re-read at execution time.** ReadOnly and Locked refuse
   body, colour and deletion; LockedContents refuses only `/Contents`, so the
   tint can still change and the note can still be deleted. The edit pipeline
@@ -700,8 +703,8 @@ System Events / Preview and `qlmanage -t` are all blocked here):
     contents and flags set by another app survive, and the edit is saved through
     the normal `DocumentSession` path. After the automatic save, Undo remains
     available and reverses the last edit; the reverted state is saved as the
-    next automatic checkpoint. A manual save reloads the document and clears
-    Undo history.
+    next automatic checkpoint. An in-place manual save also keeps Undo history;
+    Save As replaces the document and clears it.
 11. Simulate a save conflict (change the file from another app) after recolouring:
     the save is refused, the annotation and the Undo history stay in the window,
     and Save As remains available.

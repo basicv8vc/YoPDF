@@ -188,24 +188,23 @@ extension PDFDocumentModel {
     /// replacement. Nothing here writes to the original path directly: doing so
     /// would bypass the external-change check that makes a save safe.
     ///
-    /// After a successful manual write the document is re-opened from the file.
-    /// That is not cosmetic: the replacement gives the file a new inode, so the
-    /// `PDFDocument` that was memory-mapping the old one no longer describes the
-    /// file the session now owns. Automatic saves verify a reopened copy but
-    /// keep the live document so annotation undo history remains usable.
+    /// Like automatic checkpoints, manual Save keeps the displayed document and
+    /// annotation objects in place. Reopening a separate copy verifies the new
+    /// file without rebuilding PDFKit's page views or clearing Undo history.
     @discardableResult
     public func save() -> SaveOutcome {
         // A manual save supersedes the debounce. If it fails, do not run a
         // second automatic attempt against the same document a moment later.
         cancelPendingAutoSave(cancelInFlightWork: true)
         waitForAutoSaveWork()
-        return save(preservingUndoHistory: false)
+        return save(preservingUndoHistory: true)
     }
 
     private func save(preservingUndoHistory: Bool) -> SaveOutcome {
         guard let document, let session = documentSession else { return .failed(.noDocument) }
         guard hasUnsavedChanges else { return .saved }
-        guard let data = NoteService.dataRepresentationPreservingShuaGroups(in: document) else {
+        guard let snapshot = document.copy() as? PDFDocument,
+              let data = PDFDocumentSaveSerializer.dataRepresentationPreservingShuaGroups(in: snapshot) else {
             return .failed(.serializationFailed)
         }
 
