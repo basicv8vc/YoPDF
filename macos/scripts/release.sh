@@ -114,12 +114,16 @@ LOCAL_TAG_COMMIT="$(git rev-parse --verify --quiet "refs/tags/$TAG^{commit}")" |
   fail "the image was built from ${PROV_COMMIT:0:7} but tag $TAG points at ${LOCAL_TAG_COMMIT:0:7}"
 
 # The remote is what other people actually get; an annotated tag has to be
-# peeled once more to reach its commit.
-REMOTE_TYPE="$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq .object.type 2>/dev/null || true)"
-[[ -n "$REMOTE_TYPE" ]] || fail "tag $TAG does not exist on the remote; push it first"
-REMOTE_SHA="$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq .object.sha)"
+# peeled once more to reach its commit. gh may print API errors on stdout, so
+# the exit status - not the captured text - decides whether the tag exists.
+if ! REMOTE_TYPE="$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq .object.type 2>/dev/null)"; then
+  fail "tag $TAG does not exist on the remote; push it first"
+fi
+REMOTE_SHA="$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq .object.sha 2>/dev/null)" ||
+  fail "cannot read remote tag $TAG"
 if [[ "$REMOTE_TYPE" == "tag" ]]; then
-  REMOTE_SHA="$(gh api "repos/$REPO/git/tags/$REMOTE_SHA" --jq .object.sha)"
+  REMOTE_SHA="$(gh api "repos/$REPO/git/tags/$REMOTE_SHA" --jq .object.sha 2>/dev/null)" ||
+    fail "cannot resolve annotated tag $TAG"
 fi
 [[ "$REMOTE_SHA" == "$PROV_COMMIT" ]] ||
   fail "remote tag $TAG points at ${REMOTE_SHA:0:7}, but the image was built from ${PROV_COMMIT:0:7}"
