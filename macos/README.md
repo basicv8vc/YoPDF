@@ -117,6 +117,61 @@ XcodeGen installed.
 Build products stay under `macos/build/` (git-ignored) so builds are
 reproducible and easy to inspect.
 
+## Distributable DMG
+
+A Developer ID signed, notarized disk image for other Macs is produced by one
+script:
+
+```bash
+cd macos
+SIGN_IDENTITY=<name or SHA-1> ./scripts/package-dmg.sh
+```
+
+It archives a Universal (arm64 + x86_64) Release build, exports it with a
+Developer ID Application certificate and hardened runtime, notarizes and staples
+the app, builds a `UDZO` image with an `Applications` symlink, signs that image,
+notarizes and staples it, then verifies signatures, architecture, version and
+Gatekeeper acceptance (including a quarantined copy extracted from the image).
+
+The version and build number come from `project.yml`; `MARKETING_VERSION`,
+`BUILD_NUMBER`, `SIGN_IDENTITY`, `TEAM_ID`, `ARCHS`, `VOLUME_NAME`, `DMG_NAME`,
+`OUT_DIR`, `DERIVED_DATA`, `SPARKLE_FEED_URL` and `SPARKLE_PUBLIC_ED_KEY` can be
+overridden. The two Sparkle settings are forwarded to Xcode the same way
+`build.sh` forwards them, and the exported `Info.plist` is checked to contain
+them. Notarization needs either `asc auth login` or
+`xcrun notarytool store-credentials <profile>` (`NOTARY_PROFILE`, default
+`AC_PASSWORD`); credentials stay in the keychain. `NOTARIZE=0` stops after
+signing, for a local dry run.
+
+Every image is accompanied by `build-info.txt`, which records the full commit,
+the dirty state, the version, the build number and the image hash at build time.
+
+Artifacts, logs, notarization responses and `SHA256.txt` land in a
+`macos/build/dist-<version>-<build>-<sha>/` directory.
+
+Publishing is a separate step, so only a finished image can reach a Release.
+Create and push the tag first, then:
+
+```bash
+cd macos
+git tag v0.1.0 && git push origin v0.1.0
+./scripts/release.sh v0.1.0 --dry-run                      # verify, print the plan
+./scripts/release.sh v0.1.0 --notes-file release-notes.md  # upload
+```
+
+`release.sh` requires the tag to exist locally and on the remote, pointing at the
+commit recorded in the image's `build-info.txt`. Images built from a dirty tree
+or from another commit are refused. Before uploading it re-verifies the image:
+`hdiutil verify`, code signature, notarization staple, and Gatekeeper acceptance
+of both the image and a quarantined copy of the app extracted from it.
+
+The only uploadable assets are the image named by `build-info.txt` and its
+`SHA256.txt`, whose hash and file name must both match the image. No extra
+assets can be attached, so a build directory, an `.xcarchive`, an
+`ExportOptions.plist` or an Xcode log cannot reach a Release. `--draft`,
+`--replace` (overwrite already published assets), `--yes` and `--dry-run` are
+available; `--notes-file` replaces GitHub's generated notes.
+
 ## Sparkle updates
 
 The macOS app links Sparkle 2.10.0. It checks the configured signed appcast on
@@ -808,9 +863,12 @@ zero non-system libraries.
 
 ## Signing
 
-Ad-hoc (`CODE_SIGN_IDENTITY = "-"`, no hardened runtime) so the project builds
-without a developer team. Developer ID signing + notarization is a later,
-separate task; see `internal/` notes (not published).
+Local builds stay ad-hoc (`CODE_SIGN_IDENTITY = "-"`, no hardened runtime) so
+the project builds without a developer team. A distributable build uses
+`scripts/package-dmg.sh`, which signs with a Developer ID Application identity,
+enables the hardened runtime, and notarizes and staples both the app and the
+disk image. Developer ID and notarization credentials are per-developer and
+never stored in the repository.
 
 ## Scope
 
