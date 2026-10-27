@@ -320,13 +320,6 @@ struct PDFReaderView: View {
 
     private var lifecycleReader: some View {
         urlReader
-            .modifier(ReaderPDFDropDestination(
-                isTargeted: $isDropTargeted,
-                showsPersistentHint: !model.isLoaded
-            ) { url in
-                requestOpen(url)
-                return true
-            })
             .onChange(of: canReceiveFinderOpenRequest) { _, canReceive in
                 fileOpenRequests.setReaderCanReceiveFinderRequests(
                     readerID: closeGuard.readerID,
@@ -514,6 +507,13 @@ struct PDFReaderView: View {
                 Divider()
             }
             content
+                .modifier(ReaderPDFDropDestination(
+                    isTargeted: $isDropTargeted,
+                    showsPersistentHint: !model.isLoaded
+                ) { url in
+                    requestOpen(url)
+                    return true
+                })
         }
     }
 
