@@ -117,6 +117,32 @@ XcodeGen installed.
 Build products stay under `macos/build/` (git-ignored) so builds are
 reproducible and easy to inspect.
 
+## Distributable DMG
+
+A Developer ID signed, notarized disk image for other Macs is produced by one
+script:
+
+```bash
+cd macos
+SIGN_IDENTITY=<name or SHA-1> ./scripts/package-dmg.sh
+```
+
+It archives a Universal (arm64 + x86_64) Release build, exports it with a
+Developer ID Application certificate and hardened runtime, notarizes and staples
+the app, builds a `UDZO` image with an `Applications` symlink, signs that image,
+notarizes and staples it, then verifies signatures, architecture, version and
+Gatekeeper acceptance (including a quarantined copy extracted from the image).
+
+The version and build number come from `project.yml`; `MARKETING_VERSION`,
+`BUILD_NUMBER`, `SIGN_IDENTITY`, `TEAM_ID`, `ARCHS`, `VOLUME_NAME`, `DMG_NAME`,
+`OUT_DIR` and `DERIVED_DATA` can be overridden. Notarization needs either
+`asc auth login` or `xcrun notarytool store-credentials <profile>`
+(`NOTARY_PROFILE`, default `AC_PASSWORD`); credentials stay in the keychain.
+`NOTARIZE=0` stops after signing, for a local dry run.
+
+Artifacts, logs, notarization responses and `SHA256.txt` land in a
+`macos/build/dist-<version>-<build>-<sha>/` directory.
+
 ## Sparkle updates
 
 The macOS app links Sparkle 2.10.0. It checks the configured signed appcast on
@@ -808,9 +834,12 @@ zero non-system libraries.
 
 ## Signing
 
-Ad-hoc (`CODE_SIGN_IDENTITY = "-"`, no hardened runtime) so the project builds
-without a developer team. Developer ID signing + notarization is a later,
-separate task; see `internal/` notes (not published).
+Local builds stay ad-hoc (`CODE_SIGN_IDENTITY = "-"`, no hardened runtime) so
+the project builds without a developer team. A distributable build uses
+`scripts/package-dmg.sh`, which signs with a Developer ID Application identity,
+enables the hardened runtime, and notarizes and staples both the app and the
+disk image. Developer ID and notarization credentials are per-developer and
+never stored in the repository.
 
 ## Scope
 
