@@ -143,6 +143,24 @@ The version and build number come from `project.yml`; `MARKETING_VERSION`,
 Artifacts, logs, notarization responses and `SHA256.txt` land in a
 `macos/build/dist-<version>-<build>-<sha>/` directory.
 
+Publishing is a separate step, so only a finished image can reach a Release.
+Create and push the tag first, then:
+
+```bash
+cd macos
+git tag v0.1.0 && git push origin v0.1.0
+./scripts/release.sh v0.1.0 --dry-run                      # verify, print the plan
+./scripts/release.sh v0.1.0 --notes-file release-notes.md  # upload
+```
+
+`release.sh` requires the tag to exist on the remote and re-verifies the image
+before uploading: `hdiutil verify`, code signature, notarization staple, and
+Gatekeeper acceptance of both the image and a quarantined copy of the app
+extracted from it. It refuses every asset whose name is not `YoPDF-*.dmg` or
+`SHA256.txt`, so a build directory, an `.xcarchive`, `ExportOptions.plist` or an
+Xcode log cannot be attached by accident. `--draft`, `--attach`, `--yes` and
+`--dry-run` are available; `--notes-file` replaces GitHub's generated notes.
+
 ## Sparkle updates
 
 The macOS app links Sparkle 2.10.0. It checks the configured signed appcast on
