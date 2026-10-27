@@ -4,7 +4,10 @@
 # The result is a Universal (arm64 + x86_64) Release build signed with a
 # Developer ID Application certificate and hardened runtime. Both the .app and
 # the .dmg are notarized and stapled, so a copy dragged out of the image also
-# passes Gatekeeper offline.
+# passes Gatekeeper offline. The script also writes build-info.txt next to the
+# image, recording the commit and dirty state used for the build;
+# scripts/release.sh refuses to publish an image whose build-info.txt does not
+# match the release tag.
 #
 # Env:
 #   SIGN_IDENTITY      Developer ID Application identity: full name or SHA-1.
@@ -17,6 +20,8 @@
 #   VOLUME_NAME        Default: YoPDF.
 #   DMG_NAME           Default: YoPDF-<version>-<build>-<sha>-universal.dmg.
 #   DERIVED_DATA       Default: <repo>/macos/build/DerivedData.
+#   SPARKLE_FEED_URL       HTTPS Sparkle appcast URL (optional, forwarded).
+#   SPARKLE_PUBLIC_ED_KEY  Base64 Sparkle EdDSA public key (optional, forwarded).
 #   OUT_DIR            Default: <repo>/macos/build/dist-<version>-<build>-<sha>.
 #   NOTARIZE           1 (default) notarize and staple; 0 only sign and package.
 #   NOTARY_TOOL        auto (default) | asc | notarytool.
@@ -61,9 +66,20 @@ NOTARY_TIMEOUT="${NOTARY_TIMEOUT:-30m}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-AC_PASSWORD}"
 DERIVED_DATA="${DERIVED_DATA:-build/DerivedData}"
 
-GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+SPARKLE_BUILD_SETTINGS=()
+if [[ -n "${SPARKLE_FEED_URL:-}" ]]; then
+  SPARKLE_BUILD_SETTINGS+=("SPARKLE_FEED_URL=$SPARKLE_FEED_URL")
+fi
+if [[ -n "${SPARKLE_PUBLIC_ED_KEY:-}" ]]; then
+  SPARKLE_BUILD_SETTINGS+=("SPARKLE_PUBLIC_ED_KEY=$SPARKLE_PUBLIC_ED_KEY")
+fi
+
+GIT_SHA_FULL="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+GIT_SHA="${GIT_SHA_FULL:0:7}"
+DIRTY=0
 if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
-  note "working tree is dirty; the DMG will not match commit $GIT_SHA"
+  DIRTY=1
+  note "working tree is dirty; this image will record dirty=1 and cannot be published"
 fi
 
 # --- signing identity -------------------------------------------------------
@@ -150,23 +166,27 @@ fi
 
 note "archiving"
 rm -rf "$ARCHIVE" "$EXPORT_DIR"
-xcodebuild archive \
-  -project YoPDF.xcodeproj \
-  -scheme YoPDF \
-  -configuration Release \
-  -destination "generic/platform=macOS" \
-  -archivePath "$ARCHIVE" \
-  -derivedDataPath "$DERIVED_DATA" \
-  "ARCHS=$ARCHS" \
-  ONLY_ACTIVE_ARCH=NO \
-  MARKETING_VERSION="$MARKETING" \
-  CURRENT_PROJECT_VERSION="$BUILD" \
-  CODE_SIGN_STYLE=Manual \
-  "CODE_SIGN_IDENTITY=$IDENTITY_HASH" \
-  DEVELOPMENT_TEAM="$TEAM" \
-  ENABLE_HARDENED_RUNTIME=YES \
-  CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
-  archive >"$OUT_DIR/archive.log" 2>&1 ||
+XCODEBUILD_ARGS=(archive
+  -project YoPDF.xcodeproj
+  -scheme YoPDF
+  -configuration Release
+  -destination "generic/platform=macOS"
+  -archivePath "$ARCHIVE"
+  -derivedDataPath "$DERIVED_DATA"
+  "ARCHS=$ARCHS"
+  ONLY_ACTIVE_ARCH=NO
+  "MARKETING_VERSION=$MARKETING"
+  "CURRENT_PROJECT_VERSION=$BUILD"
+  CODE_SIGN_STYLE=Manual
+  "CODE_SIGN_IDENTITY=$IDENTITY_HASH"
+  "DEVELOPMENT_TEAM=$TEAM"
+  ENABLE_HARDENED_RUNTIME=YES
+  CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO)
+# bash 3.2 treats "${arr[@]}" on an empty array as unbound under `set -u`.
+if [[ ${#SPARKLE_BUILD_SETTINGS[@]} -gt 0 ]]; then
+  XCODEBUILD_ARGS+=("${SPARKLE_BUILD_SETTINGS[@]}")
+fi
+xcodebuild "${XCODEBUILD_ARGS[@]}" >"$OUT_DIR/archive.log" 2>&1 ||
   { tail -40 "$OUT_DIR/archive.log" >&2; fail "archive failed; see $OUT_DIR/archive.log"; }
 
 # --- export with Developer ID ----------------------------------------------
@@ -299,6 +319,17 @@ PLIST_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' 
 [[ "$PLIST_VERSION" == "$MARKETING" ]] ||
   fail "CFBundleShortVersionString is $PLIST_VERSION, expected $MARKETING"
 
+# The release build must carry the Sparkle configuration it was given; an empty
+# value in Info.plist would silently disable update checks.
+PLIST_FEED="$(/usr/libexec/PlistBuddy -c 'Print :SUFeedURL' "$APP/Contents/Info.plist" 2>/dev/null || true)"
+if [[ -n "${SPARKLE_FEED_URL:-}" && "$PLIST_FEED" != "$SPARKLE_FEED_URL" ]]; then
+  fail "SUFeedURL is '$PLIST_FEED', expected '$SPARKLE_FEED_URL'"
+fi
+PLIST_KEY="$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$APP/Contents/Info.plist" 2>/dev/null || true)"
+if [[ -n "${SPARKLE_PUBLIC_ED_KEY:-}" && "$PLIST_KEY" != "$SPARKLE_PUBLIC_ED_KEY" ]]; then
+  fail "SUPublicEDKey does not match SPARKLE_PUBLIC_ED_KEY"
+fi
+
 if [[ "$NOTARIZE" == "1" ]]; then
   xcrun stapler validate "$APP" >/dev/null || fail "the app staple is missing"
   xcrun stapler validate "$DMG" >/dev/null || fail "the disk image staple is missing"
@@ -323,7 +354,22 @@ if [[ "$NOTARIZE" == "1" ]]; then
 fi
 
 ( cd "$OUT_DIR" && shasum -a 256 "$DMG_NAME" | tee SHA256.txt )
+DMG_SHA256="$(cut -d' ' -f1 "$OUT_DIR/SHA256.txt")"
+
+# Provenance travels with the image. release.sh compares it to the release tag
+# and refuses dirty or mismatched builds; the commit here is authoritative, not
+# the short SHA in the file name.
+cat >"$OUT_DIR/build-info.txt" <<INFO
+schema=1
+version=$MARKETING
+build=$BUILD
+commit=$GIT_SHA_FULL
+dirty=$DIRTY
+archs=$ARCHS
+dmg=$DMG_NAME
+dmg-sha256=$DMG_SHA256
+INFO
 
 note "done"
-printf '  app:     %s\n  dmg:     %s\n  sha256:  %s\n  logs:    %s\n' \
-  "$APP" "$DMG" "$(cut -d' ' -f1 "$OUT_DIR/SHA256.txt")" "$OUT_DIR"
+printf '  app:     %s\n  dmg:     %s\n  info:    %s\n  sha256:  %s\n  logs:    %s\n' \
+  "$APP" "$DMG" "$OUT_DIR/build-info.txt" "$DMG_SHA256" "$OUT_DIR"
