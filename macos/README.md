@@ -215,6 +215,16 @@ the built app and sends real keyboard input, so it requires an interactive,
 logged-in macOS desktop session. The UI regression tests use PDFs generated in
 temporary directories and remove them after each test.
 
+## Trackpad zoom
+
+Two-finger pinch magnification is handled by PDFKit's native view hierarchy.
+YoPDF observes the beginning of a gesture only to leave Fit mode; it forwards
+the original magnification events unchanged and does not set `PDFView.scaleFactor`
+or scroll offsets for each gesture delta. This keeps live zoom, pointer anchoring
+and page rendering under PDFKit/AppKit control. The model mirrors PDFKit's scale
+notifications so the resulting manual zoom survives later view refreshes and
+document saves.
+
 ## Layout
 
 ```
