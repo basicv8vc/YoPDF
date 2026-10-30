@@ -228,10 +228,8 @@ struct PDFViewerRepresentable: NSViewRepresentable {
             view.onCancelPlacement = { [weak self] in
                 self?.parent.onCancelPlacement()
             }
-            view.magnificationController.onScaleChanged = { [weak self] scale in
-                guard let self else { return }
-                self.parent.onScaleChange(scale)
-                self.parent.onManualMagnification()
+            view.magnificationController.onManualMagnification = { [weak self] in
+                self?.parent.onManualMagnification()
             }
             view.makeMenuItems = { [weak self] context in
                 self?.parent.makeMenuItems(context) ?? []
@@ -416,10 +414,6 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         magnificationController.attach(to: self)
-    }
-
-    override func magnify(with event: NSEvent) {
-        magnificationController.magnify(with: event, in: self)
     }
 
     override func mouseDown(with event: NSEvent) {
