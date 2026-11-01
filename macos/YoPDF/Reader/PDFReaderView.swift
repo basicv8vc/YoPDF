@@ -671,13 +671,14 @@ struct PDFReaderView: View {
                     beginNote()
                 }
             } label: {
-                Label(
-                    isPlacingNote ? "Cancel Note" : "Add Note",
-                    systemImage: isPlacingNote ? "xmark.circle" : "note.text.badge.plus"
-                )
+                // Icon only: the text moves to the help tag and the spoken
+                // label, which keeps the editing row narrow.
+                Image(systemName: isPlacingNote ? "xmark.circle" : "note.text.badge.plus")
+                    .font(.system(size: 13, weight: .medium))
             }
             .buttonStyle(ReaderInteractiveButtonStyle(isSelected: isPlacingNote))
             .disabled(!model.canCreateNote)
+            .accessibilityLabel(isPlacingNote ? "Cancel Note" : "Add Note")
             .help(
                 isPlacingNote
                     ? "Click a page to place the note, or press Esc to cancel"
@@ -724,9 +725,11 @@ struct PDFReaderView: View {
             Button {
                 requestSave()
             } label: {
-                Label("Save", systemImage: "square.and.arrow.down")
+                Image(systemName: "square.and.arrow.down")
+                    .font(.system(size: 13, weight: .medium))
             }
             .disabled(!model.isLoaded)
+            .accessibilityLabel("Save")
             .help("Save changes (⌘S)")
 
             Spacer(minLength: 8)
