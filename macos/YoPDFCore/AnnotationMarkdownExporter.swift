@@ -33,8 +33,10 @@ public enum AnnotationMarkdownExporter {
         if let kind = MarkupKind(annotation: annotation) {
             var blocks: [String] = []
             if let quote = selectedText(for: annotation, on: page) {
-                if kind == .underline {
-                    blocks.append("**Underline**")
+                // A bare blockquote reads as a highlight; the other kinds are
+                // named so the log records which mark the reader made.
+                if kind != .highlight {
+                    blocks.append("**\(kind.title)**")
                 }
                 blocks.append(blockquote(quote))
             } else {

@@ -267,6 +267,79 @@ final class MarkupEditingTests: XCTestCase {
         XCTAssertTrue(model.hasUnsavedChanges)
     }
 
+    func testStrikeOutUsesStandardSubtypeAndItsOwnDefault() throws {
+        let url = try makeFixture(pageCount: 1, linesPerPage: 3)
+        let model = makeModel()
+        XCTAssertTrue(model.open(url: url))
+        let document = try XCTUnwrap(model.document)
+
+        let selection = try self.selection(in: document, pageIndex: 0, from: 0, to: 8)
+        let summary = try addMarkup(.strikeOut, to: model, selection: selection)
+        XCTAssertEqual(summary.annotationCount, 1)
+        XCTAssertEqual(summary.pageIndices, [0])
+
+        let annotation = try firstMarkup(on: 0, in: model, kind: .strikeOut)
+        XCTAssertEqual(PDFAnnotationTypeName.normalized(annotation.type), "strikeout")
+        XCTAssertEqual(MarkupKind(annotation: annotation), .strikeOut)
+        XCTAssertEqual(hex(annotation.color), "FF3B30")
+        XCTAssertEqual(annotation.quadrilateralPoints?.count, summary.quadCount * 4)
+
+        // Preferences stay per kind: changing Strike Out must not touch the
+        // highlight default.
+        XCTAssertEqual(hex(model.defaultMarkupColor(for: .strikeOut)), "FF3B30")
+        XCTAssertTrue(model.setDefaultMarkupColor(
+            MarkupColorPalette.color(fromHex: "34C759"),
+            for: .strikeOut
+        ))
+        XCTAssertEqual(hex(model.defaultMarkupColor(for: .strikeOut)), "34C759")
+        XCTAssertEqual(hex(model.defaultMarkupColor(for: .highlight)), "FFD60A")
+
+        try addMarkup(
+            .strikeOut,
+            to: model,
+            selection: try self.selection(in: document, pageIndex: 0, from: 10, to: 18)
+        )
+        let strikeOuts = try XCTUnwrap(
+            model.document?.page(at: 0)?.annotations.filter { MarkupKind(annotation: $0) == .strikeOut }
+        )
+        XCTAssertEqual(strikeOuts.count, 2)
+        let newest = try XCTUnwrap(strikeOuts.first { $0 !== annotation })
+        XCTAssertEqual(hex(newest.color), "34C759")
+
+        XCTAssertTrue(model.undoMarkup())
+        XCTAssertEqual(
+            model.document?.page(at: 0)?.annotations.filter { MarkupKind(annotation: $0) == .strikeOut }.count,
+            1
+        )
+    }
+
+    func testStrikeOutConvertsBackToHighlightAndUndoesAsOneEdit() throws {
+        let url = try makeFixture(pageCount: 1, linesPerPage: 3)
+        let model = makeModel()
+        XCTAssertTrue(model.open(url: url))
+        let document = try XCTUnwrap(model.document)
+
+        try addMarkup(
+            .strikeOut,
+            to: model,
+            selection: try selection(in: document, pageIndex: 0, from: 0, to: 8)
+        )
+        let strikeOut = try firstMarkup(on: 0, in: model)
+        let bounds = strikeOut.bounds
+        try selectMarkup(strikeOut, in: model)
+
+        XCTAssertTrue(model.convertSelectedMarkup())
+        let converted = try firstMarkup(on: 0, in: model)
+        XCTAssertEqual(MarkupKind(annotation: converted), .highlight)
+        XCTAssertEqual(converted.bounds, bounds)
+        XCTAssertEqual(hex(converted.color), "FF3B30")
+        XCTAssertEqual(model.selectedMarkup?.kind, .highlight)
+
+        XCTAssertTrue(model.undoMarkup())
+        let restored = try firstMarkup(on: 0, in: model)
+        XCTAssertEqual(MarkupKind(annotation: restored), .strikeOut)
+    }
+
     func testEditingAnAnnotationsColourDoesNotChangeTheNewMarkDefault() throws {
         let url = try makeFixture(pageCount: 1, linesPerPage: 3)
         let model = makeModel()
@@ -1056,7 +1129,7 @@ final class MarkupEditingTests: XCTestCase {
 
 private extension PDFAnnotation {
     var isMarkup: Bool {
-        type?.hasSuffix("Highlight") == true || type?.hasSuffix("Underline") == true
+        MarkupKind(annotation: self) != nil
     }
 
     func isMarkupType(_ name: String) -> Bool {

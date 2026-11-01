@@ -1,19 +1,21 @@
 import AppKit
 import PDFKit
 
-/// The markup annotations YoPDF can create and edit in P2b.
+/// The markup annotations YoPDF can create and edit.
 ///
-/// Both kinds are standard PDF annotations. The enum deliberately excludes
-/// StrikeOut, notes and free text: P2b PR 1 is about the two text markup tools
-/// that already share PDFKit's selection geometry.
+/// All three kinds are standard PDF annotations built from the same PDFKit
+/// selection geometry, so they share one construction, save and undo path.
+/// Notes and free text are separate models, not markup kinds.
 public enum MarkupKind: String, CaseIterable, Hashable, Sendable {
     case highlight
     case underline
+    case strikeOut
 
     public var title: String {
         switch self {
         case .highlight: return "Highlight"
         case .underline: return "Underline"
+        case .strikeOut: return "Strike Out"
         }
     }
 
@@ -25,6 +27,7 @@ public enum MarkupKind: String, CaseIterable, Hashable, Sendable {
         switch self {
         case .highlight: return "highlighter"
         case .underline: return "underline"
+        case .strikeOut: return "strikethrough"
         }
     }
 
@@ -33,6 +36,7 @@ public enum MarkupKind: String, CaseIterable, Hashable, Sendable {
         switch self {
         case .highlight: return .highlight
         case .underline: return .underline
+        case .strikeOut: return .strikeOut
         }
     }
 
@@ -40,23 +44,32 @@ public enum MarkupKind: String, CaseIterable, Hashable, Sendable {
         switch self {
         case .highlight: return MarkupColorPalette.defaultHighlightHex
         case .underline: return MarkupColorPalette.defaultUnderlineHex
+        case .strikeOut: return MarkupColorPalette.defaultStrikeOutHex
         }
     }
 
-    /// The other markup subtype, for the "Convert" action.
+    /// The next kind in the Convert cycle: Highlight → Underline → Strike Out →
+    /// Highlight. Every kind is reachable and reversible, so the single Convert
+    /// control does not need a menu.
     public var converted: MarkupKind {
         switch self {
         case .highlight: return .underline
-        case .underline: return .highlight
+        case .underline: return .strikeOut
+        case .strikeOut: return .highlight
         }
     }
 
     public init?(annotation: PDFAnnotation) {
-        switch annotation.type ?? "" {
-        case "Highlight":
+        // PDFKit may report the subtype with or without a leading slash
+        // depending on where the annotation came from, so compare the
+        // normalized name rather than one spelling.
+        switch PDFAnnotationTypeName.normalized(annotation.type) {
+        case "highlight":
             self = .highlight
-        case "Underline":
+        case "underline":
             self = .underline
+        case "strikeout":
+            self = .strikeOut
         default:
             return nil
         }
@@ -86,6 +99,10 @@ public struct MarkupColorPreset: Identifiable, Hashable, Sendable {
 public enum MarkupColorPalette {
     public static let defaultHighlightHex = "FFD60A"
     public static let defaultUnderlineHex = "007AFF"
+    /// Strike-outs default to opaque system red. The value is a plain sRGB
+    /// literal because PDFKit stores `/C` as RGB only, so the file has to carry
+    /// the colour rather than a dynamic system colour reference.
+    public static let defaultStrikeOutHex = "FF3B30"
 
     public static let presets: [MarkupColorPreset] = [
         MarkupColorPreset(name: "Yellow", hex: "FFD60A"),
@@ -178,7 +195,7 @@ public enum MarkupColorPalette {
     }
 }
 
-/// UserDefaults-backed defaults for the two markup tools.
+/// UserDefaults-backed defaults for the three markup tools.
 ///
 /// The keys are YoPDF's own and nothing else's preference namespace is read or
 /// written. Importing another app's defaults would make its private storage a
@@ -186,6 +203,7 @@ public enum MarkupColorPalette {
 public struct MarkupColorPreferences {
     public static let highlightColorKey = "dev.yopdf.markup.highlightColorHex"
     public static let underlineColorKey = "dev.yopdf.markup.underlineColorHex"
+    public static let strikeOutColorKey = "dev.yopdf.markup.strikeOutColorHex"
 
     private let defaults: UserDefaults
 
@@ -197,6 +215,7 @@ public struct MarkupColorPreferences {
         switch kind {
         case .highlight: return highlightColorKey
         case .underline: return underlineColorKey
+        case .strikeOut: return strikeOutColorKey
         }
     }
 

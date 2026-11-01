@@ -13,9 +13,10 @@ with `/QuadPoints`, so other readers see it as their own. Editing introduced a
 minimal dirty state and a manual Save; committed annotation edits now auto-save
 after a short quiet period.
 
-P2b extends that to editable **Highlight** and **Underline** annotations:
-six presets plus a custom `ColorPicker`, click selection, recolouring, deletion,
-conversion between the two subtypes, a context menu, and model-owned Undo/Redo.
+P2b extends that to editable **Highlight**, **Underline** and **Strike Out**
+annotations: six presets plus a custom `ColorPicker`, click selection,
+recolouring, deletion, conversion between the three subtypes, a context menu,
+and model-owned Undo/Redo.
 
 P2c adds **notes**: a compact SwiftUI composer writes a standard PDF `/Text`
 annotation, either about the selected text or at a point the user clicks on the
@@ -85,11 +86,11 @@ search covers text extractable by PDFKit; image-only scans require OCR and are
 not included. Search uses PDFKit and does not require network access.
 
 The File menu's **Export Annotations as Markdown…** writes a local `.md` reading
-log grouped by page. It includes Highlight and Underline text, Note excerpts and
-bodies, and comments attached to markup annotations. Plain annotation text is
-escaped as Markdown text; unsupported annotation types are omitted. Markups
-whose text cannot be extracted remain visible with a placeholder. Exporting
-does not modify the PDF.
+log grouped by page. It includes Highlight, Underline and Strike Out text, Note
+excerpts and bodies, and comments attached to markup annotations. Plain
+annotation text is escaped as Markdown text; unsupported annotation types are
+omitted. Markups whose text cannot be extracted remain visible with a
+placeholder. Exporting does not modify the PDF.
 
 ## Requirements
 
@@ -236,7 +237,7 @@ macos/
 │   ├── DocumentStoreIO.swift   # filesystem seam + POSIX implementation
 │   ├── DocumentStoreError.swift
 │   ├── DocumentVersion.swift   # identity, version, external-change types
-│   ├── HighlightService.swift  # selection → /Highlight or /Underline
+│   ├── HighlightService.swift  # selection → /Highlight, /Underline, /StrikeOut
 │   ├── MarkupAnnotation.swift  # kinds, palette, preferences, permissions, quads
 │   ├── MarkupEditing.swift     # model-owned add/edit/delete/convert/undo
 │   ├── NoteAnnotation.swift    # /Text notes, style keys, anchors, markers
@@ -451,18 +452,30 @@ note. ⌘S and the Save button remain available for an immediate save.
 
 ### Markup editing (P2b)
 
-Highlight and Underline share one construction path. Both are standard PDF
-annotations with `/QuadPoints`; a selection that spans pages is still one
-annotation per page.
+Highlight, Underline and Strike Out share one construction path. All three are
+standard PDF annotations with `/QuadPoints`; a selection that spans pages is
+still one annotation per page.
 
-- **Defaults are independent.** New highlights use `#FFD60A` and new underlines
-  use `#007AFF`. The values live in YoPDF's own `UserDefaults` keys,
-  `dev.yopdf.markup.highlightColorHex` and
-  `dev.yopdf.markup.underlineColorHex`. Choosing a colour for an existing
-  annotation is a document edit and never rewrites either default.
+- **Defaults are independent.** New highlights use `#FFD60A`, new underlines use
+  `#007AFF` and new strike-outs use `#FF3B30` (opaque system red). The values
+  live in YoPDF's own `UserDefaults` keys,
+  `dev.yopdf.markup.highlightColorHex`,
+  `dev.yopdf.markup.underlineColorHex` and
+  `dev.yopdf.markup.strikeOutColorHex`. Choosing a colour for an existing
+  annotation is a document edit and never rewrites any default.
+- **Convert cycles through the three kinds.** Highlight → Underline → Strike Out
+  → Highlight, so one Convert control reaches every kind and Undo restores the
+  previous subtype in a single step.
+- **The toolbar mirrors ShuaMac's editing group.** Highlight, Underline and
+  Strike Out share one rounded group with icon-only tools, 12 pt colour swatches
+  and disclosure chevrons. Strike Out has no swatch because its default is the
+  fixed `#FF3B30` red. The colour popover lists the six presets as a 3×2 grid of
+  labelled circles with the current colour checked, followed by the custom
+  picker and Cancel/Apply.
 - **Six presets and a custom colour.** The presets are `FFD60A`, `34C759`,
   `007AFF`, `FF2D55`, `AF52DE` and `FF9500`. The custom path uses SwiftUI's
-  `ColorPicker` with opacity disabled. PDFKit writes `/C` as RGB and a
+  `ColorPicker` with opacity disabled and is committed by Apply; Cancel leaves
+  the annotation and the default untouched. PDFKit writes `/C` as RGB and a
   save/reopen round trip discards alpha, so YoPDF stores an opaque colour;
   a fully transparent choice is rejected instead of becoming invisible.
 - **Click selection uses the painted quads.** `MarkupGeometry.contains` tests
@@ -659,7 +672,7 @@ database — the saved PDF is the whole document.
 
 Known P2a/P2b limitations:
 
-- No StrikeOut, free-text or ink annotation editing, and no annotation search.
+- No free-text or ink annotation editing, and no annotation search.
   The sidebar indexes standard PDF annotations for navigation. YoPDF-created
   notes still store one body per annotation.
   Imported ShuaMac groups show their count and all bodies, but YoPDF currently
@@ -756,8 +769,10 @@ System Events / Preview and `qlmanage -t` are all blocked here):
 4. Highlight, then open a corrupt PDF and choose "Don't Save": the corrupt file
    fails to open, and the original document is still there, still marked edited,
    still holding its highlight.
-5. Select text with the mouse and click the Highlight toolbar button: moving
-   focus to the button must not drop the selection before it is applied.
+5. Select text with the mouse and click the Highlight tool in the markup group:
+   moving focus to the button must not drop the selection before it is applied.
+   The group shows Highlight and Underline with a colour swatch and chevron plus
+   Strike Out; the help tag names each tool.
 6. Click a highlight on the page: its painted quads get the accent outline, the
    editing controls appear in the toolbar, and a single Undo reverses the last
    add/recolour/delete/convert. Clicking the empty space inside a multi-line
@@ -770,15 +785,18 @@ System Events / Preview and `qlmanage -t` are all blocked here):
 8. Change the Highlight and Underline swatches to different presets, quit and
    reopen the app: each tool keeps its own default. Recolouring an existing mark
    must not change either swatch.
-9. Open the custom colour popover and drag through the spectrum: the annotation
-   follows, one Undo returns the original colour, and the saved PDF reopens with
-   the final colour.
-10. Convert a highlight to an underline, undo, redo, delete and undo: the
-    contents and flags set by another app survive, and the edit is saved through
-    the normal `DocumentSession` path. After the automatic save, Undo remains
-    available and reverses the last edit; the reverted state is saved as the
-    next automatic checkpoint. An in-place manual save also keeps Undo history;
-    Save As replaces the document and clears it.
+9. Open a colour swatch: six labelled presets, the current colour checked, a
+   custom picker and Cancel/Apply. A preset applies immediately; a custom colour
+   is only written by Apply, and Cancel leaves both the annotation and the
+   tool's default unchanged. Dragging through the custom picker before pressing
+   Apply must not create one Undo entry per intermediate colour.
+10. Convert a highlight to an underline, then to a strike-out, then back to a
+    highlight, undoing after each step: the contents and flags set by another app
+    survive, and the edit is saved through the normal `DocumentSession` path.
+    After the automatic save, Undo remains available and reverses the last edit;
+    the reverted state is saved as the next automatic checkpoint. An in-place
+    manual save also keeps Undo history; Save As replaces the document and
+    clears it.
 11. Simulate a save conflict (change the file from another app) after recolouring:
     the save is refused, the annotation and the Undo history stay in the window,
     and Save As remains available.
@@ -885,7 +903,7 @@ never stored in the repository.
 P0 excluded annotations, search, recent documents, tabs, agent integration,
 accounts, sync and PDF editing. P1 added file access and safe persistence. P2a
 added yellow highlights with a manual save; committed annotation changes now
-auto-save. P2b makes Highlight and Underline
+auto-save. P2b makes Highlight, Underline and Strike Out
 editable: selection, six presets plus custom colours, recolour, delete, convert
 and Undo/Redo. P2c adds standard `/Text` notes with a compact composer, six paper
 tints, page markers, editing, deletion and Undo/Redo. P2d adds 20 original
@@ -893,9 +911,9 @@ sticker motifs, a persistent versioned style (v2 with template title and symbol)
 a CropBox-relative marker anchor, twelve built-in templates with a personal
 template library, and ShuaMac's compact composer. P2e adds Outline, Thumbnails
 and Annotations views to a collapsible sidebar attached to the open PDF window.
-Annotation changes auto-save; there is no document library, StrikeOut support,
-note threads or agent integration. Recent files and reading-position restoration
-have since been added without introducing a managed library.
+Annotation changes auto-save; there is no document library, note threads or
+agent integration. Recent files and reading-position restoration have since
+been added without introducing a managed library.
 
 Known P1 boundaries:
 
