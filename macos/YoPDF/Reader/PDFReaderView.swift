@@ -613,36 +613,53 @@ struct PDFReaderView: View {
 
             Divider().frame(height: 18)
 
-            Button {
-                model.addMarkup(.highlight)
-            } label: {
-                Label("Highlight", systemImage: "highlighter")
-            }
-            .disabled(!model.canAddMarkup(.highlight))
-            .help("Highlight the selected text (⇧⌘H)")
+            MarkupToolbarGroup {
+                MarkupToolButton(
+                    title: "Highlight Selection",
+                    systemImage: MarkupKind.highlight.symbolName,
+                    help: "Highlight the selected text (⇧⌘H)"
+                ) {
+                    model.addMarkup(.highlight)
+                }
+                .disabled(!model.canAddMarkup(.highlight))
 
-            MarkupColorButton(
-                title: "Highlight Colour",
-                help: "Colour for new highlights",
-                color: model.defaultMarkupColor(for: .highlight)
-            ) { color in
-                model.setDefaultMarkupColor(color, for: .highlight)
-            }
+                MarkupColorControl(
+                    title: "Highlight colour",
+                    paletteTitle: "Colour for new highlight marks",
+                    help: "Choose the colour for new highlight marks",
+                    accessibilityIdentifier: "pdf-reader-highlight-color",
+                    color: model.defaultMarkupColor(for: .highlight)
+                ) { color in
+                    model.setDefaultMarkupColor(color, for: .highlight)
+                }
 
-            Button {
-                model.addMarkup(.underline)
-            } label: {
-                Label("Underline", systemImage: "underline")
-            }
-            .disabled(!model.canAddMarkup(.underline))
-            .help("Underline the selected text (⇧⌘U)")
+                MarkupToolButton(
+                    title: "Underline Selection",
+                    systemImage: MarkupKind.underline.symbolName,
+                    help: "Underline the selected text (⇧⌘U)"
+                ) {
+                    model.addMarkup(.underline)
+                }
+                .disabled(!model.canAddMarkup(.underline))
 
-            MarkupColorButton(
-                title: "Underline Colour",
-                help: "Colour for new underlines",
-                color: model.defaultMarkupColor(for: .underline)
-            ) { color in
-                model.setDefaultMarkupColor(color, for: .underline)
+                MarkupColorControl(
+                    title: "Underline colour",
+                    paletteTitle: "Colour for new underline marks",
+                    help: "Choose the colour for new underline marks",
+                    accessibilityIdentifier: "pdf-reader-underline-color",
+                    color: model.defaultMarkupColor(for: .underline)
+                ) { color in
+                    model.setDefaultMarkupColor(color, for: .underline)
+                }
+
+                MarkupToolButton(
+                    title: "Strike Out Selection",
+                    systemImage: MarkupKind.strikeOut.symbolName,
+                    help: "Strike out the selected text"
+                ) {
+                    model.addMarkup(.strikeOut)
+                }
+                .disabled(!model.canAddMarkup(.strikeOut))
             }
 
             Divider().frame(height: 18)
@@ -670,9 +687,11 @@ struct PDFReaderView: View {
             if let selected = model.selectedMarkup {
                 Divider().frame(height: 18)
 
-                MarkupColorButton(
-                    title: "\(selected.kind.title) Colour",
+                MarkupColorControl(
+                    title: "\(selected.kind.title) colour",
+                    paletteTitle: "Change selected \(selected.kind.title.lowercased()) colour",
                     help: "Change the selected annotation’s colour",
+                    accessibilityIdentifier: "pdf-reader-selected-markup-color",
                     color: selected.color
                 ) { color in
                     model.recolorSelectedMarkup(to: color)

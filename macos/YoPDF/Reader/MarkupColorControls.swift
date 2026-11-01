@@ -2,16 +2,66 @@ import AppKit
 import SwiftUI
 import YoPDFCore
 
-/// A toolbar colour control: six presets plus the system colour picker.
+/// The compact markup tools, grouped the way ShuaMac's reader groups them.
 ///
-/// Presets are buttons rather than a list so the six supported colours are
-/// visible at once. The custom value is validated by the model; a fully
-/// transparent choice is refused there instead of being written as an invisible
-/// annotation.
-struct MarkupColorButton: View {
+/// One rounded container holds Highlight, Underline and Strike Out with their
+/// colour swatches, so the markup tools read as one editing surface instead of
+/// unrelated toolbar buttons. The group is presentation only: every control
+/// calls the same model method it called before.
+struct MarkupToolbarGroup<Content: View>: View {
+
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        HStack(spacing: 0) {
+            content
+        }
+        .padding(.horizontal, 2)
+        .background(
+            Color.primary.opacity(0.06),
+            in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+        )
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Text markup")
+    }
+}
+
+/// One icon-only tool inside `MarkupToolbarGroup`.
+///
+/// The label is an SF Symbol and the visible text lives in the help tag, which
+/// is what keeps the group narrow enough for a single toolbar row.
+struct MarkupToolButton: View {
 
     let title: String
+    let systemImage: String
     let help: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 13, weight: .medium))
+        }
+        .buttonStyle(ReaderInteractiveButtonStyle())
+        .accessibilityLabel(title)
+        .help(help)
+    }
+}
+
+/// A colour swatch with a disclosure chevron, matching ShuaMac's reader.
+///
+/// The swatch reports the colour the next mark will use (or the selected
+/// annotation's colour). The popover keeps the custom value staged and commits
+/// it with Apply; a preset applies immediately and closes, which is the
+/// behaviour of the reference app.
+struct MarkupColorControl: View {
+
+    /// Spoken label, e.g. "Highlight colour".
+    let title: String
+    /// Popover heading, e.g. "Colour for new highlight marks".
+    let paletteTitle: String
+    let help: String
+    let accessibilityIdentifier: String
     let color: NSColor
     let onSelect: (NSColor) -> Void
 
@@ -19,24 +69,41 @@ struct MarkupColorButton: View {
 
     var body: some View {
         Button {
-            isPopoverPresented.toggle()
+            isPopoverPresented = true
         } label: {
-            Circle()
-                .fill(Color(nsColor: color))
-                .frame(width: 18, height: 18)
-                .overlay {
-                    Circle()
-                        .strokeBorder(Color.primary.opacity(0.22), lineWidth: 1)
-                }
+            HStack(spacing: 2) {
+                RoundedRectangle(cornerRadius: 3, style: .continuous)
+                    .fill(Color(nsColor: color))
+                    .frame(width: 12, height: 12)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 3, style: .continuous)
+                            .strokeBorder(Color.primary.opacity(0.2), lineWidth: 1)
+                    }
+
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7, weight: .semibold))
+            }
+            .frame(width: 25, height: 26)
+            .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         }
+        .buttonStyle(ReaderInteractiveButtonStyle())
+        .accessibilityLabel(title)
+        .accessibilityValue(MarkupColorPalette.hex(from: color) ?? "")
+        .accessibilityIdentifier(accessibilityIdentifier)
         .help(help)
-        .accessibilityLabel(help)
         .popover(isPresented: $isPopoverPresented, arrowEdge: .bottom) {
-            MarkupColorPopover(title: title, color: color, onSelect: onSelect)
+            MarkupColorPopover(title: paletteTitle, color: color, onSelect: onSelect)
         }
     }
 }
 
+/// Six labelled presets, a custom colour and an explicit Cancel/Apply pair.
+///
+/// Presets are buttons rather than a list so the six supported colours are
+/// visible at once. The custom value is only offered when the user presses
+/// Apply, so moving through the system colour picker cannot create one history
+/// entry per intermediate colour. A fully transparent choice is refused by the
+/// model, not written as an invisible annotation.
 private struct MarkupColorPopover: View {
 
     let title: String
@@ -53,12 +120,14 @@ private struct MarkupColorPopover: View {
         _customColor = State(initialValue: Color(nsColor: color))
     }
 
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 8), count: 3)
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(title)
                 .font(.headline)
 
-            HStack(spacing: 8) {
+            LazyVGrid(columns: columns, spacing: 10) {
                 ForEach(MarkupColorPalette.presets) { preset in
                     presetButton(preset)
                 }
@@ -67,22 +136,30 @@ private struct MarkupColorPopover: View {
             Divider()
 
             ColorPicker(
-                "Custom Colour",
+                "Custom colour",
                 selection: $customColor,
                 supportsOpacity: false
             )
-            .onChange(of: customColor) { _, newValue in
-                onSelect(NSColor(newValue))
-            }
+            .accessibilityIdentifier("pdf-markup-custom-color-picker")
 
             HStack {
                 Spacer()
-                Button("Done") { dismiss() }
-                    .keyboardShortcut(.defaultAction)
+
+                Button("Cancel") {
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Button("Apply") {
+                    onSelect(NSColor(customColor))
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
             }
         }
         .padding(14)
-        .frame(width: 238)
+        .frame(width: 248)
     }
 
     private func presetButton(_ preset: MarkupColorPreset) -> some View {
@@ -93,23 +170,30 @@ private struct MarkupColorPopover: View {
             onSelect(preset.color)
             dismiss()
         } label: {
-            Circle()
-                .fill(Color(nsColor: preset.color))
-                .frame(width: 27, height: 27)
-                .overlay {
-                    Circle()
-                        .strokeBorder(Color.primary.opacity(0.22), lineWidth: 1)
-                }
-                .overlay {
-                    if isSelected {
-                        Image(systemName: "checkmark")
-                            .font(.system(size: 11, weight: .bold))
-                            .foregroundStyle(.white)
-                            .shadow(radius: 1)
+            VStack(spacing: 5) {
+                Circle()
+                    .fill(Color(nsColor: preset.color))
+                    .frame(width: 24, height: 24)
+                    .overlay {
+                        if isSelected {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundStyle(.black.opacity(0.75))
+                        }
                     }
-                }
+                    .overlay {
+                        Circle()
+                            .strokeBorder(Color.primary.opacity(0.16), lineWidth: 1)
+                    }
+
+                Text(preset.name)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
         }
-        .buttonStyle(ReaderInteractiveButtonStyle())
+        .buttonStyle(.plain)
         .help(preset.name)
         .accessibilityLabel(preset.name)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
