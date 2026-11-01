@@ -19,10 +19,14 @@ public final class PDFViewMagnificationController {
         guard view.window != nil else { return }
         attachedView = view
         let token = NSEvent.addLocalMonitorForEvents(matching: .magnify) { [weak self, weak view] event in
+            // The event is not Sendable, so it must not cross the isolation
+            // boundary as a return value: observe it inside the isolated block
+            // and forward the original object unchanged from here.
             MainActor.assumeIsolated {
-                guard let self, let view else { return event }
-                return self.observeLocalEvent(event, in: view)
+                guard let self, let view else { return }
+                self.observeLocalEvent(event, in: view)
             }
+            return event
         }
         monitor = token.map(LocalMagnificationMonitor.init)
     }
@@ -33,22 +37,22 @@ public final class PDFViewMagnificationController {
         isMagnifying = false
     }
 
-    /// This is an observe-only monitor. Returning the same event is important:
+    /// This is an observe-only monitor. Forwarding the same event is important:
     /// PDFKit's internal NSScrollView performs the continuous magnification and
     /// its temporary live transform without forcing a PDFView layout/raster
     /// update for every trackpad delta.
-    private func observeLocalEvent(_ event: NSEvent, in view: PDFView) -> NSEvent {
+    private func observeLocalEvent(_ event: NSEvent, in view: PDFView) {
         guard let window = view.window,
               event.window === window,
               view.document != nil
-        else { return event }
+        else { return }
 
         let point = view.convert(event.locationInWindow, from: nil)
-        guard isMagnifying || view.bounds.contains(point) else { return event }
+        guard isMagnifying || view.bounds.contains(point) else { return }
 
         if event.phase.contains(.cancelled) {
             isMagnifying = false
-            return event
+            return
         }
 
         let gestureIsActive = event.phase.contains(.began)
@@ -68,8 +72,6 @@ public final class PDFViewMagnificationController {
         if event.phase.contains(.ended) {
             isMagnifying = false
         }
-
-        return event
     }
 }
 
