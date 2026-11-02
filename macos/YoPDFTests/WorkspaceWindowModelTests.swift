@@ -1,9 +1,24 @@
 import AppKit
+import PDFKit
 import XCTest
 @testable import YoPDFCore
 
 @MainActor
 final class WorkspaceWindowModelTests: XCTestCase {
+
+    private func makeDocumentDirty(_ model: PDFDocumentModel) throws {
+        let document = try XCTUnwrap(model.document)
+        let page = try XCTUnwrap(document.page(at: 0))
+        let text = try XCTUnwrap(page.string)
+        let selection = try XCTUnwrap(document.selection(
+            from: page,
+            atCharacterIndex: 0,
+            to: page,
+            atCharacterIndex: min(text.count, 5)
+        ))
+        model.updateSelection(selection)
+        XCTAssertNotNil(model.addMarkup(.highlight))
+    }
 
     func testOpenCreatesIsolatedTabsAndDuplicateOpenActivatesExistingTab() throws {
         let firstURL = try PDFFixtureFactory.writeTemporaryPDF(named: "workspace-first")
@@ -176,6 +191,164 @@ final class WorkspaceWindowModelTests: XCTestCase {
 
         workspace.discardAllDrafts()
         workspace.discardAllDocumentChanges()
+        workspace.closeAllSessions()
+    }
+
+    func testCloseTabPromptAndDiscardStayBoundToRequestedBackgroundSession() throws {
+        let firstURL = try PDFFixtureFactory.writeTemporaryPDF(named: "workspace-close-first")
+        let secondURL = try PDFFixtureFactory.writeTemporaryPDF(named: "workspace-close-second")
+        defer {
+            try? FileManager.default.removeItem(at: firstURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: secondURL.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        guard case let .opened(firstID) = workspace.open(firstURL) else {
+            return XCTFail("The first PDF should load.")
+        }
+        let firstModel = workspace.activeTab.model
+        try makeDocumentDirty(firstModel)
+
+        guard case let .opened(secondID) = workspace.open(secondURL),
+              let secondPage = workspace.activeTab.model.document?.page(at: 0),
+              let draft = workspace.activeTab.model.pageNoteDraft(
+                at: CGPoint(x: 300, y: 400), on: secondPage
+              )
+        else {
+            return XCTFail("The second PDF should load and provide a note anchor.")
+        }
+        let secondTab = try XCTUnwrap(workspace.session(tabID: secondID))
+        try makeDocumentDirty(secondTab.model)
+        XCTAssertTrue(secondTab.composerStore.begin(
+            mode: .create(draft),
+            anchorRect: .zero,
+            pageLabel: "1",
+            excerpt: nil,
+            contents: "",
+            paper: .honey
+        ))
+        secondTab.composerStore.session?.contents = "Discard only this tab"
+
+        workspace.activate(tabID: firstID)
+        XCTAssertTrue(firstModel.hasUnsavedChanges)
+        XCTAssertEqual(workspace.closeTabPrompt(tabID: secondID), .draft)
+
+        XCTAssertTrue(workspace.discardDraft(tabID: secondID))
+        XCTAssertEqual(workspace.closeTabPrompt(tabID: secondID), .document)
+        XCTAssertTrue(workspace.discardDocumentChanges(tabID: secondID))
+        XCTAssertTrue(workspace.closeTab(tabID: secondID))
+
+        XCTAssertTrue(firstModel.hasUnsavedChanges, "discarding B must not abandon A's edits")
+        XCTAssertNotNil(firstModel.document)
+        XCTAssertNil(workspace.session(tabID: secondID))
+        XCTAssertEqual(workspace.activeTabID, firstID)
+        workspace.closeAllSessions()
+    }
+
+    func testClosingCleanBackgroundTabDoesNotPromptForActiveDirtyDocument() throws {
+        let firstURL = try PDFFixtureFactory.writeTemporaryPDF(named: "workspace-clean-close-first")
+        let secondURL = try PDFFixtureFactory.writeTemporaryPDF(named: "workspace-clean-close-second")
+        defer {
+            try? FileManager.default.removeItem(at: firstURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: secondURL.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        guard case let .opened(firstID) = workspace.open(firstURL) else {
+            return XCTFail("The first PDF should load.")
+        }
+        let firstModel = workspace.activeTab.model
+        try makeDocumentDirty(firstModel)
+
+        guard case let .opened(secondID) = workspace.open(secondURL) else {
+            return XCTFail("The second PDF should load.")
+        }
+        let secondModel = workspace.activeTab.model
+        workspace.activate(tabID: firstID)
+
+        XCTAssertTrue(firstModel.hasUnsavedChanges)
+        XCTAssertFalse(secondModel.hasUnsavedChanges)
+        XCTAssertEqual(try XCTUnwrap(workspace.closeTabPrompt(tabID: secondID)), ReaderPrompt.none)
+        XCTAssertTrue(workspace.closeTab(tabID: secondID))
+
+        XCTAssertTrue(firstModel.hasUnsavedChanges, "Closing clean B must leave A's edits intact.")
+        XCTAssertNil(workspace.session(tabID: secondID))
+        XCTAssertEqual(workspace.activeTabID, firstID)
+        workspace.closeAllSessions()
+    }
+
+    func testSidebarNavigationStateIsIsolatedWhenPDFGenerationsMatch() throws {
+        let firstURL = try PDFFixtureFactory.writeTemporaryPDF(named: "workspace-sidebar-first")
+        let secondURL = try PDFFixtureFactory.writeTemporaryPDF(named: "workspace-sidebar-second")
+        defer {
+            try? FileManager.default.removeItem(at: firstURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: secondURL.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        guard case let .opened(firstID) = workspace.open(firstURL) else {
+            return XCTFail("The first PDF should load.")
+        }
+        let firstTab = workspace.activeTab
+        let firstModel = firstTab.model
+        let firstNavigation = firstTab.navigationState
+        XCTAssertTrue(firstNavigation.prepare(for: firstModel.loadGeneration))
+
+        let outlineItem = OutlineSidebarItem(
+            id: "first-outline",
+            outline: PDFOutline(),
+            title: "First document outline",
+            depth: 0,
+            childCount: 1,
+            destination: nil,
+            destinationPageIndex: nil,
+            isExpanded: false
+        )
+        let annotation = PDFAnnotation(
+            bounds: CGRect(x: 10, y: 10, width: 20, height: 20),
+            forType: .highlight,
+            withProperties: nil
+        )
+        firstNavigation.outlineItems = [outlineItem]
+        firstNavigation.annotationItems = [
+            SidebarAnnotationItem(id: "first-annotation", pageIndex: 0, annotation: annotation)
+        ]
+        firstNavigation.selectedSection = .outline
+        firstNavigation.isVisible = false
+        firstNavigation.updateMemory {
+            $0.markOutlineLoaded()
+            $0.selectOutlineItem("first-outline")
+            $0.setOutlineItem("first-outline", expanded: false)
+            $0.markAnnotationIndexUpdated(revision: firstModel.annotationRevision)
+        }
+
+        guard case let .opened(secondID) = workspace.open(secondURL) else {
+            return XCTFail("The second PDF should load into another tab.")
+        }
+        let secondModel = workspace.activeTab.model
+        let secondNavigation = workspace.activeTab.navigationState
+        XCTAssertEqual(firstModel.loadGeneration, secondModel.loadGeneration)
+        XCTAssertTrue(secondNavigation.prepare(for: secondModel.loadGeneration))
+
+        XCTAssertFalse(firstNavigation === secondNavigation)
+        XCTAssertTrue(secondNavigation.outlineItems.isEmpty)
+        XCTAssertTrue(secondNavigation.annotationItems.isEmpty)
+        XCTAssertTrue(secondNavigation.memory.needsOutlineLoad)
+        XCTAssertTrue(secondNavigation.memory.needsAnnotationIndex(for: secondModel.annotationRevision))
+        XCTAssertNil(secondNavigation.memory.selectedOutlineItemID)
+        XCTAssertTrue(secondNavigation.isVisible)
+        XCTAssertEqual(secondNavigation.selectedSection, .thumbnails)
+
+        XCTAssertEqual(firstNavigation.outlineItems.map(\.id), ["first-outline"])
+        XCTAssertEqual(firstNavigation.annotationItems.map(\.id), ["first-annotation"])
+        XCTAssertTrue(firstNavigation.memory.hasLoadedOutline)
+        XCTAssertEqual(firstNavigation.memory.selectedOutlineItemID, "first-outline")
+        XCTAssertFalse(firstNavigation.isVisible)
+        XCTAssertEqual(firstNavigation.selectedSection, .outline)
+
+        workspace.activate(tabID: firstID)
+        workspace.activate(tabID: secondID)
+        XCTAssertTrue(workspace.activeTab.navigationState === secondNavigation)
         workspace.closeAllSessions()
     }
 }

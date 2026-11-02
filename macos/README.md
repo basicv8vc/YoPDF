@@ -64,7 +64,8 @@ the last tab uses the native window-close path. The red close button always
 closes the full window. **New Window** (⌘N) creates a separate workspace.
 
 Each tab owns its `PDFDocumentModel`, security-scoped `DocumentSession`, note
-composer, and search session. Switching tabs retains page, zoom, search results,
+composer, search session, and sidebar navigation state. Switching tabs retains
+page, zoom, search results, outline and annotation indexes, sidebar selection,
 annotation edits, and uncommitted note text. Save, Undo, Find, and annotation
 commands route through the focused tab. Closing a tab protects that tab's work;
 closing a window or quitting checks every tab. Choosing **Save All** resolves

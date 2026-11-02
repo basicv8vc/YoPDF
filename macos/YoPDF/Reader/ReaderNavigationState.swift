@@ -1,13 +1,15 @@
 import Combine
 import YoPDFCore
 
-/// State shared by one reader window so hiding and recreating its sidebar does
-/// not discard outline selection, expansion choices, or an existing index.
+/// One tab's sidebar state, retained while the user switches to another tab or
+/// temporarily hides the sidebar.
 @MainActor
 final class ReaderNavigationState: ObservableObject {
     @Published var annotationItems: [SidebarAnnotationItem] = []
     @Published var outlineItems: [OutlineSidebarItem] = []
     @Published private(set) var memory = ReaderNavigationMemory()
+    @Published var selectedSection: ReaderSidebarSection = .thumbnails
+    @Published var isVisible = true
 
     @discardableResult
     func prepare(for generation: Int) -> Bool {

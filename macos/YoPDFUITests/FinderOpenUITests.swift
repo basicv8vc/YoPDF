@@ -140,10 +140,12 @@ final class FinderOpenUITests: XCTestCase {
     }
 
     private func tabCount(in app: XCUIApplication) -> Int {
-        let tabs = app.buttons.matching(
-            NSPredicate(format: "identifier BEGINSWITH %@ AND identifier NOT CONTAINS %@", "workspace-tab-", "close")
+        let closeButtons = app.buttons.matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "workspace-tab-close-")
         )
-        return tabs.count
+        // Every tab gets a close button when there is more than one tab. The
+        // last tab closes its window, so it deliberately has no close button.
+        return closeButtons.count > 0 ? closeButtons.count : 1
     }
 
     private func waitForTabCount(_ expected: Int, in app: XCUIApplication) -> Bool {

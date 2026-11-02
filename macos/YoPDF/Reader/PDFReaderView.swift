@@ -112,6 +112,7 @@ struct PDFReaderView: View {
     @ObservedObject var model: PDFDocumentModel
     @ObservedObject var composerStore: NoteComposerStore
     @ObservedObject var searchSession: PDFSearchSession
+    @ObservedObject var navigationState: ReaderNavigationState
     @ObservedObject var updateController: SparkleUpdateController
     @ObservedObject var recentDocuments: RecentDocumentsStore
     @ObservedObject var fileOpenRequests: FileOpenRequestQueue
@@ -124,9 +125,6 @@ struct PDFReaderView: View {
     @State private var isDropTargeted = false
     @State private var prompt: Prompt?
     @State private var pendingOpenFailure: PDFDocumentModel.LoadError?
-    @State private var isSidebarVisible = true
-    @State private var sidebarSection: ReaderSidebarSection = .thumbnails
-    @StateObject private var readerNavigationState = ReaderNavigationState()
     @State private var pendingNavigationDestination: PDFDestination?
     @State private var navigationRevision = 0
     @State private var isSearchPresented = false
@@ -182,7 +180,7 @@ struct PDFReaderView: View {
         case draftChanges(PendingAction)
         case unsavedChanges(PendingAction)
         case workspaceChanges
-        case saveProblem(title: String, message: String, offersSaveAs: Bool)
+        case saveProblem(title: String, message: String, offersSaveAs: Bool, tabID: UUID?)
         case recentDocumentUnavailable(RecentDocument)
 
         var id: String {
@@ -193,8 +191,8 @@ struct PDFReaderView: View {
                 return "unsaved-\(String(describing: action))"
             case .workspaceChanges:
                 return "workspace-changes"
-            case let .saveProblem(title, _, _):
-                return "problem-\(title)"
+            case let .saveProblem(title, _, _, tabID):
+                return "problem-\(tabID?.uuidString ?? "active")-\(title)"
             case let .recentDocumentUnavailable(item):
                 return "recent-\(item.id)"
             }
@@ -208,7 +206,7 @@ struct PDFReaderView: View {
                 return "Save changes before continuing?"
             case .workspaceChanges:
                 return "Save changes before closing this workspace?"
-            case let .saveProblem(title, _, _):
+            case let .saveProblem(title, _, _, _):
                 return title
             case .recentDocumentUnavailable:
                 return "Couldn’t open recent document"
@@ -230,7 +228,7 @@ struct PDFReaderView: View {
                 case .save, .saveAs, .compose:
                     return "This document has changes that are not in the file yet."
                 }
-            case let .saveProblem(_, message, _):
+            case let .saveProblem(_, message, _, _):
                 return message
             case .workspaceChanges:
                 return "This workspace has unsaved PDF changes or note drafts in one or more tabs."
@@ -283,11 +281,11 @@ struct PDFReaderView: View {
                 Button("Save All") { saveWorkspaceThenClose() }
                 Button("Don’t Save", role: .destructive) { discardWorkspaceThenClose() }
                 Button("Cancel", role: .cancel) { self.prompt = nil }
-            case let .saveProblem(_, _, offersSaveAs):
+            case let .saveProblem(_, _, offersSaveAs, tabID):
                 if offersSaveAs {
                     Button("Save As…") {
                         self.prompt = nil
-                        presentSaveAsPanel()
+                        presentSaveAsPanel(for: tabID)
                         finishFinderOpenRequestIfResolved()
                     }
                 }
@@ -542,7 +540,7 @@ struct PDFReaderView: View {
         // the failure visible; dismissing the current prompt leaves the user
         // free to retry or save a copy.
         guard prompt == nil, let outcome = model.lastAutoSaveOutcome else { return }
-        _ = present(outcome)
+        _ = present(outcome, for: workspace.activeTabID)
     }
 
     private var promptPresentation: Binding<Bool> {
@@ -558,6 +556,15 @@ struct PDFReaderView: View {
 
     private var currentOpenError: PDFDocumentModel.LoadError? {
         model.lastError ?? pendingOpenFailure
+    }
+
+    private var isSidebarVisible: Bool { navigationState.isVisible }
+
+    private var sidebarSelection: Binding<ReaderSidebarSection> {
+        Binding(
+            get: { navigationState.selectedSection },
+            set: { navigationState.selectedSection = $0 }
+        )
     }
 
     private func dismissOpenError() {
@@ -606,14 +613,14 @@ struct PDFReaderView: View {
 
     private func toggleSidebar() {
         withAnimation(.easeInOut(duration: 0.18)) {
-            isSidebarVisible.toggle()
+            navigationState.isVisible.toggle()
         }
     }
 
     private func showSidebarSection(_ section: ReaderSidebarSection) {
         withAnimation(.easeInOut(duration: 0.18)) {
-            sidebarSection = section
-            isSidebarVisible = true
+            navigationState.selectedSection = section
+            navigationState.isVisible = true
         }
     }
 
@@ -1037,8 +1044,8 @@ struct PDFReaderView: View {
                 if isSidebarVisible {
                     ReaderSidebar(
                         model: model,
-                        navigationState: readerNavigationState,
-                        selection: $sidebarSection,
+                        navigationState: navigationState,
+                        selection: sidebarSelection,
                         onSelectDestination: { navigate(to: $0) }
                     )
                     .frame(width: 250)
@@ -1260,25 +1267,22 @@ struct PDFReaderView: View {
 
     private func requestCloseTab(_ tabID: UUID) {
         guard workspace.tabs.contains(where: { $0.id == tabID }) else { return }
-        guard workspace.activeTabID == tabID else {
+        if workspace.activeTabID != tabID {
             workspace.activate(tabID: tabID)
-            Task { @MainActor in
-                await Task.yield()
-                beginCloseTab(tabID)
-            }
-            return
         }
         beginCloseTab(tabID)
     }
 
     private func beginCloseTab(_ tabID: UUID) {
+        guard workspace.session(tabID: tabID) != nil else { return }
         guard workspace.tabs.count > 1 else {
             NSApp.sendAction(#selector(NSWindow.performClose(_:)), to: nil, from: nil)
             return
         }
 
         let action = PendingAction.closeTab(tabID)
-        switch promptKind(for: action) {
+        guard let tabPrompt = workspace.closeTabPrompt(tabID: tabID) else { return }
+        switch tabPrompt {
         case .none:
             perform(action)
         case .draft:
@@ -1329,29 +1333,49 @@ struct PDFReaderView: View {
     }
 
     private func promptKind(for action: PendingAction) -> ReaderPrompt {
-        ReaderPromptPolicy.prompt(
+        if case let .closeTab(tabID) = action {
+            return workspace.closeTabPrompt(tabID: tabID) ?? .none
+        }
+        return ReaderPromptPolicy.prompt(
             for: action.readerAction,
             draftHasChanges: composerStore.hasUncommittedChanges,
             documentHasChanges: model.hasUnsavedChanges
         )
     }
 
+    /// A close-tab action carries its target identity through every prompt.
+    /// Other actions intentionally operate on the active tab.
+    private func session(for action: PendingAction) -> WorkspaceTabSession? {
+        if case let .closeTab(tabID) = action {
+            return workspace.session(tabID: tabID)
+        }
+        return workspace.session(tabID: workspace.activeTabID)
+    }
+
     /// Saves and, on failure, turns the outcome into a prompt. Returns whether
     /// the edits are known to be on disk.
     @discardableResult
     private func performSave() -> Bool {
-        present(model.save())
+        present(model.save(), for: workspace.activeTabID)
     }
 
-    private func presentSaveAsPanel() {
-        guard model.isLoaded else { return }
+    private func presentSaveAsPanel(for tabID: UUID? = nil) {
+        let targetSession: WorkspaceTabSession
+        if let tabID {
+            guard let session = workspace.session(tabID: tabID) else { return }
+            targetSession = session
+        } else {
+            targetSession = workspace.activeTab
+        }
+        let targetModel = targetSession.model
+        guard targetModel.isLoaded else { return }
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.pdf]
         panel.canCreateDirectories = true
-        panel.nameFieldStringValue = model.fileURL?.lastPathComponent ?? "\(model.title).pdf"
-        let response = model.withAutoSavePaused { panel.runModal() }
+        panel.nameFieldStringValue = targetModel.fileURL?.lastPathComponent ?? "\(targetModel.title).pdf"
+        let response = targetModel.withAutoSavePaused { panel.runModal() }
         guard response == .OK, let url = panel.url else { return }
-        present(model.saveAs(to: url, overwrite: true))
+        present(targetModel.saveAs(to: url, overwrite: true), for: targetSession.id)
     }
 
     private func exportAnnotationsAsMarkdown() {
@@ -1386,7 +1410,7 @@ struct PDFReaderView: View {
     }
 
     @discardableResult
-    private func present(_ outcome: SaveOutcome) -> Bool {
+    private func present(_ outcome: SaveOutcome, for tabID: UUID? = nil) -> Bool {
         switch outcome {
         case .saved:
             return true
@@ -1394,7 +1418,8 @@ struct PDFReaderView: View {
             prompt = .saveProblem(
                 title: editsOnDisk ? "Saved, but not verified" : "The save could not be confirmed",
                 message: reason,
-                offersSaveAs: !editsOnDisk
+                offersSaveAs: !editsOnDisk,
+                tabID: tabID
             )
             return editsOnDisk
         case let .conflict(error):
@@ -1402,7 +1427,8 @@ struct PDFReaderView: View {
                 title: "The file changed on disk",
                 message: (error.errorDescription ?? "The file was not written.")
                     + " Your changes are still here — save a copy to keep them.",
-                offersSaveAs: true
+                offersSaveAs: true,
+                tabID: tabID
             )
             return false
         case let .uncertain(reason, recovery):
@@ -1414,14 +1440,16 @@ struct PDFReaderView: View {
             prompt = .saveProblem(
                 title: "The save stopped in an unclear state",
                 message: message,
-                offersSaveAs: false
+                offersSaveAs: false,
+                tabID: tabID
             )
             return false
         case let .failed(error):
             prompt = .saveProblem(
                 title: "Couldn’t save",
                 message: error.errorDescription ?? "The file was not written.",
-                offersSaveAs: offersSaveAs(for: error)
+                offersSaveAs: offersSaveAs(for: error),
+                tabID: tabID
             )
             return false
         }
@@ -1654,7 +1682,8 @@ struct PDFReaderView: View {
             prompt = .saveProblem(
                 title: "Couldn’t save the note",
                 message: failure + " Your text is still here.",
-                offersSaveAs: false
+                offersSaveAs: false,
+                tabID: workspace.activeTabID
             )
             return
         }
@@ -1693,7 +1722,7 @@ struct PDFReaderView: View {
     private func saveWorkspaceDocuments() -> Bool {
         for tab in workspace.tabs where tab.model.hasUnsavedChanges {
             workspace.activate(tabID: tab.id)
-            guard present(tab.model.save()) else { return false }
+            guard present(tab.model.save(), for: tab.id) else { return false }
         }
         return true
     }
@@ -1725,9 +1754,14 @@ struct PDFReaderView: View {
     /// only copy left.
     private func saveDraftThen(_ action: PendingAction) {
         prompt = nil
-        let result = action == .quit
-            ? saveWorkspaceDrafts()
-            : saveDraft(in: workspace.activeTab)
+        let result: String?
+        if action == .quit {
+            result = saveWorkspaceDrafts()
+        } else if let target = session(for: action) {
+            result = saveDraft(in: target)
+        } else {
+            result = nil
+        }
         if let message = result {
             // A failed note save stops the quit before termination is
             // requested. Approvals collected from other windows belong to an
@@ -1737,7 +1771,8 @@ struct PDFReaderView: View {
             prompt = .saveProblem(
                 title: "Couldn’t save the note",
                 message: message + " Your text is still here.",
-                offersSaveAs: false
+                offersSaveAs: false,
+                tabID: session(for: action)?.id
             )
         } else {
             if action == .quit {
@@ -1764,7 +1799,7 @@ struct PDFReaderView: View {
             of: closeGuard
         ) {
         case .endedNow:
-            composerStore.end()
+            session(for: action)?.composerStore.end()
             proceed(afterDraft: action)
         case let .deferredUntilQuitCommit(need):
             showQuitPrompt(for: need)
@@ -1777,7 +1812,10 @@ struct PDFReaderView: View {
         if action == .quit { QuitSession.coordinator.cancel() }
         // The prompt never closed the composer, but the alert may have dismissed
         // the popover on its way in. Put it back: the draft is still there.
-        if composerStore.hasSession { composerStore.isPresented = true }
+        if let target = session(for: action) {
+            workspace.activate(tabID: target.id)
+            if target.composerStore.hasSession { target.composerStore.isPresented = true }
+        }
         finishFinderOpenRequestIfResolved()
     }
 
@@ -1789,7 +1827,7 @@ struct PDFReaderView: View {
     private func proceed(afterDraft action: PendingAction) {
         switch ReaderPromptPolicy.promptAfterDraft(
             for: action.readerAction,
-            documentHasChanges: model.hasUnsavedChanges
+            documentHasChanges: session(for: action)?.model.hasUnsavedChanges ?? false
         ) {
         case .document:
             prompt = .unsavedChanges(action)
@@ -1812,8 +1850,10 @@ struct PDFReaderView: View {
         let didSave: Bool
         if action == .quit {
             didSave = saveWorkspaceDocuments()
+        } else if let target = session(for: action) {
+            didSave = present(target.model.save(), for: target.id)
         } else {
-            didSave = performSave()
+            didSave = false
         }
         guard didSave else {
             // A failed save stops the quit before termination is requested.
@@ -1838,7 +1878,7 @@ struct PDFReaderView: View {
         case let .relink(url, item):
             requestOpen(url, relinking: item)
         case let .closeTab(tabID):
-            model.abandonUnsavedChanges()
+            _ = workspace.discardDocumentChanges(tabID: tabID)
             _ = workspace.closeTab(tabID: tabID)
         case .closeWindow:
             // The window is closing now, so the edits really are being discarded.

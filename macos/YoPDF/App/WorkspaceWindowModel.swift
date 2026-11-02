@@ -9,6 +9,7 @@ final class WorkspaceTabSession: Identifiable {
     let model: PDFDocumentModel
     let composerStore: NoteComposerStore
     let searchSession: PDFSearchSession
+    let navigationState: ReaderNavigationState
 
     init(
         identity: WorkspaceTabIdentity = WorkspaceTabIdentity(),
@@ -19,6 +20,7 @@ final class WorkspaceTabSession: Identifiable {
         self.model = model
         composerStore = NoteComposerStore()
         searchSession = PDFSearchSession()
+        navigationState = ReaderNavigationState()
     }
 
     var title: String {
@@ -74,6 +76,19 @@ final class WorkspaceWindowModel: ObservableObject {
 
     var activeTabID: UUID { activeTab.id }
     var activePaneID: UUID { activeTab.paneID }
+
+    func session(tabID: UUID) -> WorkspaceTabSession? {
+        sessions[tabID]
+    }
+
+    func closeTabPrompt(tabID: UUID) -> ReaderPrompt? {
+        guard let session = sessions[tabID] else { return nil }
+        return ReaderPromptPolicy.prompt(
+            for: .closeTab,
+            draftHasChanges: session.composerStore.hasUncommittedChanges,
+            documentHasChanges: session.model.hasUnsavedChanges
+        )
+    }
 
     func activate(tabID: UUID) {
         guard state.activate(tabID: tabID) else { return }
@@ -137,6 +152,20 @@ final class WorkspaceWindowModel: ObservableObject {
         session.searchSession.clear()
         session.model.close()
         objectWillChange.send()
+        return true
+    }
+
+    @discardableResult
+    func discardDraft(tabID: UUID) -> Bool {
+        guard let session = sessions[tabID] else { return false }
+        session.composerStore.end()
+        return true
+    }
+
+    @discardableResult
+    func discardDocumentChanges(tabID: UUID) -> Bool {
+        guard let session = sessions[tabID] else { return false }
+        session.model.abandonUnsavedChanges()
         return true
     }
 

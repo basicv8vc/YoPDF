@@ -1,7 +1,7 @@
 import Foundation
 
-/// Per-window, in-memory state that should survive rebuilding the sidebar but
-/// should be discarded when the reader opens a different PDF.
+/// Per-tab, in-memory state that survives rebuilding the sidebar and is
+/// isolated from other documents even when their load generations match.
 public struct ReaderNavigationMemory: Equatable, Sendable {
     public private(set) var documentGeneration: Int?
     public private(set) var selectedOutlineItemID: String?

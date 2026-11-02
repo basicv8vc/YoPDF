@@ -61,6 +61,7 @@ private struct ReaderWindow: View {
             model: tab.model,
             composerStore: tab.composerStore,
             searchSession: tab.searchSession,
+            navigationState: tab.navigationState,
             updateController: updateController,
             recentDocuments: recentDocuments,
             fileOpenRequests: fileOpenRequests,

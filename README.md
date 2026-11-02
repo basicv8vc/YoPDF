@@ -23,9 +23,9 @@ selected empty tab is reused, otherwise it opens in a new tab after validation.
 Reopening the same path selects its existing tab. **New Tab** (⌘T) creates an
 empty workspace tab, **Close Tab** (⌘W) closes the selected tab, and closing its
 last tab closes the window. **New Window** (⌘N) creates an independent workspace.
-A tab retains its own PDF session, page and zoom, find results, and unfinished
-note draft while the user switches tabs. Window close and quit check unsaved work
-across every tab.
+A tab retains its own PDF session, page and zoom, find results, sidebar
+navigation state, and unfinished note draft while the user switches tabs.
+Window close and quit check unsaved work across every tab.
 
 The next split-pane phase requires Toolbar, Context Menu, and Drag & Drop
 creation paths together. Its drag/drop safety and acceptance rules are recorded

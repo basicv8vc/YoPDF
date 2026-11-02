@@ -113,6 +113,8 @@ targets:
       # but their state transitions are intentionally unit tested.
       - path: YoPDF/App/FileOpenRequestQueue.swift
       - path: YoPDF/App/WorkspaceWindowModel.swift
+      - path: YoPDF/Reader/ReaderNavigationState.swift
+      - path: YoPDF/Reader/ReaderSidebarItems.swift
       # The sticker tests load the real Asset Catalog. Adding it to the test
       # bundle keeps them independent of where the .app was built; the separate
       # verification script checks the actual application bundle.
