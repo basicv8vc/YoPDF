@@ -33,8 +33,8 @@ final class TabCloseUITests: XCTestCase {
             withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)
         ).click()
 
-        let noteInput = app.descendants(matching: .any)
-            .matching(identifier: "pdf-compact-note-input").firstMatch
+        let noteInput = app.textFields
+            .matching(identifier: "pdf-thought-capture-popover").firstMatch
         XCTAssertTrue(noteInput.waitForExistence(timeout: 5), "Clicking a page should open its note draft.")
         noteInput.click()
         noteInput.typeText("Draft belongs to the background tab")
@@ -52,6 +52,11 @@ final class TabCloseUITests: XCTestCase {
 
         XCTAssertTrue(secondTab.waitForExistence(timeout: 5), "Cancel must keep the requested tab open.")
         XCTAssertTrue(noteInput.waitForExistence(timeout: 5), "Cancel must keep the draft on its owning tab.")
+        XCTAssertEqual(
+            noteInput.value as? String,
+            "Draft belongs to the background tab",
+            "Cancel must preserve the draft text."
+        )
     }
 
     private func applicationURL() throws -> URL {
