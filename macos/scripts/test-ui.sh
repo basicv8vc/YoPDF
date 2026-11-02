@@ -19,4 +19,5 @@ xcodebuild \
   -derivedDataPath "$DERIVED_DATA" \
   -parallel-testing-enabled NO \
   -only-testing:YoPDFUITests \
+  YOPDF_UI_TEST_SUFFIX=.uitest \
   test

@@ -69,9 +69,11 @@ targets:
       configs:
         # Debug gets its own bundle identifier so a Debug and a Release build can
         # coexist on the same machine without LaunchServices getting confused
-        # about which copy to activate.
+        # about which copy to activate. UI tests add a separate suffix so
+        # LaunchServices and XCTest cannot attach to another worktree's Debug app.
         Debug:
-          PRODUCT_BUNDLE_IDENTIFIER: dev.yopdf.provisional.debug
+          PRODUCT_BUNDLE_IDENTIFIER: dev.yopdf.provisional.debug$(YOPDF_UI_TEST_SUFFIX)
+          YOPDF_UI_TEST_SUFFIX: ""
         Release:
           PRODUCT_BUNDLE_IDENTIFIER: dev.yopdf.provisional
           # Ad-hoc signing otherwise injects com.apple.security.get-task-allow,

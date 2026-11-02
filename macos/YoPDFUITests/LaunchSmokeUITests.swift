@@ -6,7 +6,7 @@ final class LaunchSmokeUITests: XCTestCase {
     func testAppLaunchesAndExitsRepeatedly() throws {
         let applicationURL = try applicationURL()
 
-        for iteration in 1...3 {
+        for iteration in 1...12 {
             let app = XCUIApplication(url: applicationURL)
             app.launchArguments = ["-ApplePersistenceIgnoreState", "YES"]
             app.launch()

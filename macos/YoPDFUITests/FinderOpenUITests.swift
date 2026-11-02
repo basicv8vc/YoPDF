@@ -12,7 +12,7 @@ final class FinderOpenUITests: XCTestCase {
         let applicationURL = try applicationURL()
         let app = XCUIApplication(url: applicationURL)
         defer { app.terminate() }
-        app.launchArguments = ["-ApplePersistenceIgnoreState", "YES"]
+        configureFreshLaunch(app)
 
         app.open(first)
         XCTAssertTrue(app.buttons[first.lastPathComponent].waitForExistence(timeout: 15))
@@ -39,30 +39,41 @@ final class FinderOpenUITests: XCTestCase {
         let applicationURL = try applicationURL()
         let app = XCUIApplication(url: applicationURL)
         defer { app.terminate() }
-        app.launchArguments = ["-ApplePersistenceIgnoreState", "YES"]
+        configureFreshLaunch(app)
         app.launch()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 20))
         XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 10))
+        XCTAssertEqual(tabCount(in: app), 1, "A fresh reader starts with one empty workspace tab.")
 
         try await open([first, second], with: applicationURL)
         XCTAssertTrue(app.buttons[first.lastPathComponent].waitForExistence(timeout: 10))
         XCTAssertTrue(app.buttons[second.lastPathComponent].waitForExistence(timeout: 10))
-        assertWorkspaceTabs([first, second], in: app)
+        assertWorkspaceTabs([first, second], expectedTabCount: 2, in: app)
 
         try await open([third], with: applicationURL)
         try await open([fourth], with: applicationURL)
         XCTAssertTrue(app.buttons[third.lastPathComponent].waitForExistence(timeout: 10))
         XCTAssertTrue(app.buttons[fourth.lastPathComponent].waitForExistence(timeout: 10))
-        assertWorkspaceTabs([first, second, third, fourth], in: app)
+        assertWorkspaceTabs([first, second, third, fourth], expectedTabCount: 4, in: app)
 
         try await open([corrupt], with: applicationURL)
-        XCTAssertTrue(app.staticTexts["Couldn’t open this document"].waitForExistence(timeout: 5))
-        assertWorkspaceTabs([first, second, third, fourth], in: app)
-        app.typeKey(.return, modifierFlags: [])
+        let openFailure = app.staticTexts["Couldn’t open this document"]
+        XCTAssertTrue(openFailure.waitForExistence(timeout: 5))
+        assertWorkspaceTabs([first, second, third, fourth], expectedTabCount: 4, in: app)
+        let openFailureSheet = app.sheets.firstMatch
+        XCTAssertTrue(openFailureSheet.waitForExistence(timeout: 5),
+                      "The corrupt PDF failure should be presented in a dismissible sheet.")
+        let dismissOpenFailure = openFailureSheet.buttons["OK"]
+        XCTAssertTrue(dismissOpenFailure.waitForExistence(timeout: 5),
+                      "The corrupt PDF failure sheet should expose OK.")
+        dismissOpenFailure.click()
+        XCTAssertFalse(openFailure.waitForExistence(timeout: 2),
+                       "The corrupt PDF failure should be dismissed before later Finder actions.")
 
         // Same-window duplicate opens select the original tab without adding
         // a second independently editable session.
         try await open([first], with: applicationURL)
-        assertWorkspaceTabs([first, second, third, fourth], in: app)
+        assertWorkspaceTabs([first, second, third, fourth], expectedTabCount: 4, in: app)
 
         // ⌘W closes tabs one at a time; the last tab closes the native window.
         for expectedCount in [3, 2, 1] {
@@ -85,7 +96,7 @@ final class FinderOpenUITests: XCTestCase {
         let applicationURL = try applicationURL()
         let app = XCUIApplication(url: applicationURL)
         defer { app.terminate() }
-        app.launchArguments = ["-ApplePersistenceIgnoreState", "YES"]
+        configureFreshLaunch(app)
         app.launch()
         XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 10))
 
@@ -98,7 +109,7 @@ final class FinderOpenUITests: XCTestCase {
         let applicationURL = try applicationURL()
         let app = XCUIApplication(url: applicationURL)
         defer { app.terminate() }
-        app.launchArguments = ["-ApplePersistenceIgnoreState", "YES"]
+        configureFreshLaunch(app)
         app.launch()
         XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 10))
 
@@ -119,6 +130,15 @@ final class FinderOpenUITests: XCTestCase {
         ])
     }
 
+    private func configureFreshLaunch(_ app: XCUIApplication) {
+        if app.state != .notRunning {
+            app.terminate()
+            XCTAssertTrue(app.wait(for: .notRunning, timeout: 10),
+                          "An existing YoPDF process should exit before the Finder test starts.")
+        }
+        app.launchArguments = ["-ApplePersistenceIgnoreState", "YES"]
+    }
+
     private func open(_ urls: [URL], with applicationURL: URL) async throws {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.arguments = ["-ApplePersistenceIgnoreState", "YES"]
@@ -127,25 +147,93 @@ final class FinderOpenUITests: XCTestCase {
         )
     }
 
-    private func assertWorkspaceTabs(_ documents: [URL], in app: XCUIApplication) {
-        XCTAssertEqual(app.windows.count, 1, "Finder opens belong to the current workspace window.")
+    private func assertWorkspaceTabs(
+        _ documents: [URL],
+        expectedTabCount: Int? = nil,
+        in app: XCUIApplication
+    ) {
+        let tabButtons = workspaceTabButtons(in: app)
+        let closeButtons = workspaceTabCloseButtons(in: app)
+        let expectedTabCount = expectedTabCount ?? documents.count
+        let expectedCloseButtonCount = expectedTabCount > 1 ? expectedTabCount : 0
+        let windowCount = app.windows.count
+        let diagnostics = workspaceDiagnostics(
+            documents: documents,
+            tabButtons: tabButtons,
+            closeButtons: closeButtons,
+            in: app
+        )
+
+        if windowCount != 1
+            || tabButtons.count != expectedTabCount
+            || closeButtons.count != expectedCloseButtonCount {
+            XCTContext.runActivity(named: "Workspace accessibility diagnostics") { activity in
+                let attachment = XCTAttachment(string: diagnostics)
+                attachment.name = "Workspace tabs and close buttons"
+                activity.add(attachment)
+            }
+        }
+
+        XCTAssertEqual(windowCount, 1,
+                       "Finder opens belong to the current workspace window.\n\(diagnostics)")
         for document in documents {
             XCTAssertTrue(
                 app.buttons[document.lastPathComponent].waitForExistence(timeout: 5),
                 "Expected a workspace tab for \(document.lastPathComponent)."
             )
         }
-        XCTAssertEqual(tabCount(in: app), documents.count,
-                       "Duplicate opens must not create duplicate tabs.")
+        XCTAssertEqual(tabButtons.count, expectedTabCount,
+                       "Duplicate opens must not create duplicate tabs.\n\(diagnostics)")
+        XCTAssertEqual(closeButtons.count, expectedCloseButtonCount,
+                       "Each tab in a multi-tab workspace should expose one close button.\n\(diagnostics)")
     }
 
     private func tabCount(in app: XCUIApplication) -> Int {
-        let closeButtons = app.buttons.matching(
+        workspaceTabButtons(in: app).count
+    }
+
+    private func workspaceTabButtons(in app: XCUIApplication) -> [XCUIElement] {
+        app.buttons.matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "workspace-tab-")
+        ).allElementsBoundByIndex.filter {
+            !$0.identifier.hasPrefix("workspace-tab-close-")
+        }
+    }
+
+    private func workspaceTabCloseButtons(in app: XCUIApplication) -> [XCUIElement] {
+        app.buttons.matching(
             NSPredicate(format: "identifier BEGINSWITH %@", "workspace-tab-close-")
-        )
-        // Every tab gets a close button when there is more than one tab. The
-        // last tab closes its window, so it deliberately has no close button.
-        return closeButtons.count > 0 ? closeButtons.count : 1
+        ).allElementsBoundByIndex
+    }
+
+    private func workspaceDiagnostics(
+        documents: [URL],
+        tabButtons: [XCUIElement],
+        closeButtons: [XCUIElement],
+        in app: XCUIApplication
+    ) -> String {
+        let windowDescriptions = app.windows.allElementsBoundByIndex.map {
+            "identifier=\($0.identifier) title=\($0.title)"
+        }
+        let tabDescriptions = tabButtons.map {
+            "identifier=\($0.identifier) label=\($0.label)"
+        }
+        let closeDescriptions = closeButtons.map {
+            "identifier=\($0.identifier) label=\($0.label)"
+        }
+        let pdfDescriptions = documents.map { url in
+            "\(url.lastPathComponent) exists=\(FileManager.default.fileExists(atPath: url.path))"
+        }
+
+        return [
+            "Workspace window count: \(app.windows.count)",
+            "Workspace windows:\n\(windowDescriptions.joined(separator: "\n"))",
+            "Workspace tab button count: \(tabButtons.count)",
+            "Workspace tab buttons (identifier | label):\n\(tabDescriptions.joined(separator: "\n"))",
+            "Workspace close button count: \(closeButtons.count)",
+            "Workspace close buttons (identifier | label):\n\(closeDescriptions.joined(separator: "\n"))",
+            "Fixture PDF files:\n\(pdfDescriptions.joined(separator: "\n"))"
+        ].joined(separator: "\n\n")
     }
 
     private func waitForTabCount(_ expected: Int, in app: XCUIApplication) -> Bool {
