@@ -111,10 +111,14 @@ public final class PDFDocumentModel: ObservableObject {
     /// do not need persistence can leave this nil.
     private let recentDocuments: RecentDocumentsStore?
 
-    /// The persisted colour defaults. Owned by the model so the toolbar and the
-    /// annotations created from it read one value, and so tests can point it at
-    /// an isolated `UserDefaults` suite.
-    let markupPreferences: MarkupColorPreferences
+    /// The persisted colour defaults, shared by every reader window.
+    ///
+    /// Owned by the model so the toolbar and the annotations created from it
+    /// read one value, and so tests can point it at an isolated `UserDefaults`
+    /// suite. The default is the app-wide instance: a colour chosen in one
+    /// window has to repaint the swatch in the others, and only a shared
+    /// observable object can do that.
+    public let markupPreferences: MarkupColorPreferences
 
     /// Model-owned undo history.
     ///
@@ -153,7 +157,7 @@ public final class PDFDocumentModel: ObservableObject {
     public init(
         access: any SecurityScopeAccessing = SystemSecurityScopeAccess(),
         io: any DocumentStoreIO = SystemDocumentStoreIO(),
-        markupPreferences: MarkupColorPreferences = MarkupColorPreferences(),
+        markupPreferences: MarkupColorPreferences = .shared,
         recentDocuments: RecentDocumentsStore? = nil
     ) {
         self.store = DocumentStore(access: access, io: io)

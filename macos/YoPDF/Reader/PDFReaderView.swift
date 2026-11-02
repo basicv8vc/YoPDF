@@ -623,15 +623,10 @@ struct PDFReaderView: View {
                 }
                 .disabled(!model.canAddMarkup(.highlight))
 
-                MarkupColorControl(
-                    title: "Highlight colour",
-                    paletteTitle: "Colour for new highlight marks",
-                    help: "Choose the colour for new highlight marks",
-                    accessibilityIdentifier: "pdf-reader-highlight-color",
-                    color: model.defaultMarkupColor(for: .highlight)
-                ) { color in
-                    model.setDefaultMarkupColor(color, for: .highlight)
-                }
+                DefaultMarkupColorControl(
+                    preferences: model.markupPreferences,
+                    kind: .highlight
+                )
 
                 MarkupToolButton(
                     title: "Underline Selection",
@@ -642,15 +637,10 @@ struct PDFReaderView: View {
                 }
                 .disabled(!model.canAddMarkup(.underline))
 
-                MarkupColorControl(
-                    title: "Underline colour",
-                    paletteTitle: "Colour for new underline marks",
-                    help: "Choose the colour for new underline marks",
-                    accessibilityIdentifier: "pdf-reader-underline-color",
-                    color: model.defaultMarkupColor(for: .underline)
-                ) { color in
-                    model.setDefaultMarkupColor(color, for: .underline)
-                }
+                DefaultMarkupColorControl(
+                    preferences: model.markupPreferences,
+                    kind: .underline
+                )
 
                 MarkupToolButton(
                     title: "Strike Out Selection",

@@ -463,6 +463,11 @@ still one annotation per page.
   `dev.yopdf.markup.underlineColorHex` and
   `dev.yopdf.markup.strikeOutColorHex`. Choosing a colour for an existing
   annotation is a document edit and never rewrites any default.
+- **The swatch follows the stored default in every window.** All readers share
+  one `MarkupColorPreferences` object, which publishes a revision whenever a
+  stored value actually changes. `UserDefaults` notifies no view, so without
+  that signal a colour chosen in one window would leave the other windows'
+  swatches — and the popover's checkmark — showing the previous colour.
 - **Convert cycles through the three kinds.** Highlight → Underline → Strike Out
   → Highlight, so one Convert control reaches every kind and Undo restores the
   previous subtype in a single step.

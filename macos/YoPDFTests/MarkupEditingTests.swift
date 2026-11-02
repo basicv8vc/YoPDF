@@ -42,14 +42,22 @@ final class MarkupEditingTests: XCTestCase {
 
     private func makeModel(
         suite: String? = nil,
+        preferences: MarkupColorPreferences? = nil,
         io: any DocumentStoreIO = SystemDocumentStoreIO()
     ) -> PDFDocumentModel {
-        let suite = suite ?? makeSuite()
-        let defaults = UserDefaults(suiteName: suite)!
+        let resolvedPreferences: MarkupColorPreferences
+        if let preferences {
+            resolvedPreferences = preferences
+        } else {
+            let suite = suite ?? makeSuite()
+            resolvedPreferences = MarkupColorPreferences(
+                defaults: UserDefaults(suiteName: suite)!
+            )
+        }
         return PDFDocumentModel(
             access: SecurityScopeSpy(),
             io: io,
-            markupPreferences: MarkupColorPreferences(defaults: defaults)
+            markupPreferences: resolvedPreferences
         )
     }
 
@@ -219,6 +227,74 @@ final class MarkupEditingTests: XCTestCase {
         let reopenedModel = makeModel(suite: suite)
         XCTAssertEqual(hex(reopenedModel.defaultMarkupColor(for: .highlight)), "34C759")
         XCTAssertEqual(hex(reopenedModel.defaultMarkupColor(for: .underline)), "007AFF")
+    }
+
+    func testDefaultColourRevisionPublishesOnlyRealChanges() {
+        let preferences = MarkupColorPreferences(
+            defaults: UserDefaults(suiteName: makeSuite())!
+        )
+        XCTAssertEqual(preferences.revision, 0)
+
+        XCTAssertTrue(preferences.setColor(
+            MarkupColorPalette.color(fromHex: "007AFF"),
+            for: .highlight
+        ))
+        XCTAssertEqual(preferences.revision, 1)
+        XCTAssertEqual(hex(preferences.color(for: .highlight)), "007AFF")
+
+        XCTAssertTrue(
+            preferences.setColor(MarkupColorPalette.color(fromHex: "007AFF"), for: .highlight),
+            "re-picking the stored colour is still accepted"
+        )
+        XCTAssertEqual(
+            preferences.revision,
+            1,
+            "an unchanged value must not redraw every toolbar"
+        )
+
+        XCTAssertFalse(preferences.setColor(.clear, for: .highlight))
+        XCTAssertEqual(
+            preferences.revision,
+            1,
+            "a refused colour must not publish a change"
+        )
+
+        XCTAssertTrue(preferences.setColor(
+            MarkupColorPalette.color(fromHex: "34C759"),
+            for: .underline
+        ))
+        XCTAssertEqual(preferences.revision, 2)
+        XCTAssertEqual(hex(preferences.color(for: .highlight)), "007AFF")
+    }
+
+    /// Two reader windows must not disagree about the colour a new mark will
+    /// use: each window owns a model, but the preference object is shared and
+    /// publishes the change once.
+    func testReaderWindowsShareOnePreferenceObjectAndSeeEachOthersDefault() {
+        let preferences = MarkupColorPreferences(
+            defaults: UserDefaults(suiteName: makeSuite())!
+        )
+        let windowA = makeModel(preferences: preferences)
+        let windowB = makeModel(preferences: preferences)
+
+        XCTAssertTrue(windowA.markupPreferences === windowB.markupPreferences)
+        XCTAssertEqual(hex(windowB.defaultMarkupColor(for: .highlight)), "FFD60A")
+
+        XCTAssertTrue(windowA.setDefaultMarkupColor(
+            MarkupColorPalette.color(fromHex: "007AFF"),
+            for: .highlight
+        ))
+
+        XCTAssertEqual(hex(windowB.defaultMarkupColor(for: .highlight)), "007AFF")
+        XCTAssertEqual(preferences.revision, 1)
+    }
+
+    func testModelsDefaultToTheAppWidePreferenceObject() {
+        let first = PDFDocumentModel(access: SecurityScopeSpy())
+        let second = PDFDocumentModel(access: SecurityScopeSpy())
+
+        XCTAssertTrue(first.markupPreferences === second.markupPreferences)
+        XCTAssertTrue(first.markupPreferences === MarkupColorPreferences.shared)
     }
 
     func testCustomColourIsStoredOpaqueAndTransparentIsRejected() throws {

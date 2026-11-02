@@ -86,13 +86,40 @@ struct MarkupColorControl: View {
             .frame(width: 25, height: 26)
             .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         }
-        .buttonStyle(ReaderInteractiveButtonStyle())
+        // Zero insets keep the swatch the same 28x28 target as the icon-only
+        // tools, so the group's height is not stretched by the two swatches.
+        .buttonStyle(ReaderInteractiveButtonStyle(insets: EdgeInsets()))
         .accessibilityLabel(title)
         .accessibilityValue(MarkupColorPalette.hex(from: color) ?? "")
         .accessibilityIdentifier(accessibilityIdentifier)
         .help(help)
         .popover(isPresented: $isPopoverPresented, arrowEdge: .bottom) {
             MarkupColorPopover(title: paletteTitle, color: color, onSelect: onSelect)
+        }
+    }
+}
+
+/// A swatch for the colour the next new mark of `kind` will use.
+///
+/// It observes `MarkupColorPreferences` rather than the document model: a
+/// default colour is an application preference, not a document edit, so the
+/// model publishes nothing when it changes. Observing the shared preferences
+/// object is also what keeps two reader windows in step, and it is what
+/// refreshes the swatch and the popover's checkmark immediately after a choice.
+struct DefaultMarkupColorControl: View {
+
+    @ObservedObject var preferences: MarkupColorPreferences
+    let kind: MarkupKind
+
+    var body: some View {
+        MarkupColorControl(
+            title: "\(kind.title) colour",
+            paletteTitle: "Colour for new \(kind.title.lowercased()) marks",
+            help: "Choose the colour for new \(kind.title.lowercased()) marks",
+            accessibilityIdentifier: "pdf-reader-\(kind.rawValue)-color",
+            color: preferences.color(for: kind)
+        ) { color in
+            preferences.setColor(color, for: kind)
         }
     }
 }

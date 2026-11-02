@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import PDFKit
 
 /// The markup annotations YoPDF can create and edit.
@@ -200,10 +201,26 @@ public enum MarkupColorPalette {
 /// The keys are YoPDF's own and nothing else's preference namespace is read or
 /// written. Importing another app's defaults would make its private storage a
 /// compatibility contract YoPDF never agreed to.
-public struct MarkupColorPreferences {
+///
+/// One instance is shared by every reader window and observed by the toolbar.
+/// `UserDefaults` publishes nothing, so a colour chosen in one window would
+/// otherwise leave the other windows' swatches — and the popover's checkmark —
+/// showing the previous value. `revision` is that change signal; it advances
+/// only when a stored value actually changes, so re-picking the current colour
+/// does not redraw the readers.
+@MainActor
+public final class MarkupColorPreferences: ObservableObject {
+    /// The app-wide defaults. Models use this unless a test injects an
+    /// isolated suite.
+    public static let shared = MarkupColorPreferences()
+
     public static let highlightColorKey = "dev.yopdf.markup.highlightColorHex"
     public static let underlineColorKey = "dev.yopdf.markup.underlineColorHex"
     public static let strikeOutColorKey = "dev.yopdf.markup.strikeOutColorHex"
+
+    /// Advances when a stored default changes. SwiftUI cannot observe
+    /// `UserDefaults` directly, so this is what refreshes a swatch.
+    @Published public private(set) var revision = 0
 
     private let defaults: UserDefaults
 
@@ -219,7 +236,6 @@ public struct MarkupColorPreferences {
         }
     }
 
-    @MainActor
     public func color(for kind: MarkupKind) -> NSColor {
         MarkupColorPalette.color(
             forHex: defaults.string(forKey: Self.key(for: kind)),
@@ -227,13 +243,15 @@ public struct MarkupColorPreferences {
         )
     }
 
-    @MainActor
     @discardableResult
     public func setColor(_ color: NSColor, for kind: MarkupKind) -> Bool {
         guard let normalized = MarkupColorPalette.normalized(color),
               let hex = MarkupColorPalette.hex(from: normalized)
         else { return false }
+        // An unchanged value must not invalidate every reader's toolbar.
+        guard defaults.string(forKey: Self.key(for: kind)) != hex else { return true }
         defaults.set(hex, forKey: Self.key(for: kind))
+        revision &+= 1
         return true
     }
 }
