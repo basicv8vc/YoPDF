@@ -48,6 +48,7 @@ final class WorkspaceCloseUITests: XCTestCase {
         let firstDocumentEdit = "PDF edit in first window \(runID)"
         try createNoteDraft(firstDocumentEdit, on: firstWindowFiles[1], in: app)
         try commitDraftWithAutoSaveBlocked(for: firstWindowFiles[1], in: app)
+        let firstWorkspaceWindow = assertTabsShareWindow(firstWindowFiles, in: app)
 
         app.typeKey("n", modifierFlags: .command)
         XCTAssertTrue(waitForWindowCount(2, in: app), "⌘N should create a second workspace window.")
@@ -58,6 +59,14 @@ final class WorkspaceCloseUITests: XCTestCase {
         let secondDocumentEdit = "PDF edit in second window \(runID)"
         try createNoteDraft(secondDocumentEdit, on: secondWindowFiles[1], in: app)
         try commitDraftWithAutoSaveBlocked(for: secondWindowFiles[1], in: app)
+        let secondWorkspaceWindow = assertTabsShareWindow(secondWindowFiles, in: app)
+        XCTAssertEqual(app.windows.count, 2, "The quit scenario should contain exactly two workspace windows.")
+        for file in secondWindowFiles {
+            assertTab(file, isNotIn: firstWorkspaceWindow, in: app)
+        }
+        for file in firstWindowFiles {
+            assertTab(file, isNotIn: secondWorkspaceWindow, in: app)
+        }
 
         app.typeKey("q", modifierFlags: .command)
         let cancelQuit = app.sheets.firstMatch.buttons["Cancel"]
@@ -340,6 +349,39 @@ final class WorkspaceCloseUITests: XCTestCase {
         let window = app.windows.containing(.button, identifier: tab.identifier).firstMatch
         XCTAssertTrue(window.waitForExistence(timeout: 5), "The selected tab should belong to a reader window.")
         return window
+    }
+
+    private func assertTabsShareWindow(_ files: [URL], in app: XCUIApplication) -> XCUIElement {
+        guard let firstFile = files.first else {
+            XCTFail("At least one PDF is required to identify its workspace window.")
+            return app.windows.firstMatch
+        }
+
+        let firstTab = tab(for: firstFile, in: app)
+        XCTAssertTrue(firstTab.waitForExistence(timeout: 10), "Expected tab \(firstFile.lastPathComponent).")
+        let matchingWindows = app.windows.containing(.button, identifier: firstTab.identifier)
+        XCTAssertEqual(matchingWindows.count, 1,
+                       "Expected exactly one workspace window to own \(firstFile.lastPathComponent).")
+        let workspaceWindow = matchingWindows.firstMatch
+
+        for file in files.dropFirst() {
+            let currentTab = tab(for: file, in: app)
+            XCTAssertTrue(currentTab.waitForExistence(timeout: 10), "Expected tab \(file.lastPathComponent).")
+            XCTAssertTrue(
+                workspaceWindow.buttons.matching(identifier: currentTab.identifier).firstMatch.exists,
+                "Expected PDFs \(firstFile.lastPathComponent) and \(file.lastPathComponent) in the same window."
+            )
+        }
+        return workspaceWindow
+    }
+
+    private func assertTab(_ file: URL, isNotIn window: XCUIElement, in app: XCUIApplication) {
+        let targetTab = tab(for: file, in: app)
+        XCTAssertTrue(targetTab.waitForExistence(timeout: 10), "Expected tab \(file.lastPathComponent).")
+        XCTAssertFalse(
+            window.buttons.matching(identifier: targetTab.identifier).firstMatch.exists,
+            "PDF \(file.lastPathComponent) must not appear in the other workspace window."
+        )
     }
 
     private func tab(for file: URL, in app: XCUIApplication) -> XCUIElement {
