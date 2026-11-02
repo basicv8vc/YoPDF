@@ -22,18 +22,13 @@ import YoPDFCore
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
-    /// Finder can ask the app to open a document before SwiftUI has created a
-    /// reader window. The queue keeps one request until the frontmost reader
-    /// has handled it. A second request is rejected while that request is
-    /// pending or waiting for the user's unsaved-work decision.
+    /// Finder can ask the app to open documents before SwiftUI has created a
+    /// reader window. The queue accepts batches and delivers them FIFO, one
+    /// request at a time, to an available workspace.
     let fileOpenRequests = FileOpenRequestQueue()
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        guard urls.count == 1, let url = urls.first, url.isFileURL else {
-            application.reply(toOpenOrPrint: .failure)
-            return
-        }
-        let reply: NSApplication.DelegateReply = acceptOpenRequest(url, from: application)
+        let reply: NSApplication.DelegateReply = acceptOpenRequests(urls, from: application)
             ? .success
             : .failure
         application.reply(toOpenOrPrint: reply)
@@ -45,23 +40,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
-        // Finder can deliver several files in one callback. The reader routes
-        // one request at a time, so refuse a batch instead of silently opening
-        // only one of its PDFs.
-        guard filenames.count == 1, let filename = filenames.first else {
-            sender.reply(toOpenOrPrint: .failure)
-            return
-        }
-
-        let reply: NSApplication.DelegateReply = acceptOpenRequest(
-            URL(fileURLWithPath: filename),
-            from: sender
-        ) ? .success : .failure
+        let urls = filenames.map { URL(fileURLWithPath: $0) }
+        let reply: NSApplication.DelegateReply = acceptOpenRequests(urls, from: sender)
+            ? .success
+            : .failure
         sender.reply(toOpenOrPrint: reply)
     }
 
     private func acceptOpenRequest(_ url: URL, from application: NSApplication) -> Bool {
-        guard fileOpenRequests.enqueue(url) else { return false }
+        acceptOpenRequests([url], from: application)
+    }
+
+    private func acceptOpenRequests(_ urls: [URL], from application: NSApplication) -> Bool {
+        guard fileOpenRequests.enqueue(urls) else { return false }
 
         // A cold Finder launch already gets the WindowGroup's initial window.
         // For an app that is still running after all reader windows were closed,

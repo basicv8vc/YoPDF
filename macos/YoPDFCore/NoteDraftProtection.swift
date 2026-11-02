@@ -453,6 +453,7 @@ public enum ReaderAction: Equatable, Sendable {
     case open(URL)
     case save
     case saveAs
+    case closeTab
     case closeWindow
     case quit
     /// Replacing the open composer with another note.
@@ -497,7 +498,7 @@ public enum ReaderPromptPolicy {
         documentHasChanges: Bool
     ) -> ReaderPrompt {
         switch action {
-        case .open, .closeWindow, .quit:
+        case .open, .closeTab, .closeWindow, .quit:
             return documentHasChanges ? .document : .none
         case .save, .saveAs, .compose:
             return .none

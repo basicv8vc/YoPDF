@@ -32,6 +32,69 @@ private struct ReaderPDFDropDestination: ViewModifier {
     }
 }
 
+private struct WorkspaceTabStrip: View {
+    @ObservedObject var workspace: WorkspaceWindowModel
+    let closeTab: (UUID) -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ScrollView(.horizontal) {
+                HStack(spacing: 4) {
+                    ForEach(workspace.tabs) { tab in
+                        let isActive = tab.id == workspace.activeTabID
+                        HStack(spacing: 2) {
+                            Button {
+                                workspace.activate(tabID: tab.id)
+                            } label: {
+                                Text(tab.title)
+                                    .lineLimit(1)
+                                    .frame(maxWidth: 190, alignment: .leading)
+                                    .padding(.leading, 10)
+                                    .padding(.vertical, 6)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(tab.title)
+                            .accessibilityIdentifier("workspace-tab-\(tab.id.uuidString)")
+                            .accessibilityAddTraits(isActive ? .isSelected : [])
+
+                            if workspace.tabs.count > 1 {
+                                Button {
+                                    closeTab(tab.id)
+                                } label: {
+                                    Image(systemName: "xmark")
+                                        .font(.system(size: 9, weight: .semibold))
+                                        .frame(width: 22, height: 22)
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Close \(tab.title)")
+                                .accessibilityIdentifier("workspace-tab-close-\(tab.id.uuidString)")
+                            }
+                        }
+                        .background(
+                            isActive ? Color.accentColor.opacity(0.16) : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 7)
+                        )
+                    }
+                }
+            }
+            .scrollIndicators(.hidden)
+
+            Button {
+                _ = workspace.createTab()
+            } label: {
+                Image(systemName: "plus")
+                    .frame(width: 26, height: 26)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("New Tab")
+            .accessibilityIdentifier("workspace-new-tab")
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 38)
+        .background(.bar)
+    }
+}
+
 private struct RecentDocumentsHeadingWidthPreferenceKey: PreferenceKey {
     static let defaultValue: CGFloat = 110
 
@@ -45,39 +108,31 @@ private struct RecentDocumentsHeadingWidthPreferenceKey: PreferenceKey {
 
 struct PDFReaderView: View {
 
+    @ObservedObject var workspace: WorkspaceWindowModel
     @ObservedObject var model: PDFDocumentModel
+    @ObservedObject var composerStore: NoteComposerStore
+    @ObservedObject var searchSession: PDFSearchSession
     @ObservedObject var updateController: SparkleUpdateController
     @ObservedObject var recentDocuments: RecentDocumentsStore
     @ObservedObject var fileOpenRequests: FileOpenRequestQueue
     let canReceiveFinderOpenRequest: Bool
-    let openReaderWindow: @MainActor (URL, UUID?) -> Void
 
     @State private var isImporterPresented = false
     @State private var recentDocumentsHeadingWidth = RecentDocumentsHeadingWidthPreferenceKey.defaultValue
     @State private var pendingRecentRelink: RecentDocument?
-    /// A Finder request stays reserved while its Save / Discard / Cancel prompt
-    /// is visible, so another event cannot replace the action in that prompt.
-    @State private var finderOpenRequestAwaitingResolution = false
     @State private var finderOpenRequestID: UUID?
     @State private var isDropTargeted = false
     @State private var prompt: Prompt?
+    @State private var pendingOpenFailure: PDFDocumentModel.LoadError?
     @State private var isSidebarVisible = true
     @State private var sidebarSection: ReaderSidebarSection = .thumbnails
     @StateObject private var readerNavigationState = ReaderNavigationState()
     @State private var pendingNavigationDestination: PDFDestination?
     @State private var navigationRevision = 0
     @State private var isSearchPresented = false
-    @State private var searchQuery = ""
     @FocusState private var isSearchFieldFocused: Bool
     /// Installed on the window so closing it cannot drop unsaved edits.
     @State private var closeGuard = WindowCloseGuard()
-    /// The window's one note composer, and the draft that outlives its popover.
-    ///
-    /// The text is not `@State` here or in the popover: both are rebuilt often
-    /// enough — a save, another annotation edit, a click outside — that either
-    /// would throw typed text away.
-    @StateObject private var composerStore = NoteComposerStore()
-    @StateObject private var searchSession = PDFSearchSession()
     /// True while the next page click places a page note.
     @State private var isPlacingNote = false
     /// Converts page rectangles into popover anchors through the live PDFView.
@@ -96,6 +151,7 @@ struct PDFReaderView: View {
         case relink(URL, RecentDocument)
         case save
         case saveAs
+        case closeTab(UUID)
         case closeWindow
         case quit
         /// Replacing the open composer with another note.
@@ -113,6 +169,7 @@ struct PDFReaderView: View {
             case let .relink(url, _): return .open(url)
             case .save: return .save
             case .saveAs: return .saveAs
+            case .closeTab: return .closeTab
             case .closeWindow: return .closeWindow
             case .quit: return .quit
             case .compose: return .compose
@@ -124,6 +181,7 @@ struct PDFReaderView: View {
         /// The note has text that is not in the document yet.
         case draftChanges(PendingAction)
         case unsavedChanges(PendingAction)
+        case workspaceChanges
         case saveProblem(title: String, message: String, offersSaveAs: Bool)
         case recentDocumentUnavailable(RecentDocument)
 
@@ -133,6 +191,8 @@ struct PDFReaderView: View {
                 return "draft-\(String(describing: action))"
             case let .unsavedChanges(action):
                 return "unsaved-\(String(describing: action))"
+            case .workspaceChanges:
+                return "workspace-changes"
             case let .saveProblem(title, _, _):
                 return "problem-\(title)"
             case let .recentDocumentUnavailable(item):
@@ -146,6 +206,8 @@ struct PDFReaderView: View {
                 return "Save this note first?"
             case .unsavedChanges:
                 return "Save changes before continuing?"
+            case .workspaceChanges:
+                return "Save changes before closing this workspace?"
             case let .saveProblem(title, _, _):
                 return title
             case .recentDocumentUnavailable:
@@ -163,13 +225,15 @@ struct PDFReaderView: View {
                     return "“\(url.lastPathComponent)” cannot be opened while this document has unsaved changes."
                 case let .relink(url, _):
                     return "“\(url.lastPathComponent)” cannot be opened while this document has unsaved changes."
-                case .closeWindow, .quit:
+                case .closeTab, .closeWindow, .quit:
                     return "This document has changes that are not in the file yet."
                 case .save, .saveAs, .compose:
                     return "This document has changes that are not in the file yet."
                 }
             case let .saveProblem(_, message, _):
                 return message
+            case .workspaceChanges:
+                return "This workspace has unsaved PDF changes or note drafts in one or more tabs."
             case let .recentDocumentUnavailable(item):
                 return "YoPDF can no longer resolve the saved location for “\(item.displayName)”. Locate the PDF to reconnect this recent item."
             }
@@ -188,7 +252,7 @@ struct PDFReaderView: View {
                 return base + " “\(url.lastPathComponent)” cannot be opened until you save or discard it."
             case let .relink(url, _):
                 return base + " “\(url.lastPathComponent)” cannot be opened until you save or discard it."
-            case .closeWindow, .quit:
+            case .closeTab, .closeWindow, .quit:
                 return base + " Saving it puts the note in the document; the file itself still has to be saved."
             case .compose:
                 return base + " Save it or discard it before opening another note."
@@ -215,6 +279,10 @@ struct PDFReaderView: View {
                 Button("Save") { saveThen(action) }
                 Button("Don’t Save", role: .destructive) { discardThen(action) }
                 Button("Cancel", role: .cancel) { cancel(action) }
+            case .workspaceChanges:
+                Button("Save All") { saveWorkspaceThenClose() }
+                Button("Don’t Save", role: .destructive) { discardWorkspaceThenClose() }
+                Button("Cancel", role: .cancel) { self.prompt = nil }
             case let .saveProblem(_, _, offersSaveAs):
                 if offersSaveAs {
                     Button("Save As…") {
@@ -265,10 +333,10 @@ struct PDFReaderView: View {
                     // Termination is committed, so the draft goes with the
                     // document's edits. Until this point a "Discard Draft" is
                     // only an intent for the quit attempt.
-                    composerStore.end()
+                    workspace.discardAllDrafts()
                 },
                 discardDocumentChanges: {
-                    model.abandonUnsavedChanges()
+                    workspace.discardAllDocumentChanges()
                 },
                 onUnsavedChanges: handleCloseIntent,
                 onWindowAvailable: {
@@ -286,6 +354,7 @@ struct PDFReaderView: View {
                     }
                 },
                 onWindowClosed: {
+                    workspace.closeAllSessions()
                     guard fileOpenRequests.readerWindowDidClose(readerID: readerID) else { return }
                     if WindowCloseGuard.installedGuards(among: NSApp.windows).isEmpty {
                         fileOpenRequests.openReaderWindowIfAvailable()
@@ -299,6 +368,8 @@ struct PDFReaderView: View {
         lifecycleReader
             .focusedSceneValue(\.documentModel, model)
             .focusedSceneValue(\.openDocument, { isImporterPresented = true })
+            .focusedSceneValue(\.newWorkspaceTab, { _ = workspace.createTab() })
+            .focusedSceneValue(\.closeWorkspaceTab, { requestCloseTab(workspace.activeTabID) })
             .focusedSceneValue(\.openRecentDocument, { requestOpenRecent($0) })
             .focusedSceneValue(\.saveDocument, { requestSave() })
             .focusedSceneValue(\.saveDocumentAs, { requestSaveAs() })
@@ -361,20 +432,18 @@ struct PDFReaderView: View {
                 presentLatestAutoSaveFailure()
             }
             .onChange(of: model.loadGeneration) { _, _ in
-                closeSearch()
+                isPlacingNote = false
                 pendingNavigationDestination = nil
+                composerStore.reconcile(with: model)
             }
             .onChange(of: model.isLoaded) { _, isLoaded in
                 if !isLoaded { closeSearch() }
             }
             .onChange(of: model.document.map(ObjectIdentifier.init)) { _, _ in
+                isPlacingNote = false
+                pendingNavigationDestination = nil
                 searchSession.documentWasReplaced(with: model.document)
             }
-            .onChange(of: searchQuery) { _, query in
-                guard isSearchPresented else { return }
-                searchSession.search(query, in: model.document)
-            }
-            .onDisappear(perform: closeSearch)
     }
 
     private var urlReader: some View {
@@ -406,6 +475,7 @@ struct PDFReaderView: View {
             orderedReaders: orderedReaders.map(ObjectIdentifier.init)
         )
         guard prompt == nil,
+              currentOpenError == nil,
               !isImporterPresented,
               let window = closeGuard.window,
               target == ObjectIdentifier(window),
@@ -420,20 +490,12 @@ struct PDFReaderView: View {
         NSApp.activate(ignoringOtherApps: true)
 
         finderOpenRequestID = request.id
-        finderOpenRequestAwaitingResolution = !model.isLoaded
-            && promptKind(for: .open(request.url)) != .none
         requestOpen(request.url)
-        if !finderOpenRequestAwaitingResolution {
-            finishFinderOpenRequest(requestID: request.id)
-        }
+        finishFinderOpenRequest(requestID: request.id)
     }
 
     private func finishFinderOpenRequestIfResolved() {
-        guard finderOpenRequestAwaitingResolution,
-              prompt == nil,
-              let requestID = finderOpenRequestID
-        else { return }
-        finderOpenRequestAwaitingResolution = false
+        guard prompt == nil, let requestID = finderOpenRequestID else { return }
         finishFinderOpenRequest(requestID: requestID)
     }
 
@@ -450,7 +512,7 @@ struct PDFReaderView: View {
             .fileImporter(
                 isPresented: $isImporterPresented,
                 allowedContentTypes: [.pdf],
-                allowsMultipleSelection: false
+                allowsMultipleSelection: pendingRecentRelink == nil
             ) { result in
                 handleImportResult(result)
             }
@@ -463,8 +525,16 @@ struct PDFReaderView: View {
             requestOpen(url, relinking: item)
             return
         }
-        guard case let .success(urls) = result, let url = urls.first else { return }
-        requestOpen(url)
+        guard case let .success(urls) = result else { return }
+        var firstFailure: PDFDocumentModel.LoadError?
+        for url in urls {
+            let failure = requestOpen(url)
+            if firstFailure == nil { firstFailure = failure }
+        }
+        if let firstFailure {
+            model.dismissError()
+            pendingOpenFailure = firstFailure
+        }
     }
 
     private func presentLatestAutoSaveFailure() {
@@ -486,6 +556,19 @@ struct PDFReaderView: View {
         )
     }
 
+    private var currentOpenError: PDFDocumentModel.LoadError? {
+        model.lastError ?? pendingOpenFailure
+    }
+
+    private func dismissOpenError() {
+        model.dismissError()
+        pendingOpenFailure = nil
+        Task { @MainActor in
+            await Task.yield()
+            openFileRequestIfReady()
+        }
+    }
+
     private func openScreenshotPDFIfConfigured() {
         #if DEBUG
         let environmentPath = ProcessInfo.processInfo.environment["YOPDF_SCREENSHOT_PDF"]
@@ -500,6 +583,8 @@ struct PDFReaderView: View {
 
     private var readerLayout: some View {
         VStack(spacing: 0) {
+            WorkspaceTabStrip(workspace: workspace, closeTab: requestCloseTab)
+            Divider()
             toolbar
             Divider()
             if isSearchPresented {
@@ -774,7 +859,10 @@ struct PDFReaderView: View {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(.secondary)
 
-            TextField("Find in PDF", text: $searchQuery)
+            TextField("Find in PDF", text: Binding(
+                get: { searchSession.inputQuery },
+                set: { searchSession.search($0, in: model.document) }
+            ))
                 .textFieldStyle(.plain)
                 .focused($isSearchFieldFocused)
                 .accessibilityIdentifier("pdf-search-field")
@@ -782,9 +870,9 @@ struct PDFReaderView: View {
                 .onExitCommand(perform: closeSearch)
                 .frame(minWidth: 220, maxWidth: 360)
 
-            if !searchQuery.isEmpty {
+            if !searchSession.inputQuery.isEmpty {
                 Button {
-                    searchQuery = ""
+                    searchSession.clear()
                     isSearchFieldFocused = true
                 } label: {
                     Image(systemName: "xmark.circle.fill")
@@ -838,7 +926,7 @@ struct PDFReaderView: View {
     }
 
     private var searchResultSummary: String {
-        guard !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard !searchSession.query.isEmpty else {
             return ""
         }
         if searchSession.isSearching {
@@ -871,7 +959,7 @@ struct PDFReaderView: View {
             return
         }
         isSearchPresented = true
-        searchSession.search(searchQuery, in: model.document)
+        searchSession.search(searchSession.inputQuery, in: model.document)
         focusSearchField(selectingQuery: false)
     }
 
@@ -882,7 +970,6 @@ struct PDFReaderView: View {
             }
         }
         searchSession.clear()
-        searchQuery = ""
         isSearchPresented = false
         isSearchFieldFocused = false
     }
@@ -1060,26 +1147,26 @@ struct PDFReaderView: View {
             .alert(
                 "Couldn’t open this document",
                 isPresented: Binding(
-                    get: { model.lastError != nil },
-                    set: { if !$0 { model.dismissError() } }
+                    get: { currentOpenError != nil },
+                    set: { if !$0 { dismissOpenError() } }
                 )
             ) {
-                Button("OK", role: .cancel) { model.dismissError() }
+                Button("OK", role: .cancel) { dismissOpenError() }
             } message: {
-                Text(model.lastError?.errorDescription ?? "Unknown error.")
+                Text(currentOpenError?.errorDescription ?? "Unknown error.")
             }
         } else {
             emptyState
                 .alert(
                     "Couldn’t open this document",
                     isPresented: Binding(
-                        get: { model.lastError != nil },
-                        set: { if !$0 { model.dismissError() } }
+                        get: { currentOpenError != nil },
+                        set: { if !$0 { dismissOpenError() } }
                     )
                 ) {
-                    Button("OK", role: .cancel) { model.dismissError() }
+                    Button("OK", role: .cancel) { dismissOpenError() }
                 } message: {
-                    Text(model.lastError?.errorDescription ?? "Unknown error.")
+                    Text(currentOpenError?.errorDescription ?? "Unknown error.")
                 }
         }
     }
@@ -1155,16 +1242,42 @@ struct PDFReaderView: View {
 
     // MARK: - Opening
 
-    /// The single entry point for opening a document. An already-loaded reader
-    /// keeps its document and sends the new PDF to its own window. An empty
-    /// reader can use its existing window directly.
-    private func requestOpen(_ url: URL, relinking item: RecentDocument? = nil) {
-        if model.isLoaded {
-            openReaderWindow(url, item?.id)
+    /// Opens a PDF in the current workspace, reusing an empty tab or creating a
+    /// new one. A failed candidate leaves every already-open tab untouched.
+    @discardableResult
+    private func requestOpen(
+        _ url: URL,
+        relinking item: RecentDocument? = nil
+    ) -> PDFDocumentModel.LoadError? {
+        pendingOpenFailure = nil
+        let result = workspace.open(url, relinking: item)
+        if case let .failed(error) = result {
+            if model.lastError == nil { pendingOpenFailure = error }
+            return error
+        }
+        return nil
+    }
+
+    private func requestCloseTab(_ tabID: UUID) {
+        guard workspace.tabs.contains(where: { $0.id == tabID }) else { return }
+        guard workspace.activeTabID == tabID else {
+            workspace.activate(tabID: tabID)
+            Task { @MainActor in
+                await Task.yield()
+                beginCloseTab(tabID)
+            }
+            return
+        }
+        beginCloseTab(tabID)
+    }
+
+    private func beginCloseTab(_ tabID: UUID) {
+        guard workspace.tabs.count > 1 else {
+            NSApp.sendAction(#selector(NSWindow.performClose(_:)), to: nil, from: nil)
             return
         }
 
-        let action: PendingAction = item.map { .relink(url, $0) } ?? .open(url)
+        let action = PendingAction.closeTab(tabID)
         switch promptKind(for: action) {
         case .none:
             perform(action)
@@ -1519,33 +1632,70 @@ struct PDFReaderView: View {
     /// Read live by the close guard, so a draft edit is visible to the quit
     /// coordinator without the model knowing that a composer exists.
     private var unsavedWork: UnsavedWork {
-        UnsavedWork(
-            documentRevision: model.editRevision,
-            draftRevision: composerStore.revision,
-            documentHasChanges: model.hasUnsavedChanges,
-            draftHasChanges: composerStore.hasUncommittedChanges
-        )
+        workspace.unsavedWork
     }
 
     private func handleCloseIntent(_ intent: WindowCloseGuard.Intent) {
         switch intent {
         case .windowClose:
-            switch promptKind(for: .closeWindow) {
-            case .draft:
-                prompt = .draftChanges(.closeWindow)
-            case .document:
-                prompt = .unsavedChanges(.closeWindow)
-            case .none:
-                // The guard only asks when something is unsaved, so this is only
-                // reachable if the draft was resolved between the two reads.
-                perform(.closeWindow)
-            }
+            prompt = workspace.unsavedWork.hasChanges ? .workspaceChanges : nil
+            if prompt == nil { closeGuard.closeNow() }
         case .quit:
             // The coordinator knows which half of the window is still
             // unanswered. A draft that was already approved for this attempt is
             // not asked about again.
             showQuitPrompt(for: QuitSession.coordinator.confirmationNeed(for: closeGuard))
         }
+    }
+
+    private func saveWorkspaceThenClose() {
+        prompt = nil
+        if let failure = saveWorkspaceDrafts() {
+            prompt = .saveProblem(
+                title: "Couldn’t save the note",
+                message: failure + " Your text is still here.",
+                offersSaveAs: false
+            )
+            return
+        }
+        guard saveWorkspaceDocuments() else { return }
+        closeGuard.closeNow()
+    }
+
+    private func discardWorkspaceThenClose() {
+        prompt = nil
+        workspace.discardAllDrafts()
+        workspace.discardAllDocumentChanges()
+        closeGuard.closeNow()
+    }
+
+    /// Returns a user-facing failure while keeping every failed draft intact.
+    private func saveWorkspaceDrafts() -> String? {
+        for tab in workspace.tabs where tab.composerStore.hasUncommittedChanges {
+            if let failure = saveDraft(in: tab) {
+                workspace.activate(tabID: tab.id)
+                return failure
+            }
+        }
+        return nil
+    }
+
+    private func saveDraft(in tab: WorkspaceTabSession) -> String? {
+        guard tab.composerStore.hasUncommittedChanges else { return nil }
+        if case let .failure(error) = tab.composerStore.commit(using: tab.model) {
+            return error.errorDescription ?? "The note was not saved."
+        }
+        return nil
+    }
+
+    /// Saves every PDF in place. A failed, conflicting, or uncertain result
+    /// stops the close and leaves the remaining sessions available.
+    private func saveWorkspaceDocuments() -> Bool {
+        for tab in workspace.tabs where tab.model.hasUnsavedChanges {
+            workspace.activate(tabID: tab.id)
+            guard present(tab.model.save()) else { return false }
+        }
+        return true
     }
 
     /// Continues the current quit attempt from whatever the coordinator says is
@@ -1575,8 +1725,10 @@ struct PDFReaderView: View {
     /// only copy left.
     private func saveDraftThen(_ action: PendingAction) {
         prompt = nil
-        switch composerStore.commit(using: model) {
-        case let .failure(error):
+        let result = action == .quit
+            ? saveWorkspaceDrafts()
+            : saveDraft(in: workspace.activeTab)
+        if let message = result {
             // A failed note save stops the quit before termination is
             // requested. Approvals collected from other windows belong to an
             // attempt that is no longer running, so they must not survive into
@@ -1584,11 +1736,10 @@ struct PDFReaderView: View {
             if action == .quit { QuitSession.coordinator.cancel() }
             prompt = .saveProblem(
                 title: "Couldn’t save the note",
-                message: (error.errorDescription ?? "The note was not saved.")
-                    + " Your text is still here.",
+                message: message + " Your text is still here.",
                 offersSaveAs: false
             )
-        case .success:
+        } else {
             if action == .quit {
                 continueQuit()
             } else {
@@ -1657,8 +1808,14 @@ struct PDFReaderView: View {
         // draft prompt with "Discard Draft". Saving the document changes the
         // document's revision, not the draft, so the same decision has to be
         // rebound to the new revisions before termination is retried.
-        let keptDeferredDraft = action == .quit && composerStore.hasUncommittedChanges
-        guard performSave() else {
+        let keptDeferredDraft = action == .quit && workspace.unsavedWork.draftHasChanges
+        let didSave: Bool
+        if action == .quit {
+            didSave = saveWorkspaceDocuments()
+        } else {
+            didSave = performSave()
+        }
+        guard didSave else {
             // A failed save stops the quit before termination is requested.
             // Any "Don't Save" answers collected from other windows belong to
             // an attempt that is no longer running, so they must not survive.
@@ -1677,17 +1834,16 @@ struct PDFReaderView: View {
         prompt = nil
         switch action {
         case let .open(url):
-            // Opening with `discardingUnsavedChanges` only abandons the edits as
-            // part of a successful switch. If the new file cannot be opened, the
-            // old document, its annotations and its dirty state all stay — so a
-            // failed open cannot leave a document on screen whose edits nothing
-            // is protecting any more.
-            model.open(url: url, discardingUnsavedChanges: true)
+            requestOpen(url)
         case let .relink(url, item):
-            model.open(url: url, discardingUnsavedChanges: true, relinking: item)
+            requestOpen(url, relinking: item)
+        case let .closeTab(tabID):
+            model.abandonUnsavedChanges()
+            _ = workspace.closeTab(tabID: tabID)
         case .closeWindow:
             // The window is closing now, so the edits really are being discarded.
-            model.abandonUnsavedChanges()
+            workspace.discardAllDrafts()
+            workspace.discardAllDocumentChanges()
             closeGuard.closeNow()
         case .quit:
             // The window stays open and keeps its dirty state: this records the
@@ -1708,13 +1864,15 @@ struct PDFReaderView: View {
     private func perform(_ action: PendingAction) {
         switch action {
         case let .open(url):
-            model.open(url: url)
+            requestOpen(url)
         case let .relink(url, item):
-            model.open(url: url, relinking: item)
+            requestOpen(url, relinking: item)
         case .save:
             performSave()
         case .saveAs:
             presentSaveAsPanel()
+        case let .closeTab(tabID):
+            _ = workspace.closeTab(tabID: tabID)
         case .closeWindow:
             closeGuard.closeNow()
         case .quit:

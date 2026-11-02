@@ -25,28 +25,38 @@ final class FileOpenRequestQueueTests: XCTestCase {
         ), "An event must wait for a reader that is actually available.")
     }
 
-    func testRejectsAdditionalFinderEventsUntilTheCurrentRequestFinishes() throws {
+    func testQueuesRapidFinderEventsInArrivalOrder() throws {
         let queue = FileOpenRequestQueue()
         let first = URL(fileURLWithPath: "/tmp/first.pdf")
         let second = URL(fileURLWithPath: "/tmp/second.pdf")
         let readerID = UUID()
 
         XCTAssertTrue(queue.enqueue(first))
-        XCTAssertFalse(queue.enqueue(second), "A second event must not be left behind the first.")
+        XCTAssertTrue(queue.enqueue(second))
         let request = try XCTUnwrap(queue.takeNext(readerID: readerID))
         XCTAssertEqual(request.url, first)
         XCTAssertNil(queue.takeNext(readerID: readerID), "A request can only be delivered once.")
 
-        // Taking the URL does not release the slot: the reader may still be
-        // waiting for the user to answer its unsaved-work prompt.
-        XCTAssertFalse(queue.enqueue(second))
+        let third = URL(fileURLWithPath: "/tmp/third.pdf")
+        XCTAssertTrue(queue.enqueue(third))
 
         XCTAssertTrue(queue.finishRequest(requestID: request.id, readerID: readerID))
-        XCTAssertNil(queue.takeNext(readerID: readerID), "Finishing the request must leave no stale URL.")
-        XCTAssertTrue(queue.enqueue(second))
         let secondRequest = try XCTUnwrap(queue.takeNext(readerID: readerID))
         XCTAssertEqual(secondRequest.url, second)
         XCTAssertTrue(queue.finishRequest(requestID: secondRequest.id, readerID: readerID))
+        let thirdRequest = try XCTUnwrap(queue.takeNext(readerID: readerID))
+        XCTAssertEqual(thirdRequest.url, third)
+        XCTAssertTrue(queue.finishRequest(requestID: thirdRequest.id, readerID: readerID))
+    }
+
+    func testBatchEnqueueIsAtomicWhenOneURLIsNotAFileURL() {
+        let queue = FileOpenRequestQueue()
+        let first = URL(fileURLWithPath: "/tmp/first.pdf")
+        let invalid = URL(string: "https://example.com/paper.pdf")!
+
+        XCTAssertFalse(queue.enqueue([first, invalid]))
+        XCTAssertNil(queue.takeNext(readerID: UUID()))
+        XCTAssertTrue(queue.enqueue([first]))
     }
 
     func testPendingSceneRequestCannotTakeALaterFinderOpen() throws {
