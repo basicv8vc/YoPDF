@@ -43,6 +43,18 @@ final class AnnotationMarkdownExporterTests: XCTestCase {
         XCTAssertEqual(firstPage.annotations.filter { MarkupKind(annotation: $0) == .highlight }.count, 1)
     }
 
+    func testExportsStrikeOutWithItsOwnLabel() throws {
+        let data = try PDFFixtureFactory.makeParagraphData(pageCount: 1, linesPerPage: 2)
+        let document = try XCTUnwrap(PDFDocument(data: data))
+
+        let strikeOutSelection = try selection(in: document, pageIndex: 0, from: 0, to: 20)
+        try HighlightService.addMarkup(.strikeOut, from: strikeOutSelection, to: document)
+
+        let markdown = AnnotationMarkdownExporter.markdown(for: document, fallbackTitle: "Log")
+
+        XCTAssertTrue(markdown.contains("**Strike Out**\n\n> Page 1 line 1"))
+    }
+
     func testExportsFallbackTitleAndIgnoresUnsupportedAnnotations() throws {
         let data = try PDFFixtureFactory.makeParagraphData(pageCount: 1, linesPerPage: 1)
         let document = try XCTUnwrap(PDFDocument(data: data))

@@ -42,14 +42,22 @@ final class MarkupEditingTests: XCTestCase {
 
     private func makeModel(
         suite: String? = nil,
+        preferences: MarkupColorPreferences? = nil,
         io: any DocumentStoreIO = SystemDocumentStoreIO()
     ) -> PDFDocumentModel {
-        let suite = suite ?? makeSuite()
-        let defaults = UserDefaults(suiteName: suite)!
+        let resolvedPreferences: MarkupColorPreferences
+        if let preferences {
+            resolvedPreferences = preferences
+        } else {
+            let suite = suite ?? makeSuite()
+            resolvedPreferences = MarkupColorPreferences(
+                defaults: UserDefaults(suiteName: suite)!
+            )
+        }
         return PDFDocumentModel(
             access: SecurityScopeSpy(),
             io: io,
-            markupPreferences: MarkupColorPreferences(defaults: defaults)
+            markupPreferences: resolvedPreferences
         )
     }
 
@@ -221,6 +229,74 @@ final class MarkupEditingTests: XCTestCase {
         XCTAssertEqual(hex(reopenedModel.defaultMarkupColor(for: .underline)), "007AFF")
     }
 
+    func testDefaultColourRevisionPublishesOnlyRealChanges() {
+        let preferences = MarkupColorPreferences(
+            defaults: UserDefaults(suiteName: makeSuite())!
+        )
+        XCTAssertEqual(preferences.revision, 0)
+
+        XCTAssertTrue(preferences.setColor(
+            MarkupColorPalette.color(fromHex: "007AFF"),
+            for: .highlight
+        ))
+        XCTAssertEqual(preferences.revision, 1)
+        XCTAssertEqual(hex(preferences.color(for: .highlight)), "007AFF")
+
+        XCTAssertTrue(
+            preferences.setColor(MarkupColorPalette.color(fromHex: "007AFF"), for: .highlight),
+            "re-picking the stored colour is still accepted"
+        )
+        XCTAssertEqual(
+            preferences.revision,
+            1,
+            "an unchanged value must not redraw every toolbar"
+        )
+
+        XCTAssertFalse(preferences.setColor(.clear, for: .highlight))
+        XCTAssertEqual(
+            preferences.revision,
+            1,
+            "a refused colour must not publish a change"
+        )
+
+        XCTAssertTrue(preferences.setColor(
+            MarkupColorPalette.color(fromHex: "34C759"),
+            for: .underline
+        ))
+        XCTAssertEqual(preferences.revision, 2)
+        XCTAssertEqual(hex(preferences.color(for: .highlight)), "007AFF")
+    }
+
+    /// Two reader windows must not disagree about the colour a new mark will
+    /// use: each window owns a model, but the preference object is shared and
+    /// publishes the change once.
+    func testReaderWindowsShareOnePreferenceObjectAndSeeEachOthersDefault() {
+        let preferences = MarkupColorPreferences(
+            defaults: UserDefaults(suiteName: makeSuite())!
+        )
+        let windowA = makeModel(preferences: preferences)
+        let windowB = makeModel(preferences: preferences)
+
+        XCTAssertTrue(windowA.markupPreferences === windowB.markupPreferences)
+        XCTAssertEqual(hex(windowB.defaultMarkupColor(for: .highlight)), "FFD60A")
+
+        XCTAssertTrue(windowA.setDefaultMarkupColor(
+            MarkupColorPalette.color(fromHex: "007AFF"),
+            for: .highlight
+        ))
+
+        XCTAssertEqual(hex(windowB.defaultMarkupColor(for: .highlight)), "007AFF")
+        XCTAssertEqual(preferences.revision, 1)
+    }
+
+    func testModelsDefaultToTheAppWidePreferenceObject() {
+        let first = PDFDocumentModel(access: SecurityScopeSpy())
+        let second = PDFDocumentModel(access: SecurityScopeSpy())
+
+        XCTAssertTrue(first.markupPreferences === second.markupPreferences)
+        XCTAssertTrue(first.markupPreferences === MarkupColorPreferences.shared)
+    }
+
     func testCustomColourIsStoredOpaqueAndTransparentIsRejected() throws {
         let model = makeModel()
         let translucent = NSColor(srgbRed: 0.12, green: 0.34, blue: 0.56, alpha: 0.4)
@@ -265,6 +341,79 @@ final class MarkupEditingTests: XCTestCase {
 
         XCTAssertEqual(page.annotations.filter(\.isMarkup).count, 2)
         XCTAssertTrue(model.hasUnsavedChanges)
+    }
+
+    func testStrikeOutUsesStandardSubtypeAndItsOwnDefault() throws {
+        let url = try makeFixture(pageCount: 1, linesPerPage: 3)
+        let model = makeModel()
+        XCTAssertTrue(model.open(url: url))
+        let document = try XCTUnwrap(model.document)
+
+        let selection = try self.selection(in: document, pageIndex: 0, from: 0, to: 8)
+        let summary = try addMarkup(.strikeOut, to: model, selection: selection)
+        XCTAssertEqual(summary.annotationCount, 1)
+        XCTAssertEqual(summary.pageIndices, [0])
+
+        let annotation = try firstMarkup(on: 0, in: model, kind: .strikeOut)
+        XCTAssertEqual(PDFAnnotationTypeName.normalized(annotation.type), "strikeout")
+        XCTAssertEqual(MarkupKind(annotation: annotation), .strikeOut)
+        XCTAssertEqual(hex(annotation.color), "FF3B30")
+        XCTAssertEqual(annotation.quadrilateralPoints?.count, summary.quadCount * 4)
+
+        // Preferences stay per kind: changing Strike Out must not touch the
+        // highlight default.
+        XCTAssertEqual(hex(model.defaultMarkupColor(for: .strikeOut)), "FF3B30")
+        XCTAssertTrue(model.setDefaultMarkupColor(
+            MarkupColorPalette.color(fromHex: "34C759"),
+            for: .strikeOut
+        ))
+        XCTAssertEqual(hex(model.defaultMarkupColor(for: .strikeOut)), "34C759")
+        XCTAssertEqual(hex(model.defaultMarkupColor(for: .highlight)), "FFD60A")
+
+        try addMarkup(
+            .strikeOut,
+            to: model,
+            selection: try self.selection(in: document, pageIndex: 0, from: 10, to: 18)
+        )
+        let strikeOuts = try XCTUnwrap(
+            model.document?.page(at: 0)?.annotations.filter { MarkupKind(annotation: $0) == .strikeOut }
+        )
+        XCTAssertEqual(strikeOuts.count, 2)
+        let newest = try XCTUnwrap(strikeOuts.first { $0 !== annotation })
+        XCTAssertEqual(hex(newest.color), "34C759")
+
+        XCTAssertTrue(model.undoMarkup())
+        XCTAssertEqual(
+            model.document?.page(at: 0)?.annotations.filter { MarkupKind(annotation: $0) == .strikeOut }.count,
+            1
+        )
+    }
+
+    func testStrikeOutConvertsBackToHighlightAndUndoesAsOneEdit() throws {
+        let url = try makeFixture(pageCount: 1, linesPerPage: 3)
+        let model = makeModel()
+        XCTAssertTrue(model.open(url: url))
+        let document = try XCTUnwrap(model.document)
+
+        try addMarkup(
+            .strikeOut,
+            to: model,
+            selection: try selection(in: document, pageIndex: 0, from: 0, to: 8)
+        )
+        let strikeOut = try firstMarkup(on: 0, in: model)
+        let bounds = strikeOut.bounds
+        try selectMarkup(strikeOut, in: model)
+
+        XCTAssertTrue(model.convertSelectedMarkup())
+        let converted = try firstMarkup(on: 0, in: model)
+        XCTAssertEqual(MarkupKind(annotation: converted), .highlight)
+        XCTAssertEqual(converted.bounds, bounds)
+        XCTAssertEqual(hex(converted.color), "FF3B30")
+        XCTAssertEqual(model.selectedMarkup?.kind, .highlight)
+
+        XCTAssertTrue(model.undoMarkup())
+        let restored = try firstMarkup(on: 0, in: model)
+        XCTAssertEqual(MarkupKind(annotation: restored), .strikeOut)
     }
 
     func testEditingAnAnnotationsColourDoesNotChangeTheNewMarkDefault() throws {
@@ -1056,7 +1205,7 @@ final class MarkupEditingTests: XCTestCase {
 
 private extension PDFAnnotation {
     var isMarkup: Bool {
-        type?.hasSuffix("Highlight") == true || type?.hasSuffix("Underline") == true
+        MarkupKind(annotation: self) != nil
     }
 
     func isMarkupType(_ name: String) -> Bool {

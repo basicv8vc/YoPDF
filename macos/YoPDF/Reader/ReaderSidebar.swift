@@ -265,7 +265,7 @@ struct ReaderSidebar: View {
             SidebarEmptyState(
                 symbolName: "pencil.tip.crop.circle",
                 title: "No annotations",
-                message: "Highlights, underlines, and notes in this PDF will appear here."
+                message: "Highlights, underlines, strike-outs, and notes in this PDF will appear here."
             )
         } else {
             ScrollView {
@@ -755,7 +755,7 @@ struct SidebarAnnotationItem: Identifiable {
         switch PDFAnnotationTypeName.normalized(annotation.type) {
         case "text": "Note"
         case "freetext": "Text"
-        case "strikeout": "Strikethrough"
+        case "strikeout": "Strike Out"
         case "fileattachment": "Attachment"
         case let type?:
             type.prefix(1).uppercased() + String(type.dropFirst())

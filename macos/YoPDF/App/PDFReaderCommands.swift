@@ -147,6 +147,13 @@ struct PDFReaderCommands: Commands {
             .keyboardShortcut("u", modifiers: [.command, .shift])
             .disabled(model?.canAddMarkup(.underline) != true)
 
+            // No key equivalent: ⇧⌘S is already Save As. Preview also leaves
+            // Strike Out unshortcut.
+            Button("Strike Out") {
+                model?.addMarkup(.strikeOut)
+            }
+            .disabled(model?.canAddMarkup(.strikeOut) != true)
+
             Button("Add Note") {
                 addNote?()
             }

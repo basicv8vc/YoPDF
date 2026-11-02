@@ -1,9 +1,10 @@
 import AppKit
 import PDFKit
 
-/// Turns a `PDFSelection` into standard PDF highlight or underline annotations.
+/// Turns a `PDFSelection` into standard PDF highlight, underline or strike-out
+/// annotations.
 ///
-/// The selection geometry and serialization rules are shared by both tools:
+/// The selection geometry and serialization rules are shared by all tools:
 /// PDFKit's per-line rectangles become the annotation's `/QuadPoints`, and a
 /// cross-page drag becomes one annotation per page. The service only constructs
 /// and mutates PDF annotations; `PDFDocumentModel` is the single entry point
@@ -64,7 +65,8 @@ public enum HighlightService {
         try addMarkup(.highlight, from: selection, to: document, color: color)
     }
 
-    /// Adds a standard `/Highlight` or `/Underline` annotation for `selection`.
+    /// Adds a standard `/Highlight`, `/Underline` or `/StrikeOut` annotation for
+    /// `selection`.
     ///
     /// A selection spanning several pages becomes one annotation per page,
     /// each carrying only the quads that belong to it. A selection that
@@ -158,7 +160,7 @@ public enum HighlightService {
             .filter(isUsable)
     }
 
-    /// Converts an existing markup annotation to the other subtype.
+    /// Converts an existing markup annotation to another markup subtype.
     ///
     /// The new annotation keeps the old bounds and quads, colour, `/NM`,
     /// contents, flags, author, creation date and unknown custom keys. The

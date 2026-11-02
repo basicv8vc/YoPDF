@@ -613,36 +613,43 @@ struct PDFReaderView: View {
 
             Divider().frame(height: 18)
 
-            Button {
-                model.addMarkup(.highlight)
-            } label: {
-                Label("Highlight", systemImage: "highlighter")
-            }
-            .disabled(!model.canAddMarkup(.highlight))
-            .help("Highlight the selected text (⇧⌘H)")
+            MarkupToolbarGroup {
+                MarkupToolButton(
+                    title: "Highlight Selection",
+                    systemImage: MarkupKind.highlight.symbolName,
+                    help: "Highlight the selected text (⇧⌘H)"
+                ) {
+                    model.addMarkup(.highlight)
+                }
+                .disabled(!model.canAddMarkup(.highlight))
 
-            MarkupColorButton(
-                title: "Highlight Colour",
-                help: "Colour for new highlights",
-                color: model.defaultMarkupColor(for: .highlight)
-            ) { color in
-                model.setDefaultMarkupColor(color, for: .highlight)
-            }
+                DefaultMarkupColorControl(
+                    preferences: model.markupPreferences,
+                    kind: .highlight
+                )
 
-            Button {
-                model.addMarkup(.underline)
-            } label: {
-                Label("Underline", systemImage: "underline")
-            }
-            .disabled(!model.canAddMarkup(.underline))
-            .help("Underline the selected text (⇧⌘U)")
+                MarkupToolButton(
+                    title: "Underline Selection",
+                    systemImage: MarkupKind.underline.symbolName,
+                    help: "Underline the selected text (⇧⌘U)"
+                ) {
+                    model.addMarkup(.underline)
+                }
+                .disabled(!model.canAddMarkup(.underline))
 
-            MarkupColorButton(
-                title: "Underline Colour",
-                help: "Colour for new underlines",
-                color: model.defaultMarkupColor(for: .underline)
-            ) { color in
-                model.setDefaultMarkupColor(color, for: .underline)
+                DefaultMarkupColorControl(
+                    preferences: model.markupPreferences,
+                    kind: .underline
+                )
+
+                MarkupToolButton(
+                    title: "Strike Out Selection",
+                    systemImage: MarkupKind.strikeOut.symbolName,
+                    help: "Strike out the selected text"
+                ) {
+                    model.addMarkup(.strikeOut)
+                }
+                .disabled(!model.canAddMarkup(.strikeOut))
             }
 
             Divider().frame(height: 18)
@@ -654,13 +661,14 @@ struct PDFReaderView: View {
                     beginNote()
                 }
             } label: {
-                Label(
-                    isPlacingNote ? "Cancel Note" : "Add Note",
-                    systemImage: isPlacingNote ? "xmark.circle" : "note.text.badge.plus"
-                )
+                // Icon only: the text moves to the help tag and the spoken
+                // label, which keeps the editing row narrow.
+                Image(systemName: isPlacingNote ? "xmark.circle" : "note.text.badge.plus")
+                    .font(.system(size: 13, weight: .medium))
             }
             .buttonStyle(ReaderInteractiveButtonStyle(isSelected: isPlacingNote))
             .disabled(!model.canCreateNote)
+            .accessibilityLabel(isPlacingNote ? "Cancel Note" : "Add Note")
             .help(
                 isPlacingNote
                     ? "Click a page to place the note, or press Esc to cancel"
@@ -670,9 +678,11 @@ struct PDFReaderView: View {
             if let selected = model.selectedMarkup {
                 Divider().frame(height: 18)
 
-                MarkupColorButton(
-                    title: "\(selected.kind.title) Colour",
+                MarkupColorControl(
+                    title: "\(selected.kind.title) colour",
+                    paletteTitle: "Change selected \(selected.kind.title.lowercased()) colour",
                     help: "Change the selected annotation’s colour",
+                    accessibilityIdentifier: "pdf-reader-selected-markup-color",
                     color: selected.color
                 ) { color in
                     model.recolorSelectedMarkup(to: color)
@@ -705,9 +715,11 @@ struct PDFReaderView: View {
             Button {
                 requestSave()
             } label: {
-                Label("Save", systemImage: "square.and.arrow.down")
+                Image(systemName: "square.and.arrow.down")
+                    .font(.system(size: 13, weight: .medium))
             }
             .disabled(!model.isLoaded)
+            .accessibilityLabel("Save")
             .help("Save changes (⌘S)")
 
             Spacer(minLength: 8)
