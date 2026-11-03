@@ -1,11 +1,11 @@
 import Combine
 import Foundation
 
-/// Keeps the app's Finder-open policy to one request at a time.
+/// Delivers Finder-open requests in arrival order, one at a time per reader.
 ///
-/// The slot stays occupied after the reader takes the URL until it opens the
-/// file itself or hands it to a dedicated reader window. This avoids stranded
-/// URLs and duplicate delivery while the new scene is being created.
+/// The in-flight request stays owned until the reader finishes opening it. If
+/// that window closes first, the same request is returned to the front of the
+/// queue so a different reader can take it.
 @MainActor
 final class FileOpenRequestQueue: ObservableObject {
 
@@ -22,7 +22,7 @@ final class FileOpenRequestQueue: ObservableObject {
     }
 
     @Published private(set) var revision = 0
-    private var pendingRequest: Request?
+    private var pendingRequests: [Request] = []
     /// Keep the current owner and request identity until it finishes. If that
     /// reader closes, the same request can be reassigned without letting a
     /// different reader's close or a stale completion mutate it.
@@ -44,12 +44,20 @@ final class FileOpenRequestQueue: ObservableObject {
         return orderedReaders.first
     }
 
-    /// Accepts one request. Further events fail until its owner finishes it,
-    /// including while the first request is being confirmed.
+    /// Accepts a file request. Requests are processed in arrival order.
     @discardableResult
     func enqueue(_ url: URL) -> Bool {
-        guard pendingRequest == nil, inFlightRequest == nil else { return false }
-        pendingRequest = Request(id: UUID(), url: url, readerID: nil)
+        enqueue([url])
+    }
+
+    /// A Finder batch is accepted atomically, so no prefix is silently opened
+    /// when a later URL in the same callback is invalid.
+    @discardableResult
+    func enqueue(_ urls: [URL]) -> Bool {
+        guard !urls.isEmpty, urls.allSatisfy(\.isFileURL) else { return false }
+        pendingRequests.append(contentsOf: urls.map {
+            Request(id: UUID(), url: $0, readerID: nil)
+        })
         revision &+= 1
         return true
     }
@@ -57,30 +65,30 @@ final class FileOpenRequestQueue: ObservableObject {
     func takeNext(readerID: UUID) -> Request? {
         guard readerRequestAvailability[readerID] != false,
               inFlightRequest == nil,
-              let pendingRequest
+              !pendingRequests.isEmpty
         else { return nil }
+        let pendingRequest = pendingRequests.removeFirst()
         let request = Request(id: pendingRequest.id, url: pendingRequest.url, readerID: readerID)
-        self.pendingRequest = nil
         inFlightRequest = request
         revision &+= 1
         return request
     }
 
     /// Re-queues an in-flight request only when its owner closes. A reader
-    /// closing while a request is still unclaimed also wakes other readers so
-    /// one can take it, or opens a replacement if none remain.
+    /// closing while requests are unclaimed also wakes another reader or opens
+    /// a replacement if none remain.
     @discardableResult
     func readerWindowDidClose(readerID: UUID) -> Bool {
         readerRequestAvailability.removeValue(forKey: readerID)
         if let inFlightRequest {
             guard inFlightRequest.readerID == readerID else { return false }
-            pendingRequest = Request(
+            pendingRequests.insert(Request(
                 id: inFlightRequest.id,
                 url: inFlightRequest.url,
                 readerID: nil
-            )
+            ), at: 0)
             self.inFlightRequest = nil
-        } else if pendingRequest == nil {
+        } else if pendingRequests.isEmpty {
             return false
         }
         revision &+= 1

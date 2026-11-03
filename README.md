@@ -16,8 +16,20 @@ with automatic saving for committed annotation edits. Full-text search is
 available, and annotations can be exported as page-grouped Markdown. AI-assisted
 reading is not implemented yet.
 
-Each reader window owns one PDF. When a reader already has a PDF, opening
-another creates a new reader window, so documents already open stay available.
+Each macOS window is a research workspace with an ordered set of PDF tabs. Open
+another file from Finder, **Open PDF…**, or **Open Recent** to add it to the
+current workspace; a PDF dropped onto the reader follows the same rule. The
+selected empty tab is reused, otherwise it opens in a new tab after validation.
+Reopening the same path selects its existing tab. **New Tab** (⌘T) creates an
+empty workspace tab, **Close Tab** (⌘W) closes the selected tab, and closing its
+last tab closes the window. **New Window** (⌘N) creates an independent workspace.
+A tab retains its own PDF session, page and zoom, find results, sidebar
+navigation state, and unfinished note draft while the user switches tabs.
+Window close and quit check unsaved work across every tab.
+
+The next split-pane phase requires Toolbar, Context Menu, and Drag & Drop
+creation paths together. Its drag/drop safety and acceptance rules are recorded
+in [the P0-B split-pane requirements](Docs/P0-B-DRAG-DROP-REQUIREMENTS.md).
 
 ## Design constraints
 

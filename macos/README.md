@@ -52,11 +52,33 @@ The File menu's **Open Recent** list and the empty reader window make the last
 and the last page and zoom mode. This is a small preference value, not a
 document database or managed library.
 
-Each reader window owns one PDF. When the current window already has a PDF,
-opening a different one from the File menu, Open Recent, the file picker, drag
-and drop, or Finder creates another reader window and leaves the current PDF
-open. An empty reader window can be reused for its first PDF. Closing a reader
-still uses that window's normal unsaved-work prompts.
+Each reader window owns an ordered workspace of PDF tabs. **Open PDF…** and
+**Open Recent** open a different document in a new tab in the current window;
+Finder batches and quick successive events are processed in arrival order.
+They reuse the selected empty tab when possible, otherwise opening a PDF creates
+a tab after it loads successfully. Dropping a PDF onto the reader content uses
+the same rule. Opening a path already present in the same window selects its
+existing tab. Opening the first PDF reuses the initial empty tab. **New Tab**
+(⌘T) creates an empty tab, **Close Tab** (⌘W) closes the selected tab, and closing
+the last tab uses the native window-close path. The red close button always
+closes the full window. **New Window** (⌘N) creates a separate workspace.
+
+Each tab owns its `PDFDocumentModel`, security-scoped `DocumentSession`, note
+composer, search session, and sidebar navigation state. Switching tabs retains
+page, zoom, search results, outline and annotation indexes, sidebar selection,
+annotation edits, and uncommitted note text. Save, Undo, Find, and annotation
+commands route through the focused tab. Closing a tab protects that tab's work;
+closing a window or quitting checks every tab. Choosing **Save All** resolves
+note drafts first, then saves each dirty PDF. A conflict or uncertain save stops
+the close and leaves the affected tab available. Cross-window opens still use
+independent sessions; `DocumentStore` external-change checks prevent a second
+window from silently overwriting bytes written by the first.
+
+P0-B is a separate split-pane phase. Its first releasable version must include
+Toolbar, Context Menu, and Drag & Drop creation paths. Dragging an open Pane must
+move its existing Session and preserve reading and editing state; Finder drops
+must validate before committing layout. See
+[P0-B-DRAG-DROP-REQUIREMENTS.md](../Docs/P0-B-DRAG-DROP-REQUIREMENTS.md).
 
 Opening a recent item resolves its bookmark and then uses the normal
 `DocumentStore` path, which acquires and holds the security scope for the open
@@ -64,9 +86,8 @@ window. Stale bookmarks are refreshed after that session has acquired access.
 The reader saves the current page and either Fit mode or the manual zoom factor
 as navigation changes. Reopened page indices are clamped to the PDF's current
 page count; Fit is recalculated for the current window size. Opening a recent
-PDF from a reader that already has a document leaves that window's annotations
-and note draft in place. YoPDF does not automatically reopen every window at
-launch.
+PDF creates or selects a workspace tab without replacing another tab's session
+or note draft. YoPDF does not automatically reopen every window at launch.
 
 If macOS can no longer resolve a saved bookmark, YoPDF keeps the recent entry
 and offers **Relink…**. Choosing the moved PDF validates and opens it before

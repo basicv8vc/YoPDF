@@ -13,6 +13,14 @@ struct OpenDocumentActionKey: FocusedValueKey {
     typealias Value = @MainActor () -> Void
 }
 
+struct NewWorkspaceTabActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
+struct CloseWorkspaceTabActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
 /// Opens a saved recent URL through the focused reader's unsaved-work prompts.
 struct OpenRecentDocumentActionKey: FocusedValueKey {
     typealias Value = @MainActor (RecentDocument) -> Void
@@ -76,6 +84,16 @@ extension FocusedValues {
     var openDocument: (@MainActor () -> Void)? {
         get { self[OpenDocumentActionKey.self] }
         set { self[OpenDocumentActionKey.self] = newValue }
+    }
+
+    var newWorkspaceTab: (@MainActor () -> Void)? {
+        get { self[NewWorkspaceTabActionKey.self] }
+        set { self[NewWorkspaceTabActionKey.self] = newValue }
+    }
+
+    var closeWorkspaceTab: (@MainActor () -> Void)? {
+        get { self[CloseWorkspaceTabActionKey.self] }
+        set { self[CloseWorkspaceTabActionKey.self] = newValue }
     }
 
     var openRecentDocument: (@MainActor (RecentDocument) -> Void)? {

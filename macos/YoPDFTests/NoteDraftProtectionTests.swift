@@ -485,7 +485,7 @@ final class NoteDraftProtectionTests: XCTestCase {
     func testTheDraftIsResolvedBeforeEveryRiskyAction() {
         let actions: [ReaderAction] = [
             .save, .saveAs, .open(URL(fileURLWithPath: "/tmp/other.pdf")),
-            .closeWindow, .quit, .compose,
+            .closeTab, .closeWindow, .quit, .compose,
         ]
         for action in actions {
             XCTAssertEqual(
@@ -505,7 +505,7 @@ final class NoteDraftProtectionTests: XCTestCase {
     func testNothingIsAskedWhenNothingWouldBeLost() {
         let actions: [ReaderAction] = [
             .save, .saveAs, .open(URL(fileURLWithPath: "/tmp/other.pdf")),
-            .closeWindow, .quit, .compose,
+            .closeTab, .closeWindow, .quit, .compose,
         ]
         for action in actions {
             XCTAssertEqual(
@@ -529,6 +529,10 @@ final class NoteDraftProtectionTests: XCTestCase {
         )
         XCTAssertEqual(
             ReaderPromptPolicy.promptAfterDraft(for: .closeWindow, documentHasChanges: true),
+            .document
+        )
+        XCTAssertEqual(
+            ReaderPromptPolicy.promptAfterDraft(for: .closeTab, documentHasChanges: true),
             .document
         )
         XCTAssertEqual(

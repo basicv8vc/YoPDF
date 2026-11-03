@@ -27,7 +27,7 @@ final class WindowCloseGuard: NSObject, NSWindowDelegate {
     let readerID = UUID()
 
     enum Intent {
-        /// The window's close button, ⌘W, or `performClose:`.
+        /// The window's close button, ⌘W on its last tab, or `performClose:`.
         case windowClose
         /// The app is quitting and this window is the first one with edits.
         case quit

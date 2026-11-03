@@ -9,11 +9,14 @@ import YoPDFCore
 /// when no reader window is focused.
 struct PDFReaderCommands: Commands {
 
+    @Environment(\.openWindow) private var openWindow
     @ObservedObject private var updateController: SparkleUpdateController
     @ObservedObject private var recentDocuments: RecentDocumentsStore
 
     @FocusedValue(\.documentModel) private var model
     @FocusedValue(\.openDocument) private var openDocument
+    @FocusedValue(\.newWorkspaceTab) private var newWorkspaceTab
+    @FocusedValue(\.closeWorkspaceTab) private var closeWorkspaceTab
     @FocusedValue(\.openRecentDocument) private var openRecentDocument
     @FocusedValue(\.saveDocument) private var saveDocument
     @FocusedValue(\.saveDocumentAs) private var saveDocumentAs
@@ -33,6 +36,12 @@ struct PDFReaderCommands: Commands {
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
+            Button("New Tab") {
+                newWorkspaceTab?()
+            }
+            .keyboardShortcut("t", modifiers: .command)
+            .disabled(newWorkspaceTab == nil)
+
             Button("Open PDF…") {
                 openDocument?()
             }
@@ -62,15 +71,16 @@ struct PDFReaderCommands: Commands {
             }
             .disabled(!recentDocuments.canClear)
 
-            // Replacing `.newItem` and `.saveItem` removes the standard Close
-            // item, so it is added back. Closing goes through `performClose:`
-            // and therefore through `WindowCloseGuard`, which is what keeps ⌘W
-            // from dropping unsaved edits.
-            Button("Close") {
-                NSApp.sendAction(#selector(NSWindow.performClose(_:)), to: nil, from: nil)
+            Button("New Window") {
+                openWindow(id: "reader")
+            }
+            .keyboardShortcut("n", modifiers: .command)
+
+            Button("Close Tab") {
+                closeWorkspaceTab?()
             }
             .keyboardShortcut("w", modifiers: .command)
-            .disabled(model == nil)
+            .disabled(closeWorkspaceTab == nil)
         }
 
         // Annotation edits use the model's own history rather than PDFKit's

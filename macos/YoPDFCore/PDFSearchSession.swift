@@ -2,7 +2,7 @@ import Combine
 import Foundation
 import PDFKit
 
-/// Owns the temporary search state for one reader window.
+/// Owns the temporary search state for one PDF tab.
 ///
 /// PDFKit delivers asynchronous search results through document notifications.
 /// A document can have only one active find operation at a time, so a newer
@@ -12,6 +12,7 @@ import PDFKit
 @MainActor
 public final class PDFSearchSession: ObservableObject {
 
+    @Published public private(set) var inputQuery = ""
     @Published public private(set) var query = ""
     @Published public private(set) var results: [PDFSelection] = []
     @Published public private(set) var currentResultIndex: Int?
@@ -73,13 +74,14 @@ public final class PDFSearchSession: ObservableObject {
     /// including the identity swaps performed after Save and Save As.
     public func documentWasReplaced(with document: PDFDocument?) {
         guard self.document !== document else { return }
-        search(query, in: document)
+        search(inputQuery, in: document)
     }
 
     /// Starts an exact, case-insensitive search after a short typing pause.
     /// Repeating the same query for the same document preserves the current
     /// result position, which is useful when ⌘F is pressed again.
     public func search(_ rawQuery: String, in document: PDFDocument?) {
+        inputQuery = rawQuery
         let normalizedQuery = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         if normalizedQuery == query, self.document === document {
             return
@@ -121,6 +123,7 @@ public final class PDFSearchSession: ObservableObject {
         debounceTask = nil
         pendingRequest = nil
         pendingNavigationOffset = 0
+        inputQuery = ""
         query = ""
         document = nil
         results = []
