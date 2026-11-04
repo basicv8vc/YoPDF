@@ -55,8 +55,8 @@ targets:
       base:
         PRODUCT_NAME: YoPDF
         PRODUCT_BUNDLE_IDENTIFIER: dev.yopdf.provisional
-        MARKETING_VERSION: "0.1.0"
-        CURRENT_PROJECT_VERSION: "2"
+        MARKETING_VERSION: "2026.11.4"
+        CURRENT_PROJECT_VERSION: "3"
         SPARKLE_FEED_URL: ""
         SPARKLE_PUBLIC_ED_KEY: ""
         ENABLE_HARDENED_RUNTIME: NO
