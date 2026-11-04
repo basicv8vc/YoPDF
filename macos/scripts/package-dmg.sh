@@ -18,7 +18,7 @@
 #   BUILD_NUMBER       Default: CURRENT_PROJECT_VERSION in project.yml.
 #   ARCHS              Default: "arm64 x86_64".
 #   VOLUME_NAME        Default: YoPDF.
-#   DMG_NAME           Default: YoPDF-<version>-<build>-<sha>-universal.dmg.
+#   DMG_NAME           Default: YoPDF-<version>-build<build>-universal.dmg.
 #   DERIVED_DATA       Default: <repo>/macos/build/DerivedData.
 #   SPARKLE_FEED_URL       HTTPS Sparkle appcast URL (optional, forwarded).
 #   SPARKLE_PUBLIC_ED_KEY  Base64 Sparkle EdDSA public key (optional, forwarded).
@@ -136,7 +136,7 @@ esac
 
 # --- output paths -----------------------------------------------------------
 OUT_DIR="${OUT_DIR:-build/dist-${MARKETING}-${BUILD}-${GIT_SHA}}"
-DMG_NAME="${DMG_NAME:-YoPDF-${MARKETING}-${BUILD}-${GIT_SHA}-universal.dmg}"
+DMG_NAME="${DMG_NAME:-YoPDF-${MARKETING}-build${BUILD}-universal.dmg}"
 ARCHIVE="$OUT_DIR/YoPDF.xcarchive"
 EXPORT_DIR="$OUT_DIR/export"
 APP="$EXPORT_DIR/YoPDF.app"

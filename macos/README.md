@@ -155,6 +155,10 @@ the app, builds a `UDZO` image with an `Applications` symlink, signs that image,
 notarizes and staples it, then verifies signatures, architecture, version and
 Gatekeeper acceptance (including a quarantined copy extracted from the image).
 
+Release versions use a date-based `MARKETING_VERSION` (for example
+`2026.11.4`) with a monotonically increasing `CURRENT_PROJECT_VERSION`; the
+image is named `YoPDF-<version>-build<build>-universal.dmg`.
+
 The version and build number come from `project.yml`; `MARKETING_VERSION`,
 `BUILD_NUMBER`, `SIGN_IDENTITY`, `TEAM_ID`, `ARCHS`, `VOLUME_NAME`, `DMG_NAME`,
 `OUT_DIR`, `DERIVED_DATA`, `SPARKLE_FEED_URL` and `SPARKLE_PUBLIC_ED_KEY` can be
@@ -176,9 +180,9 @@ Create and push the tag first, then:
 
 ```bash
 cd macos
-git tag v0.1.0 && git push origin v0.1.0
-./scripts/release.sh v0.1.0 --dry-run                      # verify, print the plan
-./scripts/release.sh v0.1.0 --notes-file release-notes.md  # upload
+git tag v2026.11.4 && git push origin v2026.11.4
+./scripts/release.sh v2026.11.4 --dry-run                      # verify, print the plan
+./scripts/release.sh v2026.11.4 --notes-file release-notes.md  # upload
 ```
 
 `release.sh` requires the tag to exist locally and on the remote, pointing at the
