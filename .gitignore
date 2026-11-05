@@ -5,6 +5,7 @@
 
 # Assistant workspace state (local only)
 /.workbuddy-ai/
+/.workbuddy/
 
 # Xcode / build output
 /macos/build/

@@ -187,13 +187,32 @@ Artifacts, logs, notarization responses and `SHA256.txt` land in a
 `macos/build/dist-<version>-<build>-<sha>/` directory.
 
 Publishing is a separate step, so only a finished image can reach a Release.
-Create and push the tag first, then:
+Bump `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` in `project.yml`, commit
+that, and run one command:
 
 ```bash
 cd macos
+./scripts/release-all.sh --dry-run     # every check, no packaging
+./scripts/release-all.sh               # package, tag, publish, refresh feed
+```
+
+`release-all.sh` refuses to start unless the checkout is on `main`, `HEAD`
+equals `origin/main`, the working tree is clean, the tag derived from the
+version does not exist yet, exactly one Developer ID identity is usable, and
+the Sparkle key is readable. After that it regenerates the project (and stops
+if that changes tracked files, because XcodeGen rewrites `Config/Info.plist`),
+packages, tags, publishes, then writes and pushes `appcast.xml`. `--draft`,
+`--notes-file` and `--yes` are forwarded; `--resume` finishes an interrupted run
+by accepting an existing tag at `HEAD` and replacing already uploaded assets.
+
+The individual steps stay available for a partial rerun:
+
+```bash
+cd macos
+./scripts/package-dmg.sh
 git tag v2026.11.4 && git push origin v2026.11.4
-./scripts/release.sh v2026.11.4 --dry-run                      # verify, print the plan
-./scripts/release.sh v2026.11.4 --notes-file release-notes.md  # upload
+./scripts/release.sh v2026.11.4 --notes-file release-notes.md
+./scripts/appcast.sh build/dist-2026.11.4-3-abc1234
 ```
 
 `release.sh` requires the tag to exist locally and on the remote, pointing at the
