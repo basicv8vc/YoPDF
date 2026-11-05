@@ -223,20 +223,36 @@ automatically.
 
 An updater starts only when the app is built with both `SPARKLE_FEED_URL` (an
 HTTPS appcast URL) and `SPARKLE_PUBLIC_ED_KEY` (the Base64 EdDSA public key).
-The build script forwards these optional environment variables to Xcode; when
-they are missing or invalid, update checks stay disabled. Set the real values
-in the release environment before running
-`CONFIGURATION=Release ./scripts/build.sh`. The feed and update archives must
-be signed with the matching private key. Keep that key in a secure developer
-key store; never add it to the repository or pass it to the build.
+Both defaults are checked into `project.yml`, so an unmodified Release build
+updates itself; the build scripts still forward the same-named environment
+variables to Xcode, which override those defaults. When either value is missing
+or invalid, update checks stay disabled.
+
+The feed lives at `https://raw.githubusercontent.com/basicv8vc/YoPDF/main/appcast.xml`
+and is generated from a published image:
+
+```bash
+cd macos
+./scripts/appcast.sh build/dist-<version>-<build>-<sha>
+git add ../appcast.xml && git commit -m "chore: publish appcast for <version>" && git push
+```
+
+Run it *after* `release.sh`, because every enclosure URL points at the GitHub
+Release asset for that tag and the script refuses to write a feed whose asset
+is not downloadable yet. The previous `appcast.xml` is fed back in, so older
+versions stay listed. Commit and push the result; Sparkle clients read the raw
+URL, which GitHub caches for a few minutes.
+
+The private EdDSA key never enters the repository. It lives in the login
+Keychain under Sparkle's default account and is read by `generate_appcast` and
+`sign_update`. Back it up once with `generate_keys -x <file>`, keep that file in
+a secure store, and restore it on another machine with `generate_keys -f <file>`.
+Losing the key means every installed copy has to be replaced by hand, because a
+new key cannot sign updates for builds that shipped with the old one.
 
 A Debug build can preview the titlebar indicator without a feed by launching
 with `--yopdf-preview-update=99.0.0`. The indicator remains disabled until
 Sparkle reports that an update check can start.
-
-YoPDF currently has no production appcast or Sparkle key configured. Its
-existing ad-hoc signing setup is for local development; public distribution
-still needs Developer ID signing and notarization.
 
 `test.sh` builds with `xcodebuild build-for-testing` and then runs the bundle
 with Apple's `xctest` CLI. On Xcode 26.3 / macOS 26.5.1 the `xcodebuild test`

@@ -55,10 +55,14 @@ targets:
       base:
         PRODUCT_NAME: YoPDF
         PRODUCT_BUNDLE_IDENTIFIER: dev.yopdf.provisional
-        MARKETING_VERSION: "2026.11.4"
-        CURRENT_PROJECT_VERSION: "3"
-        SPARKLE_FEED_URL: ""
-        SPARKLE_PUBLIC_ED_KEY: ""
+        MARKETING_VERSION: "2026.11.5"
+        CURRENT_PROJECT_VERSION: "4"
+        # Public Sparkle settings. The feed is the signed appcast committed to
+        # the repository root; the key is the EdDSA public key whose private
+        # half lives in the release machine's login Keychain. Both may be
+        # overridden from the build environment.
+        SPARKLE_FEED_URL: "https://raw.githubusercontent.com/basicv8vc/YoPDF/main/appcast.xml"
+        SPARKLE_PUBLIC_ED_KEY: "J0XVFQ7lE2pfH6wyrfI4YkEY05a4Cqn0rtYZCuXSS8I="
         ENABLE_HARDENED_RUNTIME: NO
         SWIFT_EMIT_LOC_STRINGS: YES
         COMBINE_HIDPI_IMAGES: YES
