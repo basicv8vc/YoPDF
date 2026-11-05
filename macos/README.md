@@ -136,14 +136,16 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (359)
+./scripts/test.sh                     # unit tests
 ./scripts/test-ui.sh                  # GUI tests (interactive logged-in desktop session)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
-`build.sh` and `test.sh` regenerate the Xcode project automatically when
-`project.yml` is newer than the generated project, so a fresh clone only needs
-XcodeGen installed.
+`build.sh`, `test.sh` and `test-ui.sh` call `scripts/ensure-project.sh`, which
+regenerates the Xcode project whenever `project.yml` or the set of source files
+changes. XcodeGen enumerates sources into `project.pbxproj`, so this also picks
+up newly added or removed test files in an existing worktree instead of silently
+building a stale project. A fresh clone only needs XcodeGen installed.
 
 Build products stay under `macos/build/` (git-ignored) so builds are
 reproducible and easy to inspect.

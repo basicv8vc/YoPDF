@@ -395,4 +395,39 @@ final class WorkspaceWindowModelTests: XCTestCase {
         XCTAssertTrue(workspace.activeTab === session)
         workspace.closeAllSessions()
     }
+
+    /// Menu shortcuts reach one window through focused scene values. This
+    /// covers the model half of that isolation: two workspaces own independent
+    /// tab orders and selections, so cycling in the front window cannot move
+    /// the selection of a background one.
+    func testAdjacentTabNavigationIsScopedToItsOwnWorkspace() {
+        let frontWindow = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        let backgroundWindow = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        let backgroundFirstID = backgroundWindow.activeTabID
+        _ = backgroundWindow.createTab()
+        let backgroundActiveID = backgroundWindow.activeTabID
+
+        _ = frontWindow.createTab()
+        _ = frontWindow.createTab()
+        let frontActiveID = frontWindow.activeTabID
+        frontWindow.activateAdjacentTab(direction: .next)     // wraps to the leftmost
+        frontWindow.activateAdjacentTab(direction: .previous) // wraps back
+
+        XCTAssertEqual(frontWindow.tabs.count, 3)
+        XCTAssertEqual(frontWindow.activeTabID, frontActiveID)
+        XCTAssertEqual(backgroundWindow.tabs.count, 2, "Navigation must not add tabs to another window.")
+        XCTAssertEqual(
+            backgroundWindow.activeTabID,
+            backgroundActiveID,
+            "Only the focused workspace's tab selection may change."
+        )
+        XCTAssertNotEqual(backgroundFirstID, backgroundActiveID)
+
+        // The other window still cycles through its own ordered tabs.
+        backgroundWindow.activateAdjacentTab(direction: .next)
+        XCTAssertEqual(backgroundWindow.activeTabID, backgroundFirstID)
+
+        frontWindow.closeAllSessions()
+        backgroundWindow.closeAllSessions()
+    }
 }
