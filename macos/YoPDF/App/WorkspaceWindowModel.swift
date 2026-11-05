@@ -94,6 +94,13 @@ final class WorkspaceWindowModel: ObservableObject {
         guard state.activate(tabID: tabID) else { return }
     }
 
+    /// Terminal-style cyclic tab selection. The wrapping rule lives in
+    /// `WorkspaceState`; this only forwards to the window's published state so
+    /// the tab strip and the reader's focused model update together.
+    func activateAdjacentTab(direction: WorkspaceTabDirection) {
+        _ = state.activateAdjacentTab(direction: direction)
+    }
+
     @discardableResult
     func createTab() -> UUID {
         let session = makeSession()

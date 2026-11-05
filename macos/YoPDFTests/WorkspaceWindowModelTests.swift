@@ -351,4 +351,48 @@ final class WorkspaceWindowModelTests: XCTestCase {
         XCTAssertTrue(workspace.activeTab.navigationState === secondNavigation)
         workspace.closeAllSessions()
     }
+
+    func testAdjacentTabShortcutsCycleThroughWorkspaceSessions() {
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        let firstID = workspace.activeTabID
+        let firstModel = workspace.activeTab.model
+        let secondID = workspace.createTab()
+        let thirdID = workspace.createTab()
+
+        XCTAssertEqual(workspace.tabs.map(\.id), [firstID, secondID, thirdID])
+        XCTAssertEqual(workspace.activeTabID, thirdID, "A new tab becomes the active tab.")
+
+        // ⇧⌘] wraps from the rightmost tab back to the leftmost one, with the
+        // reader's focused document following the selection.
+        workspace.activateAdjacentTab(direction: .next)
+        XCTAssertEqual(workspace.activeTabID, firstID)
+        XCTAssertTrue(workspace.activeTab.model === firstModel)
+
+        // ⇧⌘[ wraps from the leftmost tab back to the rightmost one.
+        workspace.activateAdjacentTab(direction: .previous)
+        XCTAssertEqual(workspace.activeTabID, thirdID)
+
+        // Holding the shortcut down keeps cycling rather than stopping at an
+        // end or selecting an out-of-range index.
+        for expected in [secondID, firstID, thirdID, secondID] {
+            workspace.activateAdjacentTab(direction: .previous)
+            XCTAssertEqual(workspace.activeTabID, expected)
+        }
+        XCTAssertEqual(workspace.tabs.count, 3, "Navigation must never create or close tabs.")
+
+        workspace.closeAllSessions()
+    }
+
+    func testAdjacentTabShortcutWithSingleTabKeepsItsSession() {
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        let onlyID = workspace.activeTabID
+        let session = workspace.activeTab
+
+        workspace.activateAdjacentTab(direction: .previous)
+        workspace.activateAdjacentTab(direction: .next)
+
+        XCTAssertEqual(workspace.activeTabID, onlyID)
+        XCTAssertTrue(workspace.activeTab === session)
+        workspace.closeAllSessions()
+    }
 }

@@ -62,6 +62,13 @@ existing tab. Opening the first PDF reuses the initial empty tab. **New Tab**
 (⌘T) creates an empty tab, **Close Tab** (⌘W) closes the selected tab, and closing
 the last tab uses the native window-close path. The red close button always
 closes the full window. **New Window** (⌘N) creates a separate workspace.
+**Show Previous Tab** (⇧⌘[) and **Show Next Tab** (⇧⌘]) move through the tabs
+in the focused window, wrapping at both ends as browsers and coding terminals
+do: ⇧⌘[ on the leftmost tab selects the rightmost one, and ⇧⌘] on the
+rightmost tab selects the leftmost one. Holding either shortcut down keeps
+cycling; with a single tab it does nothing. YoPDF draws its own tab strip, so
+AppKit's automatic window tabbing is disabled and these keys never target a
+native tab bar.
 
 Each tab owns its `PDFDocumentModel`, security-scoped `DocumentSession`, note
 composer, search session, and sidebar navigation state. Switching tabs retains

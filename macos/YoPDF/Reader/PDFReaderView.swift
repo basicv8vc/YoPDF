@@ -368,6 +368,14 @@ struct PDFReaderView: View {
             .focusedSceneValue(\.openDocument, { isImporterPresented = true })
             .focusedSceneValue(\.newWorkspaceTab, { _ = workspace.createTab() })
             .focusedSceneValue(\.closeWorkspaceTab, { requestCloseTab(workspace.activeTabID) })
+            .focusedSceneValue(
+                \.selectPreviousWorkspaceTab,
+                { workspace.activateAdjacentTab(direction: .previous) }
+            )
+            .focusedSceneValue(
+                \.selectNextWorkspaceTab,
+                { workspace.activateAdjacentTab(direction: .next) }
+            )
             .focusedSceneValue(\.openRecentDocument, { requestOpenRecent($0) })
             .focusedSceneValue(\.saveDocument, { requestSave() })
             .focusedSceneValue(\.saveDocumentAs, { requestSaveAs() })
