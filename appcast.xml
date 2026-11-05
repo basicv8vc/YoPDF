@@ -4,16 +4,16 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>YoPDF</title>
         <item>
-            <title>2026.11.5</title>
-            <pubDate>Thu, 05 Nov 2026 16:39:58 +0900</pubDate>
+            <title>2026.11.6</title>
+            <pubDate>Thu, 05 Nov 2026 17:20:57 +0900</pubDate>
             <link>https://github.com/basicv8vc/YoPDF/releases</link>
-            <sparkle:version>4</sparkle:version>
-            <sparkle:shortVersionString>2026.11.5</sparkle:shortVersionString>
+            <sparkle:version>5</sparkle:version>
+            <sparkle:shortVersionString>2026.11.6</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.5/YoPDF-2026.11.5-build4-universal.dmg" length="6258476" type="application/octet-stream" sparkle:edSignature="qkD28SsZDhbBm+oIYF2zqzyPmBdUyoowxo4k1xq+b+/OJPGR9CPq7T15S0ievN+ARCaKGfBaHU2Qneu0njOgBA=="></enclosure>
+            <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.6/YoPDF-2026.11.6-build5-universal.dmg" length="6258363" type="application/octet-stream" sparkle:edSignature="BAzqYl/Ss+HLmzwUSPrMtdrOelglSS1om/XcAQ2ZSfn+Q2Aa1nHa8igX7jr6jTvGyfq/oozYBD+n9jbaJVufDg=="></enclosure>
         </item>
     </channel>
 </rss><!-- sparkle-signatures:
-edSignature: BYjNPoIpEdN3ybh0wna3axjdbrElwSNSSbqiudqPoPc/VgUg/vyRw1CXOjkyCxDXI0e/7X9EpTwGNvYcL8ToAg==
+edSignature: TkjiQfY+KS9vRBuk8aj3HvsXRRg8Y/xzCw1gbDakjcXjdt90uOtB+YsU5v/GG5vU7QMgST+Bnt6DTBSzWTKmDQ==
 length: 1135
 -->
