@@ -1,7 +1,7 @@
 name: YoPDF
 
 options:
-  bundleIdPrefix: dev.yopdf.provisional
+  bundleIdPrefix: app.yopdf
   deploymentTarget:
     macOS: "14.0"
   createIntermediateGroups: true
@@ -34,7 +34,7 @@ targets:
     settings:
       base:
         PRODUCT_NAME: YoPDFCore
-        PRODUCT_BUNDLE_IDENTIFIER: dev.yopdf.provisional.core
+        PRODUCT_BUNDLE_IDENTIFIER: app.yopdf.core
         DEFINES_MODULE: YES
         GENERATE_INFOPLIST_FILE: YES
         SKIP_INSTALL: YES
@@ -54,9 +54,9 @@ targets:
     settings:
       base:
         PRODUCT_NAME: YoPDF
-        PRODUCT_BUNDLE_IDENTIFIER: dev.yopdf.provisional
-        MARKETING_VERSION: "2026.11.5"
-        CURRENT_PROJECT_VERSION: "4"
+        PRODUCT_BUNDLE_IDENTIFIER: app.yopdf
+        MARKETING_VERSION: "2026.11.6"
+        CURRENT_PROJECT_VERSION: "5"
         # Public Sparkle settings. The feed is the signed appcast committed to
         # the repository root; the key is the EdDSA public key whose private
         # half lives in the release machine's login Keychain. Both may be
@@ -76,10 +76,10 @@ targets:
         # about which copy to activate. UI tests add a separate suffix so
         # LaunchServices and XCTest cannot attach to another worktree's Debug app.
         Debug:
-          PRODUCT_BUNDLE_IDENTIFIER: dev.yopdf.provisional.debug$(YOPDF_UI_TEST_SUFFIX)
+          PRODUCT_BUNDLE_IDENTIFIER: app.yopdf.debug$(YOPDF_UI_TEST_SUFFIX)
           YOPDF_UI_TEST_SUFFIX: ""
         Release:
-          PRODUCT_BUNDLE_IDENTIFIER: dev.yopdf.provisional
+          PRODUCT_BUNDLE_IDENTIFIER: app.yopdf
           # Ad-hoc signing otherwise injects com.apple.security.get-task-allow,
           # which lets a debugger attach. Fine locally, wrong for any build that
           # is handed to someone else. Release builds carry no entitlements
@@ -94,7 +94,7 @@ targets:
         LSApplicationCategoryType: public.app-category.productivity
         LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
         NSHighResolutionCapable: true
-        NSHumanReadableCopyright: "YoPDF contributors. Apache-2.0. Provisional bundle identifier."
+        NSHumanReadableCopyright: "YoPDF contributors. Apache-2.0."
         SUFeedURL: "$(SPARKLE_FEED_URL)"
         SUPublicEDKey: "$(SPARKLE_PUBLIC_ED_KEY)"
         SUEnableAutomaticChecks: true
@@ -130,7 +130,7 @@ targets:
       - target: YoPDFCore
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.yopdf.provisional.tests
+        PRODUCT_BUNDLE_IDENTIFIER: app.yopdf.tests
         GENERATE_INFOPLIST_FILE: YES
 
   YoPDFUITests:
@@ -143,7 +143,7 @@ targets:
       - target: YoPDF
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.yopdf.provisional.uitests
+        PRODUCT_BUNDLE_IDENTIFIER: app.yopdf.uitests
         GENERATE_INFOPLIST_FILE: YES
         TEST_TARGET_NAME: YoPDF
 
