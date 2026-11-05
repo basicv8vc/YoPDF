@@ -43,6 +43,8 @@ PDFKit page thumbnails, and an index of standard PDF annotations. The thumbnail
 view stays connected to the reader, outline destinations keep their target
 position, and annotation rows jump to their page location. The sidebar belongs
 to the open document window; it does not manage files or create a PDF library.
+**Toggle Sidebar** (⌘B) shows or hides it in the focused window while a PDF is
+loaded, matching the shortcut used by coding editors and terminals.
 
 ## Recent Documents and reading position
 

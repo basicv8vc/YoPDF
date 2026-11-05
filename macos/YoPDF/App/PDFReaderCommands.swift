@@ -220,10 +220,12 @@ struct PDFReaderCommands: Commands {
         }
 
         CommandGroup(after: .toolbar) {
+            // ⌘B is the sidebar toggle used by coding editors and terminals.
+            // Like the toolbar button it only applies once a PDF is loaded.
             Button("Toggle Sidebar") {
                 sidebarActions?.toggle()
             }
-            .keyboardShortcut("s", modifiers: [.command, .option])
+            .keyboardShortcut("b", modifiers: .command)
             .disabled(sidebarActions == nil || model?.isLoaded != true)
 
             Button("Outline") {
