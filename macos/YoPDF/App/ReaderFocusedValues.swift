@@ -21,6 +21,16 @@ struct CloseWorkspaceTabActionKey: FocusedValueKey {
     typealias Value = @MainActor () -> Void
 }
 
+/// Menu-bar counterparts of the terminal-style `⇧⌘[` / `⇧⌘]` tab shortcuts.
+/// Like the other workspace actions they target the focused window only.
+struct SelectPreviousWorkspaceTabActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
+struct SelectNextWorkspaceTabActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
 /// Opens a saved recent URL through the focused reader's unsaved-work prompts.
 struct OpenRecentDocumentActionKey: FocusedValueKey {
     typealias Value = @MainActor (RecentDocument) -> Void
@@ -94,6 +104,16 @@ extension FocusedValues {
     var closeWorkspaceTab: (@MainActor () -> Void)? {
         get { self[CloseWorkspaceTabActionKey.self] }
         set { self[CloseWorkspaceTabActionKey.self] = newValue }
+    }
+
+    var selectPreviousWorkspaceTab: (@MainActor () -> Void)? {
+        get { self[SelectPreviousWorkspaceTabActionKey.self] }
+        set { self[SelectPreviousWorkspaceTabActionKey.self] = newValue }
+    }
+
+    var selectNextWorkspaceTab: (@MainActor () -> Void)? {
+        get { self[SelectNextWorkspaceTabActionKey.self] }
+        set { self[SelectNextWorkspaceTabActionKey.self] = newValue }
     }
 
     var openRecentDocument: (@MainActor (RecentDocument) -> Void)? {

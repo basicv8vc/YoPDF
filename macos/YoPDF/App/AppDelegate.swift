@@ -27,6 +27,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// request at a time, to an available workspace.
     let fileOpenRequests = FileOpenRequestQueue()
 
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // YoPDF renders its own workspace tab strip. Turning off AppKit's
+        // automatic window tabbing keeps the system's Show Previous/Next Tab
+        // menu items from claiming ⇧⌘[ / ⇧⌘], and makes ⌘N open a real
+        // window instead of merging it into a native tab bar.
+        NSWindow.allowsAutomaticWindowTabbing = false
+    }
+
     func application(_ application: NSApplication, open urls: [URL]) {
         let reply: NSApplication.DelegateReply = acceptOpenRequests(urls, from: application)
             ? .success

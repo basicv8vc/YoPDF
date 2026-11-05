@@ -15,6 +15,13 @@ public struct WorkspaceTabIdentity: Identifiable, Equatable, Sendable {
     }
 }
 
+/// Direction of the terminal-style tab navigation shortcuts: `⇧⌘[` moves
+/// left and `⇧⌘]` moves right.
+public enum WorkspaceTabDirection: Sendable {
+    case previous
+    case next
+}
+
 /// Pure tab-order and selection state for one application window.
 public struct WorkspaceState: Equatable, Sendable {
     public private(set) var tabs: [WorkspaceTabIdentity]
@@ -44,6 +51,25 @@ public struct WorkspaceState: Equatable, Sendable {
         guard tabs.contains(where: { $0.id == tabID }) else { return false }
         activeTabID = tabID
         return true
+    }
+
+    /// Selects the neighbouring tab in `direction`, wrapping at both ends the
+    /// way browsers and coding terminals do: previous on the leftmost tab
+    /// selects the rightmost one, and next on the rightmost selects the
+    /// leftmost. With one tab this is a harmless no-op, so holding the shortcut
+    /// down (key repeat) can never produce an out-of-range lookup.
+    ///
+    /// Returns the newly selected tab ID, or `nil` if the workspace has no
+    /// valid selection.
+    @discardableResult
+    public mutating func activateAdjacentTab(direction: WorkspaceTabDirection) -> UUID? {
+        guard let currentTabID = activeTabID,
+              let index = tabs.firstIndex(where: { $0.id == currentTabID })
+        else { return nil }
+
+        let step = direction == .previous ? -1 : 1
+        activeTabID = tabs[(index + step + tabs.count) % tabs.count].id
+        return activeTabID
     }
 
     /// Removes a tab while keeping one window tab alive and selecting a valid

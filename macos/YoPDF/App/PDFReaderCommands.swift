@@ -17,6 +17,8 @@ struct PDFReaderCommands: Commands {
     @FocusedValue(\.openDocument) private var openDocument
     @FocusedValue(\.newWorkspaceTab) private var newWorkspaceTab
     @FocusedValue(\.closeWorkspaceTab) private var closeWorkspaceTab
+    @FocusedValue(\.selectPreviousWorkspaceTab) private var selectPreviousWorkspaceTab
+    @FocusedValue(\.selectNextWorkspaceTab) private var selectNextWorkspaceTab
     @FocusedValue(\.openRecentDocument) private var openRecentDocument
     @FocusedValue(\.saveDocument) private var saveDocument
     @FocusedValue(\.saveDocumentAs) private var saveDocumentAs
@@ -36,6 +38,8 @@ struct PDFReaderCommands: Commands {
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
+            // Coding terminals and browsers use ⌘T for a new tab. This is the
+            // workspace's own tab strip, not AppKit's window tabbing.
             Button("New Tab") {
                 newWorkspaceTab?()
             }
@@ -81,6 +85,23 @@ struct PDFReaderCommands: Commands {
             }
             .keyboardShortcut("w", modifiers: .command)
             .disabled(closeWorkspaceTab == nil)
+
+            Divider()
+
+            // Kept with the other workspace tab commands so the File menu is
+            // searched before any AppKit window-tabbing items with the same key
+            // equivalents. Selection wraps at both ends (see WorkspaceState).
+            Button("Show Previous Tab") {
+                selectPreviousWorkspaceTab?()
+            }
+            .keyboardShortcut("[", modifiers: [.command, .shift])
+            .disabled(selectPreviousWorkspaceTab == nil)
+
+            Button("Show Next Tab") {
+                selectNextWorkspaceTab?()
+            }
+            .keyboardShortcut("]", modifiers: [.command, .shift])
+            .disabled(selectNextWorkspaceTab == nil)
         }
 
         // Annotation edits use the model's own history rather than PDFKit's
@@ -199,10 +220,12 @@ struct PDFReaderCommands: Commands {
         }
 
         CommandGroup(after: .toolbar) {
+            // ⌘B is the sidebar toggle used by coding editors and terminals.
+            // Like the toolbar button it only applies once a PDF is loaded.
             Button("Toggle Sidebar") {
                 sidebarActions?.toggle()
             }
-            .keyboardShortcut("s", modifiers: [.command, .option])
+            .keyboardShortcut("b", modifiers: .command)
             .disabled(sidebarActions == nil || model?.isLoaded != true)
 
             Button("Outline") {

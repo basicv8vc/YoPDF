@@ -43,6 +43,8 @@ PDFKit page thumbnails, and an index of standard PDF annotations. The thumbnail
 view stays connected to the reader, outline destinations keep their target
 position, and annotation rows jump to their page location. The sidebar belongs
 to the open document window; it does not manage files or create a PDF library.
+**Toggle Sidebar** (⌘B) shows or hides it in the focused window while a PDF is
+loaded, matching the shortcut used by coding editors and terminals.
 
 ## Recent Documents and reading position
 
@@ -62,6 +64,13 @@ existing tab. Opening the first PDF reuses the initial empty tab. **New Tab**
 (⌘T) creates an empty tab, **Close Tab** (⌘W) closes the selected tab, and closing
 the last tab uses the native window-close path. The red close button always
 closes the full window. **New Window** (⌘N) creates a separate workspace.
+**Show Previous Tab** (⇧⌘[) and **Show Next Tab** (⇧⌘]) move through the tabs
+in the focused window, wrapping at both ends as browsers and coding terminals
+do: ⇧⌘[ on the leftmost tab selects the rightmost one, and ⇧⌘] on the
+rightmost tab selects the leftmost one. Holding either shortcut down keeps
+cycling; with a single tab it does nothing. YoPDF draws its own tab strip, so
+AppKit's automatic window tabbing is disabled and these keys never target a
+native tab bar.
 
 Each tab owns its `PDFDocumentModel`, security-scoped `DocumentSession`, note
 composer, search session, and sidebar navigation state. Switching tabs retains
@@ -127,14 +136,16 @@ cd macos
 ./scripts/generate.sh                 # regenerate YoPDF.xcodeproj from project.yml
 ./scripts/build.sh                    # Debug
 CONFIGURATION=Release ./scripts/build.sh
-./scripts/test.sh                     # unit tests (359)
+./scripts/test.sh                     # unit tests
 ./scripts/test-ui.sh                  # GUI tests (interactive logged-in desktop session)
 open build/DerivedData/Build/Products/Debug/YoPDF.app
 ```
 
-`build.sh` and `test.sh` regenerate the Xcode project automatically when
-`project.yml` is newer than the generated project, so a fresh clone only needs
-XcodeGen installed.
+`build.sh`, `test.sh` and `test-ui.sh` call `scripts/ensure-project.sh`, which
+regenerates the Xcode project whenever `project.yml` or the set of source files
+changes. XcodeGen enumerates sources into `project.pbxproj`, so this also picks
+up newly added or removed test files in an existing worktree instead of silently
+building a stale project. A fresh clone only needs XcodeGen installed.
 
 Build products stay under `macos/build/` (git-ignored) so builds are
 reproducible and easy to inspect.
