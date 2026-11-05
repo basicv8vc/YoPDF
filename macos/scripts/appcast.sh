@@ -13,11 +13,18 @@
 #
 # Env:
 #   SPARKLE_GENERATE_APPCAST  Override the path to Sparkle's generate_appcast.
+#   SPARKLE_ED_KEY_FILE       Read the private key from this file instead of the
+#                             Keychain; '-' reads it from standard input.
 #
 # The private EdDSA key is read from the login Keychain; it is never written to
-# the repository or passed on the command line.
+# the repository or passed on the command line. The Keychain item only trusts
+# the tools that created it, so on a machine where generate_appcast is blocked
+# by that ACL (it waits forever on a prompt nobody can answer) pipe the key in
+# through SPARKLE_ED_KEY_FILE=-, without letting it touch the disk.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+REPO_ROOT="$(cd .. && pwd)"
+FEED="$REPO_ROOT/appcast.xml"
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 note() { printf '==> %s\n' "$*"; }
@@ -63,15 +70,24 @@ trap 'rm -rf "$STAGE"' EXIT
 cp "$DIST/$DMG_NAME" "$STAGE/"
 # generate_appcast merges into an existing feed. Seeding it keeps older
 # versions listed, which is what a client on an older build needs.
-if [[ -f appcast.xml ]]; then cp appcast.xml "$STAGE/appcast.xml"; fi
+if [[ -f "$FEED" ]]; then cp "$FEED" "$STAGE/appcast.xml"; fi
 
 note "signing $DMG_NAME for $TAG"
-"$TOOL" \
-  --download-url-prefix "https://github.com/$REPO/releases/download/$TAG/" \
-  --link "https://github.com/$REPO/releases" \
-  "$STAGE" >/dev/null
+# bash 3.2 treats "${arr[@]}" on an empty array as unbound under `set -u`, so
+# the two invocations are spelled out instead of building an argument array.
+FEED_URL_PREFIX="https://github.com/$REPO/releases/download/$TAG/"
+LINK_URL="https://github.com/$REPO/releases"
+if [[ -n "${SPARKLE_ED_KEY_FILE:-}" ]]; then
+  "$TOOL" --ed-key-file "$SPARKLE_ED_KEY_FILE" \
+    --download-url-prefix "$FEED_URL_PREFIX" --link "$LINK_URL" \
+    "$STAGE" >/dev/null
+else
+  "$TOOL" \
+    --download-url-prefix "$FEED_URL_PREFIX" --link "$LINK_URL" \
+    "$STAGE" >/dev/null
+fi
 
-cp "$STAGE/appcast.xml" appcast.xml
+cp "$STAGE/appcast.xml" "$FEED"
 
 note "wrote appcast.xml for $VERSION ($BUILD)"
 printf '  feed: %s\n' "https://raw.githubusercontent.com/$REPO/main/appcast.xml"
