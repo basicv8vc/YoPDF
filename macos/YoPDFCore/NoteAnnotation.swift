@@ -116,6 +116,32 @@ struct GroupedThoughtPlan {
     let identityChanges: [ShuaThoughtIdentityChange]
 }
 
+/// Stable identity for one YoPDF note thread. The PDF still contains one
+/// standard `/Text` annotation per entry; these optional keys only associate
+/// annotations that share a reader anchor.
+struct YoPDFNoteThreadIdentitySnapshot {
+    var threadID: Any?
+    var order: Any?
+    var modificationDate: Date?
+}
+
+struct YoPDFNoteThreadIdentityChange {
+    let annotation: PDFAnnotation
+    let from: YoPDFNoteThreadIdentitySnapshot
+    let to: YoPDFNoteThreadIdentitySnapshot
+}
+
+struct GroupedYoPDFNotePlan {
+    let annotation: PDFAnnotation
+    let identityChanges: [YoPDFNoteThreadIdentityChange]
+}
+
+enum YoPDFNoteThreadIdentityStatus: Equatable {
+    case identified(UUID)
+    case legacy
+    case conflicting
+}
+
 enum ShuaThoughtGroupIdentityStatus: Equatable {
     case identified(UUID)
     case legacy
@@ -452,6 +478,9 @@ public enum NoteService {
     /// our notes from an untouched third-party `/Text` note.
     static let identityKey = PDFAnnotationKey(rawValue: "/YoPDFNoteIdentity")
     static let identityValue = "yopdf-note-1"
+    /// Optional group identity/order for a multi-entry YoPDF note thread.
+    static let threadIDKey = PDFAnnotationKey(rawValue: "/YoPDFNoteThreadID")
+    static let threadOrderKey = PDFAnnotationKey(rawValue: "/YoPDFNoteThreadOrder")
     /// Anchor normalized to the page's CropBox, in 0...1.
     static let anchorXKey = PDFAnnotationKey(rawValue: "/YoPDFNoteAnchorX")
     static let anchorYKey = PDFAnnotationKey(rawValue: "/YoPDFNoteAnchorY")
@@ -503,6 +532,74 @@ public enum NoteService {
             || !samePDFValue(lhs.metadata, rhs.metadata)
             || !samePDFValue(lhs.persistedIdentity, rhs.persistedIdentity)
             || !samePDFValue(lhs.persistedAnchorID, rhs.persistedAnchorID)
+            || lhs.modificationDate != rhs.modificationDate
+    }
+
+    static func yoPDFThreadIdentityStatus(
+        of annotation: PDFAnnotation
+    ) -> YoPDFNoteThreadIdentityStatus {
+        let rawID = annotation.value(forAnnotationKey: threadIDKey)
+        let rawOrder = annotation.value(forAnnotationKey: threadOrderKey)
+        guard rawID != nil || rawOrder != nil else { return .legacy }
+        guard let raw = rawID as? String,
+              let threadID = UUID(uuidString: raw),
+              let order = yoPDFThreadOrder(of: annotation),
+              order >= 0
+        else { return .conflicting }
+        return .identified(threadID)
+    }
+
+    static func yoPDFThreadID(of annotation: PDFAnnotation) -> UUID? {
+        guard let raw = annotation.value(forAnnotationKey: threadIDKey) as? String else {
+            return nil
+        }
+        return UUID(uuidString: raw)
+    }
+
+    static func yoPDFThreadOrder(of annotation: PDFAnnotation) -> Int? {
+        if let raw = annotation.value(forAnnotationKey: threadOrderKey) as? String {
+            return Int(raw)
+        }
+        if let raw = annotation.value(forAnnotationKey: threadOrderKey) as? NSNumber {
+            return raw.intValue
+        }
+        return nil
+    }
+
+    static func setYoPDFThreadIdentity(
+        _ threadID: UUID,
+        order: Int,
+        on annotation: PDFAnnotation
+    ) {
+        _ = annotation.setValue(threadID.uuidString, forAnnotationKey: threadIDKey)
+        _ = annotation.setValue(String(order), forAnnotationKey: threadOrderKey)
+    }
+
+    static func yoPDFThreadIdentitySnapshot(
+        of annotation: PDFAnnotation
+    ) -> YoPDFNoteThreadIdentitySnapshot {
+        YoPDFNoteThreadIdentitySnapshot(
+            threadID: annotation.value(forAnnotationKey: threadIDKey),
+            order: annotation.value(forAnnotationKey: threadOrderKey),
+            modificationDate: annotation.modificationDate
+        )
+    }
+
+    static func applyYoPDFThreadIdentitySnapshot(
+        _ snapshot: YoPDFNoteThreadIdentitySnapshot,
+        to annotation: PDFAnnotation
+    ) {
+        setRawAnnotationValue(snapshot.threadID, forAnnotationKey: threadIDKey, on: annotation)
+        setRawAnnotationValue(snapshot.order, forAnnotationKey: threadOrderKey, on: annotation)
+        annotation.modificationDate = snapshot.modificationDate
+    }
+
+    static func yoPDFThreadIdentitySnapshotsDiffer(
+        _ lhs: YoPDFNoteThreadIdentitySnapshot,
+        _ rhs: YoPDFNoteThreadIdentitySnapshot
+    ) -> Bool {
+        !samePDFValue(lhs.threadID, rhs.threadID)
+            || !samePDFValue(lhs.order, rhs.order)
             || lhs.modificationDate != rhs.modificationDate
     }
 
@@ -1300,29 +1397,6 @@ public enum NoteService {
                 shuaGroups[anchorID, default: []].append(annotation)
             }
 
-            for annotation in visible
-                where isYoPDFNote(annotation)
-                    && !isShuaThought(annotation)
-                    && shuaAnchorID(of: annotation) == nil
-            {
-                let center = markerCenter(of: annotation, on: page)
-                let bounds = displayBounds(
-                    center: center,
-                    in: page.bounds(for: .cropBox),
-                    showsCountBadge: true
-                )
-                markers.append(NoteMarker(
-                    annotation: annotation,
-                    pageIndex: pageIndex,
-                    center: center,
-                    bounds: bounds,
-                    maskBounds: bounds,
-                    style: style(of: annotation),
-                    showsCountBadge: true,
-                    threadContents: [annotation.contents ?? ""]
-                ))
-            }
-
             let legacyStacks = legacyShuaStackGroups(in: visible)
             let legacyStackMembers = Set(
                 legacyStacks.flatMap { $0 }.map(ObjectIdentifier.init)
@@ -1401,6 +1475,61 @@ public enum NoteService {
                     (ObjectIdentifier($0.element), $0.offset)
                 }
             )
+
+            // YoPDF notes use one standard `/Text` annotation per thought,
+            // associated by a durable thread ID. Older notes without that ID
+            // are grouped by their exact reading anchor when they were created
+            // repeatedly at the same selected text or page point.
+            let yoPDFNotes = visible.filter {
+                isYoPDFNote($0) && !isShuaThought($0) && shuaAnchorID(of: $0) == nil
+            }
+            var yoPDFGroups: [UUID: [PDFAnnotation]] = [:]
+            var yoPDFGroupOrder: [UUID] = []
+            for annotation in yoPDFNotes {
+                guard let threadID = yoPDFThreadID(of: annotation) else { continue }
+                if yoPDFGroups[threadID] == nil { yoPDFGroupOrder.append(threadID) }
+                yoPDFGroups[threadID, default: []].append(annotation)
+            }
+            for threadID in yoPDFGroupOrder {
+                guard let notes = yoPDFGroups[threadID]?.sorted(by: { left, right in
+                    let leftOrder = yoPDFThreadOrder(of: left) ?? Int.max
+                    let rightOrder = yoPDFThreadOrder(of: right) ?? Int.max
+                    if leftOrder != rightOrder { return leftOrder < rightOrder }
+                    return (annotationOrder[ObjectIdentifier(left)] ?? 0)
+                        < (annotationOrder[ObjectIdentifier(right)] ?? 0)
+                }),
+                let marker = yoPDFThreadMarker(notes, pageIndex: pageIndex, on: page)
+                else { continue }
+                markers.append(marker)
+            }
+
+            let unthreadedYoPDFNotes = yoPDFNotes.filter {
+                yoPDFThreadIdentityStatus(of: $0) == .legacy
+            }
+            var remainingYoPDFNotes = unthreadedYoPDFNotes
+            while let first = remainingYoPDFNotes.first {
+                let group = remainingYoPDFNotes.filter {
+                    shareYoPDFAnchor(first, $0, on: page)
+                }
+                let memberIDs = Set(group.map(ObjectIdentifier.init))
+                remainingYoPDFNotes.removeAll { memberIDs.contains(ObjectIdentifier($0)) }
+                if let marker = yoPDFThreadMarker(group, pageIndex: pageIndex, on: page) {
+                    markers.append(marker)
+                }
+            }
+
+            // Malformed optional thread metadata must not make a note vanish or
+            // accidentally merge it with a neighbour. It stays readable as a
+            // single entry, while appending is refused by the edit planner.
+            for annotation in yoPDFNotes
+                where yoPDFThreadIdentityStatus(of: annotation) == .conflicting
+                    && yoPDFThreadID(of: annotation) == nil
+            {
+                if let marker = yoPDFThreadMarker([annotation], pageIndex: pageIndex, on: page) {
+                    markers.append(marker)
+                }
+            }
+
             for anchorID in shuaGroupOrder {
                 guard let group = shuaGroups[anchorID] else { continue }
                 let hasCompleteThoughtOrder = group.allSatisfy {
@@ -1464,6 +1593,59 @@ public enum NoteService {
             }
         }
         return markers
+    }
+
+    private static func yoPDFThreadMarker(
+        _ notes: [PDFAnnotation],
+        pageIndex: Int,
+        on page: PDFPage
+    ) -> NoteMarker? {
+        guard let first = notes.first else { return nil }
+        let crop = page.bounds(for: .cropBox)
+        let center = markerCenter(of: first, on: page)
+        let bounds = displayBounds(
+            center: center,
+            in: crop,
+            count: notes.count,
+            showsCountBadge: true
+        )
+        let annotationsBounds = notes.dropFirst().reduce(first.bounds) { $0.union($1.bounds) }
+        let maskBounds = annotationsBounds
+            .union(bounds)
+            .insetBy(dx: -2, dy: -2)
+            .intersection(crop)
+        return NoteMarker(
+            annotation: first,
+            pageIndex: pageIndex,
+            center: center,
+            bounds: bounds,
+            maskBounds: maskBounds,
+            style: style(of: first),
+            count: notes.count,
+            showsCountBadge: true,
+            threadContents: notes.map { $0.contents ?? "" },
+            threadEntries: notes.map {
+                NoteThreadEntry(
+                    annotation: $0,
+                    contents: $0.contents ?? "",
+                    style: style(of: $0)
+                )
+            },
+            sourceHitBounds: notes.map(\.bounds)
+        )
+    }
+
+    private static func shareYoPDFAnchor(
+        _ lhs: PDFAnnotation,
+        _ rhs: PDFAnnotation,
+        on page: PDFPage
+    ) -> Bool {
+        guard excerpt(of: lhs) == excerpt(of: rhs),
+              isPageLevel(lhs) == isPageLevel(rhs)
+        else { return false }
+        let left = markerCenter(of: lhs, on: page)
+        let right = markerCenter(of: rhs, on: page)
+        return abs(left.x - right.x) <= 0.5 && abs(left.y - right.y) <= 0.5
     }
 
     /// The click target for one note.
@@ -1741,6 +1923,136 @@ public enum NoteService {
         _ = annotation.setValue(metadata, forAnnotationKey: shuaThoughtMetadataKey)
 
         return GroupedThoughtPlan(annotation: annotation, identityChanges: identityChanges)
+    }
+
+    /// Plans one additional entry in a YoPDF note thread.
+    ///
+    /// Existing unthreaded YoPDF notes are promoted to a stable thread ID as
+    /// part of the same undoable edit that inserts the new `/Text` annotation.
+    static func groupedYoPDFNotePlan(
+        for group: NoteSelection,
+        contents: String,
+        style: NoteStickerStyle,
+        on page: PDFPage
+    ) -> GroupedYoPDFNotePlan? {
+        let text = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty,
+              isYoPDFNote(group.annotation),
+              !isShuaThought(group.annotation),
+              group.annotation.page === page,
+              let document = page.document
+        else { return nil }
+
+        let identityStatus = yoPDFThreadIdentityStatus(of: group.annotation)
+        let candidates = page.annotations.filter {
+            isTextAnnotation($0) && isYoPDFNote($0) && !isShuaThought($0)
+        }
+        let threadID: UUID?
+        var members: [PDFAnnotation]
+        switch identityStatus {
+        case let .identified(id):
+            threadID = id
+            members = candidates.filter { yoPDFThreadID(of: $0) == id }
+        case .legacy:
+            threadID = nil
+            members = candidates.filter {
+                yoPDFThreadIdentityStatus(of: $0) == .legacy
+                    && shareYoPDFAnchor(group.annotation, $0, on: page)
+            }
+        case .conflicting:
+            return nil
+        }
+        let annotationOrder = Dictionary(uniqueKeysWithValues: page.annotations.enumerated().map {
+            (ObjectIdentifier($0.element), $0.offset)
+        })
+        members.sort { left, right in
+            if threadID != nil {
+                let leftOrder = yoPDFThreadOrder(of: left) ?? Int.max
+                let rightOrder = yoPDFThreadOrder(of: right) ?? Int.max
+                if leftOrder != rightOrder { return leftOrder < rightOrder }
+            }
+            return (annotationOrder[ObjectIdentifier(left)] ?? 0)
+                < (annotationOrder[ObjectIdentifier(right)] ?? 0)
+        }
+        guard members.contains(where: { $0 === group.annotation }), !members.isEmpty else {
+            return nil
+        }
+
+        var maximumOrder = -1
+        for member in members {
+            switch yoPDFThreadIdentityStatus(of: member) {
+            case let .identified(id):
+                guard threadID == id else { return nil }
+                guard let order = yoPDFThreadOrder(of: member) else { return nil }
+                maximumOrder = max(maximumOrder, order)
+            case .legacy:
+                if threadID != nil { return nil }
+            case .conflicting:
+                return nil
+            }
+        }
+        // A thread ID may not be mixed with an untagged member. That would
+        // make reopen order ambiguous, so only the marker's verified group is
+        // promoted together.
+        if threadID != nil,
+           members.contains(where: { yoPDFThreadIdentityStatus(of: $0) == .legacy }) {
+            return nil
+        }
+        let resolvedThreadID = threadID ?? UUID()
+        guard maximumOrder < Int.max else { return nil }
+        let nextOrder = maximumOrder < 0 ? members.count : maximumOrder + 1
+        guard nextOrder > 0 else { return nil }
+
+        let crop = page.bounds(for: .cropBox)
+        guard crop.minX.isFinite, crop.minY.isFinite,
+              crop.width.isFinite, crop.height.isFinite,
+              crop.width >= 24, crop.height >= 24,
+              group.center.x.isFinite, group.center.y.isFinite
+        else { return nil }
+
+        let size: CGFloat = 24
+        let x = min(max(group.center.x - size / 2, crop.minX), crop.maxX - size)
+        let lowestMemberY = members.map(\.bounds.minY).min() ?? (group.center.y - size / 2)
+        let y = min(max(lowestMemberY - 23, crop.minY), crop.maxY - size)
+        let bounds = CGRect(x: x, y: y, width: size, height: size)
+        let draft = NoteDraft(
+            pageIndex: group.pageIndex,
+            bounds: bounds,
+            excerpt: group.excerpt,
+            isPageLevel: group.isPageLevel,
+            document: document
+        )
+        guard let annotation = self.annotation(
+            for: draft,
+            contents: text,
+            style: style,
+            on: page
+        ) else { return nil }
+        setAnchor(group.center, on: annotation, page: page)
+        setYoPDFThreadIdentity(resolvedThreadID, order: nextOrder, on: annotation)
+
+        let now = Date()
+        var identityChanges: [YoPDFNoteThreadIdentityChange] = []
+        for (order, member) in members.enumerated() {
+            let status = yoPDFThreadIdentityStatus(of: member)
+            let currentOrder = yoPDFThreadOrder(of: member)
+            if status == .identified(resolvedThreadID), currentOrder == order {
+                continue
+            }
+            let before = yoPDFThreadIdentitySnapshot(of: member)
+            var after = before
+            after.threadID = resolvedThreadID.uuidString
+            after.order = String(order)
+            after.modificationDate = now
+            if yoPDFThreadIdentitySnapshotsDiffer(before, after) {
+                identityChanges.append(YoPDFNoteThreadIdentityChange(
+                    annotation: member,
+                    from: before,
+                    to: after
+                ))
+            }
+        }
+        return GroupedYoPDFNotePlan(annotation: annotation, identityChanges: identityChanges)
     }
 
     private static func orderedShuaMembers(

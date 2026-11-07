@@ -1524,12 +1524,12 @@ struct PDFReaderView: View {
         startComposer(target)
     }
 
-    /// A Shua thought opens its thread composer even when it is currently the
-    /// only member. Mouse activation and the context menu share this route so
-    /// one marker cannot expose two editing experiences.
+    /// A YoPDF note or Shua thought opens the thread composer even when it is
+    /// currently the only member. Mouse activation and the context menu share
+    /// this route so one marker cannot expose two editing experiences.
     private func requestNoteComposer(_ note: NoteSelection, anchor: CGRect) {
         isPlacingNote = false
-        let target: PendingAction.ComposerTarget = note.isShuaThought
+        let target: PendingAction.ComposerTarget = (note.isShuaThought || note.isYoPDFNote)
             ? .group(note, anchor)
             : .note(note, anchor)
         requestCompose(target)
@@ -1578,7 +1578,7 @@ struct PDFReaderView: View {
 
         if let note = context.note {
             let anchor = context.anchorRect
-            let title = note.isShuaThought
+            let title = (note.isShuaThought || note.isYoPDFNote)
                 ? "Open Note Thread"
                 : "Edit Note"
             items.append(MarkupActionMenuItem(title: title) { [note] in

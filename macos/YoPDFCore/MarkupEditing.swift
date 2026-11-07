@@ -49,6 +49,14 @@ enum MarkupEditChange {
         from: ShuaThoughtIdentitySnapshot,
         to: ShuaThoughtIdentitySnapshot
     )
+    /// Assigns YoPDF thread identity/order to existing notes when an older
+    /// same-anchor set is first extended into a note thread.
+    case setYoPDFNoteThreadIdentity(
+        annotation: PDFAnnotation,
+        pageIndex: Int,
+        from: YoPDFNoteThreadIdentitySnapshot,
+        to: YoPDFNoteThreadIdentitySnapshot
+    )
     /// Moving a note keeps its standard PDF rectangle and YoPDF's normalized
     /// marker anchor in one reversible edit.
     case setNotePosition(
@@ -66,6 +74,7 @@ enum MarkupEditChange {
              let .setContents(_, pageIndex, _, _),
              let .setNoteStyle(_, pageIndex, _, _),
              let .setShuaThoughtIdentity(_, pageIndex, _, _),
+             let .setYoPDFNoteThreadIdentity(_, pageIndex, _, _),
              let .setNotePosition(_, pageIndex, _, _):
             return pageIndex
         }
@@ -79,6 +88,7 @@ enum MarkupEditChange {
              let .setContents(annotation, _, _, _),
              let .setNoteStyle(annotation, _, _, _),
              let .setShuaThoughtIdentity(annotation, _, _, _),
+             let .setYoPDFNoteThreadIdentity(annotation, _, _, _),
              let .setNotePosition(annotation, _, _, _):
             return annotation
         }
@@ -459,7 +469,8 @@ extension PDFDocumentModel {
                           !page.annotations.contains(where: { $0 === annotation })
                     else { return .invalidHistory }
                 }
-            case .recolor, .setNoteStyle, .setShuaThoughtIdentity, .setNotePosition:
+            case .recolor, .setNoteStyle, .setShuaThoughtIdentity,
+                 .setYoPDFNoteThreadIdentity, .setNotePosition:
                 guard annotation.page === page,
                       page.annotations.contains(where: { $0 === annotation })
                 else { return .invalidHistory }
@@ -480,7 +491,8 @@ extension PDFDocumentModel {
                 guard document.allowsCommenting,
                       MarkupPermissions.allowsContentsChanges(annotation)
                 else { return .permissionDenied }
-            case .insert, .remove, .recolor, .setNoteStyle, .setShuaThoughtIdentity, .setNotePosition:
+            case .insert, .remove, .recolor, .setNoteStyle, .setShuaThoughtIdentity,
+                 .setYoPDFNoteThreadIdentity, .setNotePosition:
                 guard MarkupPermissions.allowsAnnotationChanges(annotation, in: document)
                 else { return .permissionDenied }
             }
@@ -511,6 +523,8 @@ extension PDFDocumentModel {
                 NoteService.applyStyleSnapshot(forward ? to : from, to: annotation)
             case let .setShuaThoughtIdentity(annotation, _, from, to):
                 NoteService.applyShuaIdentitySnapshot(forward ? to : from, to: annotation)
+            case let .setYoPDFNoteThreadIdentity(annotation, _, from, to):
+                NoteService.applyYoPDFThreadIdentitySnapshot(forward ? to : from, to: annotation)
             case let .setNotePosition(annotation, _, from, to):
                 NoteService.applyPositionSnapshot(forward ? to : from, to: annotation)
             }
