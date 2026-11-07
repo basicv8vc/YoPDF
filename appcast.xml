@@ -1,8 +1,19 @@
-<?xml version="1.0" standalone="yes"?><!-- sparkle-sign-warning:
+<?xml version="1.0" standalone="yes"?>
+<!-- sparkle-sign-warning:
 IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires re-signing this file with generate_appcast or sign_update! The signed signature will be embedded at the end of this file.
---><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+-->
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
     <channel>
         <title>YoPDF</title>
+        <item>
+            <title>2026.11.7</title>
+            <pubDate>Sat, 07 Nov 2026 22:17:16 +0900</pubDate>
+            <link>https://github.com/basicv8vc/YoPDF/releases</link>
+            <sparkle:version>6</sparkle:version>
+            <sparkle:shortVersionString>2026.11.7</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.7/YoPDF-2026.11.7-build6-universal.dmg" length="6304682" type="application/octet-stream" sparkle:edSignature="o1qIRRmbT1TglXIlQ5xyU/rUhL471Y55bGR7f8TWPTKpO4hEeDcLVd4Hz5Uyo4hYSEPJ+sTBk25qIrldNL5DCA=="/>
+        </item>
         <item>
             <title>2026.11.6</title>
             <pubDate>Thu, 05 Nov 2026 17:20:57 +0900</pubDate>
@@ -10,10 +21,11 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
             <sparkle:version>5</sparkle:version>
             <sparkle:shortVersionString>2026.11.6</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.6/YoPDF-2026.11.6-build5-universal.dmg" length="6258363" type="application/octet-stream" sparkle:edSignature="BAzqYl/Ss+HLmzwUSPrMtdrOelglSS1om/XcAQ2ZSfn+Q2Aa1nHa8igX7jr6jTvGyfq/oozYBD+n9jbaJVufDg=="></enclosure>
+            <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.6/YoPDF-2026.11.6-build5-universal.dmg" length="6258363" type="application/octet-stream" sparkle:edSignature="BAzqYl/Ss+HLmzwUSPrMtdrOelglSS1om/XcAQ2ZSfn+Q2Aa1nHa8igX7jr6jTvGyfq/oozYBD+n9jbaJVufDg=="/>
         </item>
     </channel>
-</rss><!-- sparkle-signatures:
-edSignature: TkjiQfY+KS9vRBuk8aj3HvsXRRg8Y/xzCw1gbDakjcXjdt90uOtB+YsU5v/GG5vU7QMgST+Bnt6DTBSzWTKmDQ==
-length: 1135
+</rss>
+<!-- sparkle-signatures:
+edSignature: S/EpG5ChdYAKRjb6x98FaEjKL+klX+lx+fLDNrk8doLl6vICAsPDE6u2EAyRSHn5ubRVkcj8qmf8y/aB+quIAA==
+length: 1825
 -->
