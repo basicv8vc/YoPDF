@@ -334,6 +334,9 @@ extension PDFDocumentModel {
             style: style,
             on: page
         ) else { return .failure(.emptyContents) }
+        // Every newly created YoPDF note starts a durable thread. Legacy
+        // anchor groups take the append path above and remain unmodified.
+        NoteService.setYoPDFThreadIdentity(UUID(), order: 0, on: annotation)
 
         let edit = MarkupEdit(changes: [
             .insert(annotation: annotation, pageIndex: draft.pageIndex)

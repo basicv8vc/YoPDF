@@ -446,6 +446,9 @@ final class NoteAnnotationTests: XCTestCase {
         let originalSelection = try addPageNote(to: model, contents: "Locked legacy note")
         let original = try note(on: 0, in: model)
         let marker = try XCTUnwrap(model.noteMarkers.first)
+        // Recreate a historical note that predates persisted thread identity.
+        original.removeValue(forAnnotationKey: NoteService.threadIDKey)
+        original.removeValue(forAnnotationKey: NoteService.threadOrderKey)
         setFlags(MarkupPermissions.lockedFlag, on: original)
 
         let page = try XCTUnwrap(model.document?.page(at: 0))
@@ -475,7 +478,7 @@ final class NoteAnnotationTests: XCTestCase {
         XCTAssertEqual(originalSelection.contents, "Locked legacy note")
     }
 
-    func testAppendingAfterDeletingMiddleEntryPreservesOrdersAndUndoRedo() throws {
+    func testNormalCreationPersistsThreadIdentityAndOrderAcrossSaveReopen() throws {
         let url = try makeFixture(named: "note-thread-order-gaps")
         let model = openModel(at: url)
         var group = try addPageNote(to: model, contents: "First")
@@ -490,16 +493,27 @@ final class NoteAnnotationTests: XCTestCase {
             group = updated
         }
 
-        let threadID = UUID()
-        for (order, annotation) in try notes(on: 0, in: model).enumerated() {
-            NoteService.setYoPDFThreadIdentity(threadID, order: order, on: annotation)
-        }
+        // No identity metadata is assigned by the test: creation and both
+        // appends use the same APIs the reader uses.
+        let createdAnnotations = try notes(on: 0, in: model)
+        let firstCreated = try XCTUnwrap(createdAnnotations.first)
+        let threadID = try XCTUnwrap(NoteService.yoPDFThreadID(of: firstCreated))
+        XCTAssertEqual(createdAnnotations.compactMap(NoteService.yoPDFThreadOrder(of:)), [0, 1, 2])
+        XCTAssertTrue(createdAnnotations.allSatisfy {
+            NoteService.yoPDFThreadIdentityStatus(of: $0) == .identified(threadID)
+        })
         XCTAssertEqual(model.save(), .saved)
 
         let reopened = openModel(at: url)
         let page = try XCTUnwrap(reopened.document?.page(at: 0))
         let initialMarker = try XCTUnwrap(reopened.noteMarkers.first)
         XCTAssertEqual(initialMarker.threadEntries.map(\.contents), ["First", "Second", "Third"])
+        XCTAssertTrue(initialMarker.threadEntries.allSatisfy {
+            NoteService.yoPDFThreadIdentityStatus(of: $0.annotation) == .identified(threadID)
+        })
+        XCTAssertEqual(initialMarker.threadEntries.map {
+            NoteService.yoPDFThreadOrder(of: $0.annotation)
+        }, [0, 1, 2])
 
         let middle = try XCTUnwrap(initialMarker.threadEntries.first { $0.contents == "Second" })
         let middleSelection = try XCTUnwrap(NoteService.selection(
