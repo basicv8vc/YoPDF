@@ -274,7 +274,8 @@ struct PDFReaderCommands: Commands {
             Button("Check for Updates…") {
                 updateController.checkForUpdates()
             }
-            .disabled(!updateController.canCheckForUpdates)
+            // Not `canCheckForUpdates`: see `isUpdateCheckingAvailable`.
+            .disabled(!updateController.isUpdateCheckingAvailable)
         }
     }
 }

@@ -26,6 +26,19 @@ final class SparkleUpdateController: NSObject, ObservableObject, SPUUpdaterDeleg
         controller.updater
     }
 
+    /// Whether the manual menu item should be offered at all.
+    ///
+    /// SwiftUI evaluates a `Commands` item's `.disabled` state once, when it
+    /// builds the menu, and does not re-evaluate it when an observed object
+    /// publishes. `canCheckForUpdates` is false during every check — including
+    /// Sparkle's scheduled one right after launch — so an item built inside
+    /// that window would stay greyed out for the rest of the session. The item
+    /// therefore follows the build-time configuration, and `checkForUpdates()`
+    /// stays a no-op while a check is running.
+    var isUpdateCheckingAvailable: Bool {
+        isConfigured
+    }
+
     override private init() {
         isConfigured = Self.hasSignedFeedConfiguration
         super.init()
