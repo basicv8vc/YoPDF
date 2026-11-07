@@ -116,24 +116,8 @@ struct GroupedThoughtPlan {
     let identityChanges: [ShuaThoughtIdentityChange]
 }
 
-/// Stable identity for one YoPDF note thread. The PDF still contains one
-/// standard `/Text` annotation per entry; these optional keys only associate
-/// annotations that share a reader anchor.
-struct YoPDFNoteThreadIdentitySnapshot {
-    var threadID: Any?
-    var order: Any?
-    var modificationDate: Date?
-}
-
-struct YoPDFNoteThreadIdentityChange {
-    let annotation: PDFAnnotation
-    let from: YoPDFNoteThreadIdentitySnapshot
-    let to: YoPDFNoteThreadIdentitySnapshot
-}
-
 struct GroupedYoPDFNotePlan {
     let annotation: PDFAnnotation
-    let identityChanges: [YoPDFNoteThreadIdentityChange]
 }
 
 enum YoPDFNoteThreadIdentityStatus: Equatable {
@@ -573,34 +557,6 @@ public enum NoteService {
     ) {
         _ = annotation.setValue(threadID.uuidString, forAnnotationKey: threadIDKey)
         _ = annotation.setValue(String(order), forAnnotationKey: threadOrderKey)
-    }
-
-    static func yoPDFThreadIdentitySnapshot(
-        of annotation: PDFAnnotation
-    ) -> YoPDFNoteThreadIdentitySnapshot {
-        YoPDFNoteThreadIdentitySnapshot(
-            threadID: annotation.value(forAnnotationKey: threadIDKey),
-            order: annotation.value(forAnnotationKey: threadOrderKey),
-            modificationDate: annotation.modificationDate
-        )
-    }
-
-    static func applyYoPDFThreadIdentitySnapshot(
-        _ snapshot: YoPDFNoteThreadIdentitySnapshot,
-        to annotation: PDFAnnotation
-    ) {
-        setRawAnnotationValue(snapshot.threadID, forAnnotationKey: threadIDKey, on: annotation)
-        setRawAnnotationValue(snapshot.order, forAnnotationKey: threadOrderKey, on: annotation)
-        annotation.modificationDate = snapshot.modificationDate
-    }
-
-    static func yoPDFThreadIdentitySnapshotsDiffer(
-        _ lhs: YoPDFNoteThreadIdentitySnapshot,
-        _ rhs: YoPDFNoteThreadIdentitySnapshot
-    ) -> Bool {
-        !samePDFValue(lhs.threadID, rhs.threadID)
-            || !samePDFValue(lhs.order, rhs.order)
-            || lhs.modificationDate != rhs.modificationDate
     }
 
     private static func samePDFValue(_ lhs: Any?, _ rhs: Any?) -> Bool {
@@ -1486,7 +1442,8 @@ public enum NoteService {
             var yoPDFGroups: [UUID: [PDFAnnotation]] = [:]
             var yoPDFGroupOrder: [UUID] = []
             for annotation in yoPDFNotes {
-                guard let threadID = yoPDFThreadID(of: annotation) else { continue }
+                guard case let .identified(threadID) = yoPDFThreadIdentityStatus(of: annotation)
+                else { continue }
                 if yoPDFGroups[threadID] == nil { yoPDFGroupOrder.append(threadID) }
                 yoPDFGroups[threadID, default: []].append(annotation)
             }
@@ -1519,11 +1476,11 @@ public enum NoteService {
             }
 
             // Malformed optional thread metadata must not make a note vanish or
-            // accidentally merge it with a neighbour. It stays readable as a
-            // single entry, while appending is refused by the edit planner.
+            // accidentally merge it with a valid thread. It stays readable as
+            // a single entry; Add Note at this anchor starts a separate legacy
+            // entry instead of trying to append to the malformed identity.
             for annotation in yoPDFNotes
                 where yoPDFThreadIdentityStatus(of: annotation) == .conflicting
-                    && yoPDFThreadID(of: annotation) == nil
             {
                 if let marker = yoPDFThreadMarker([annotation], pageIndex: pageIndex, on: page) {
                     markers.append(marker)
@@ -1927,8 +1884,9 @@ public enum NoteService {
 
     /// Plans one additional entry in a YoPDF note thread.
     ///
-    /// Existing unthreaded YoPDF notes are promoted to a stable thread ID as
-    /// part of the same undoable edit that inserts the new `/Text` annotation.
+    /// Existing unthreaded notes stay grouped by their shared anchor, so adding
+    /// an entry never requires rewriting an existing annotation. Identified
+    /// threads keep their existing orders and append at the next unused order.
     static func groupedYoPDFNotePlan(
         for group: NoteSelection,
         contents: String,
@@ -1952,7 +1910,9 @@ public enum NoteService {
         switch identityStatus {
         case let .identified(id):
             threadID = id
-            members = candidates.filter { yoPDFThreadID(of: $0) == id }
+            members = candidates.filter {
+                yoPDFThreadIdentityStatus(of: $0) == .identified(id)
+            }
         case .legacy:
             threadID = nil
             members = candidates.filter {
@@ -1998,10 +1958,18 @@ public enum NoteService {
            members.contains(where: { yoPDFThreadIdentityStatus(of: $0) == .legacy }) {
             return nil
         }
-        let resolvedThreadID = threadID ?? UUID()
-        guard maximumOrder < Int.max else { return nil }
-        let nextOrder = maximumOrder < 0 ? members.count : maximumOrder + 1
-        guard nextOrder > 0 else { return nil }
+        let nextOrder: Int?
+        if threadID != nil {
+            guard maximumOrder < Int.max else { return nil }
+            let order = maximumOrder + 1
+            guard order > 0 else { return nil }
+            nextOrder = order
+        } else {
+            // Legacy entries use the shared normalized anchor as their group
+            // identity. Do not migrate them during append: a member may be
+            // locked even though the document still permits new annotations.
+            nextOrder = nil
+        }
 
         let crop = page.bounds(for: .cropBox)
         guard crop.minX.isFinite, crop.minY.isFinite,
@@ -2029,30 +1997,10 @@ public enum NoteService {
             on: page
         ) else { return nil }
         setAnchor(group.center, on: annotation, page: page)
-        setYoPDFThreadIdentity(resolvedThreadID, order: nextOrder, on: annotation)
-
-        let now = Date()
-        var identityChanges: [YoPDFNoteThreadIdentityChange] = []
-        for (order, member) in members.enumerated() {
-            let status = yoPDFThreadIdentityStatus(of: member)
-            let currentOrder = yoPDFThreadOrder(of: member)
-            if status == .identified(resolvedThreadID), currentOrder == order {
-                continue
-            }
-            let before = yoPDFThreadIdentitySnapshot(of: member)
-            var after = before
-            after.threadID = resolvedThreadID.uuidString
-            after.order = String(order)
-            after.modificationDate = now
-            if yoPDFThreadIdentitySnapshotsDiffer(before, after) {
-                identityChanges.append(YoPDFNoteThreadIdentityChange(
-                    annotation: member,
-                    from: before,
-                    to: after
-                ))
-            }
+        if let threadID, let nextOrder {
+            setYoPDFThreadIdentity(threadID, order: nextOrder, on: annotation)
         }
-        return GroupedYoPDFNotePlan(annotation: annotation, identityChanges: identityChanges)
+        return GroupedYoPDFNotePlan(annotation: annotation)
     }
 
     private static func orderedShuaMembers(

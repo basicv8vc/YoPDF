@@ -185,10 +185,22 @@ extension PDFDocumentModel {
               })
         else { return false }
 
-        // Marker entries are the complete visible group for Shua threads,
-        // YoPDF threads, and legacy stacks. Moving that resolved group avoids
-        // deriving membership from annotation rectangle overlap.
-        let annotations = marker.threadEntries.map(\.annotation)
+        // Shua's persisted group ID is shared by hidden and visible thoughts.
+        // Resolve against every page annotation so moving a visible marker
+        // keeps hidden members' stored anchors in sync too. YoPDF threads use
+        // their marker's resolved entries.
+        let annotations: [PDFAnnotation]
+        if NoteService.isShuaThought(note.annotation) {
+            if let groupID = NoteService.shuaAnchorID(of: note.annotation) {
+                annotations = page.annotations.filter {
+                    NoteService.shuaAnchorID(of: $0) == groupID
+                }
+            } else {
+                annotations = NoteService.shuaStackMembers(of: note.annotation, on: page)
+            }
+        } else {
+            annotations = marker.threadEntries.map(\.annotation)
+        }
         guard !annotations.isEmpty,
               annotations.contains(where: { $0 === note.annotation }),
               annotations.allSatisfy({
@@ -292,15 +304,20 @@ extension PDFDocumentModel {
               page.document === document
         else { return .failure(.pageUnavailable) }
 
-        // Add Note at an anchor that already has a YoPDF or Shua marker joins
-        // that thread. This also folds older same-anchor standalone YoPDF notes
-        // into the same visible list instead of stacking inaccessible markers.
+        // Add Note at an anchor that already has a usable YoPDF or Shua marker
+        // joins that thread. A malformed YoPDF identity stays readable on its
+        // own; adding at its anchor creates a separate legacy entry rather than
+        // attempting an append that the identity validator must reject.
         if let marker = noteMarkers.first(where: {
             $0.pageIndex == draft.pageIndex
                 && abs($0.center.x - draft.bounds.midX) <= 0.5
                 && abs($0.center.y - draft.bounds.midY) <= 0.5
                 && NoteService.excerpt(of: $0.annotation) == draft.excerpt
                 && NoteService.isPageLevel($0.annotation) == draft.isPageLevel
+                && (!NoteService.isYoPDFNote($0.annotation)
+                    || $0.threadEntries.allSatisfy {
+                        NoteService.yoPDFThreadIdentityStatus(of: $0.annotation) != .conflicting
+                    })
         }),
         let existingThread = NoteService.selection(
             for: marker.annotation,
@@ -337,9 +354,9 @@ extension PDFDocumentModel {
     }
 
     /// Adds one entry to a YoPDF or Shua thread, including a thread that
-    /// currently has only one visible entry. Older same-anchor YoPDF notes and
-    /// Shua geometry stacks are promoted to stable identity in the same undoable
-    /// edit as the new annotation.
+    /// currently has only one visible entry. Legacy YoPDF notes remain grouped
+    /// by their shared anchor; identified threads retain their existing order
+    /// values. Shua geometry stacks are promoted with the new annotation.
     @discardableResult
     public func addThought(
         to group: NoteSelection,
@@ -404,14 +421,7 @@ extension PDFDocumentModel {
                 style: style,
                 on: page
             ) else { return .failure(.annotationUnavailable) }
-            identityChanges = plan.identityChanges.map {
-                .setYoPDFNoteThreadIdentity(
-                    annotation: $0.annotation,
-                    pageIndex: group.pageIndex,
-                    from: $0.from,
-                    to: $0.to
-                )
-            }
+            identityChanges = []
             annotation = plan.annotation
         } else {
             return .failure(.permissionDenied)
