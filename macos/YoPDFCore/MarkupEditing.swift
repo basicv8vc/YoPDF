@@ -480,7 +480,8 @@ extension PDFDocumentModel {
                 guard document.allowsCommenting,
                       MarkupPermissions.allowsContentsChanges(annotation)
                 else { return .permissionDenied }
-            case .insert, .remove, .recolor, .setNoteStyle, .setShuaThoughtIdentity, .setNotePosition:
+            case .insert, .remove, .recolor, .setNoteStyle, .setShuaThoughtIdentity,
+                 .setNotePosition:
                 guard MarkupPermissions.allowsAnnotationChanges(annotation, in: document)
                 else { return .permissionDenied }
             }

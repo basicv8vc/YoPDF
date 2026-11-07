@@ -509,6 +509,64 @@ final class ShuaCompatibilityTests: XCTestCase {
         }
     }
 
+    func testMovingShuaGroupAlsoMovesHiddenMembers() throws {
+        let url = try makeFixture(named: "shua-move-hidden-member")
+        let source = try XCTUnwrap(PDFDocument(url: url))
+        let sourcePage = try XCTUnwrap(source.page(at: 0))
+        let anchorID = UUID()
+        for order in 0..<3 {
+            _ = try addShuaThought(
+                to: sourcePage,
+                anchorID: anchorID,
+                order: order,
+                x: 300,
+                y: CGFloat(650 - order * 23),
+                contents: "Hidden move thought \(order)"
+            )
+        }
+        let sourceHidden = try XCTUnwrap(textAnnotations(on: sourcePage).first {
+            $0.contents == "Hidden move thought 2"
+        })
+        sourceHidden.shouldDisplay = false
+        try write(source, to: url)
+
+        let model = openModel(at: url)
+        let marker = try XCTUnwrap(model.noteMarkers.first)
+        XCTAssertEqual(marker.count, 2, "the hidden thought is not displayed as an entry")
+        let page = try XCTUnwrap(model.document?.page(at: 0))
+        let hidden = try XCTUnwrap(textAnnotations(on: page).first {
+            $0.contents == "Hidden move thought 2"
+        })
+        XCTAssertFalse(hidden.shouldDisplay)
+        let originalPosition = try markerPosition(in: hidden)
+        let selection = try XCTUnwrap(model.noteSelection(at: marker.center, on: page))
+        let target = CGPoint(x: marker.bounds.midX + 55, y: marker.bounds.midY + 35)
+        XCTAssertTrue(model.moveNoteMarker(selection, to: target))
+
+        let crop = page.bounds(for: .cropBox)
+        let expectedPosition = Point(
+            x: Double((target.x - crop.minX) / crop.width),
+            y: Double((target.y - crop.minY) / crop.height)
+        )
+        for note in textAnnotations(on: page) {
+            let position = try markerPosition(in: note)
+            XCTAssertEqual(position.x, expectedPosition.x, accuracy: 0.000001)
+            XCTAssertEqual(position.y, expectedPosition.y, accuracy: 0.000001)
+        }
+        XCTAssertFalse(hidden.shouldDisplay, "moving a group must not unhide a member")
+
+        XCTAssertTrue(model.undoMarkup())
+        let restoredPosition = try markerPosition(in: hidden)
+        XCTAssertEqual(restoredPosition.x, originalPosition.x, accuracy: 0.000001)
+        XCTAssertEqual(restoredPosition.y, originalPosition.y, accuracy: 0.000001)
+        XCTAssertFalse(hidden.shouldDisplay)
+
+        XCTAssertTrue(model.redoMarkup())
+        let redonePosition = try markerPosition(in: hidden)
+        XCTAssertEqual(redonePosition.x, expectedPosition.x, accuracy: 0.000001)
+        XCTAssertEqual(redonePosition.y, expectedPosition.y, accuracy: 0.000001)
+    }
+
     func testMovingShuaGroupKeepsEveryNoteInsideCropBoxAtAllPageEdges() throws {
         let url = try makeFixture(named: "shua-move-boundaries")
         let source = try XCTUnwrap(PDFDocument(url: url))

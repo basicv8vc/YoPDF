@@ -216,8 +216,8 @@ struct NoteComposerView: View {
         }
     }
 
-    /// ShuaMac-style thread: one sticker paper card per saved thought, then a
-    /// separate empty composer for the next thought in the group.
+    /// One sticker paper card per saved note, then an empty composer for the
+    /// next entry in the thread.
     private var groupThread: some View {
         VStack(spacing: 11) {
             Divider()
@@ -374,7 +374,12 @@ struct NoteComposerView: View {
         errorMessage = nil
         switch session.commit(to: model) {
         case .success:
-            onDismiss()
+            if session.isGroupComposer {
+                session.prepareNextGroupEntry()
+                focusRequest += 1
+            } else {
+                onDismiss()
+            }
         case let .failure(error):
             errorMessage = error.errorDescription
         }
@@ -404,7 +409,13 @@ struct NoteComposerView: View {
         switch session.commit(to: model) {
         case .success:
             expandedEditorSnapshot = nil
-            onDismiss()
+            if session.isGroupComposer {
+                session.prepareNextGroupEntry()
+                showsExpandedEditor = false
+                focusRequest += 1
+            } else {
+                onDismiss()
+            }
             return nil
         case let .failure(error):
             let message = error.errorDescription ?? "The note was not saved."

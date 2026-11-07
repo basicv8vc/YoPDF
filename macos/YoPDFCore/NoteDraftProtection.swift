@@ -101,7 +101,7 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
     public enum Mode {
         case create(NoteDraft)
         case edit(NoteSelection)
-        /// Adds a new thought to an existing ShuaMac thought group.
+        /// Adds a new entry to an existing YoPDF or ShuaMac note thread.
         case group(NoteSelection)
     }
 
@@ -113,8 +113,8 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
     public let excerpt: String?
     /// What the draft looked like when the composer opened. `hasUncommittedChanges`
     /// is measured against these, not against the document.
-    public let initialContents: String
-    public let initialStyle: NoteStickerStyle
+    public private(set) var initialContents: String
+    public private(set) var initialStyle: NoteStickerStyle
 
     /// Kept for PR #6 callers/tests: the paper is part of the style now.
     public var initialPaper: NotePaperColor { initialStyle.palette }
@@ -226,6 +226,17 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
     public var isGroupComposer: Bool {
         if case .group = mode { return true }
         return false
+    }
+
+    /// Clears the just-saved entry while keeping the thread composer open for
+    /// another note. The chosen sticker style becomes the next entry's draft
+    /// baseline, so closing the popover does not report a committed style as
+    /// unsaved work.
+    public func prepareNextGroupEntry() {
+        guard isGroupComposer else { return }
+        contents = ""
+        initialContents = ""
+        initialStyle = style
     }
 
     /// Whether the user has typed or restyled anything worth protecting.
@@ -418,7 +429,8 @@ public final class NoteComposerStore: ObservableObject {
 
     // MARK: - Committing
 
-    /// Commits the draft and closes the composer on success.
+    /// Commits the draft and closes the composer on success, or clears a
+    /// successfully saved thread entry so the user can add the next one.
     ///
     /// On failure the session — and every character in it — stays exactly as it
     /// was, so the caller can report the problem without losing the draft.
@@ -426,7 +438,13 @@ public final class NoteComposerStore: ObservableObject {
     public func commit(using model: PDFDocumentModel) -> Result<NoteSelection, NoteEditError> {
         guard let session else { return .failure(.noDocument) }
         let result = session.commit(to: model)
-        if case .success = result { end() }
+        if case .success = result {
+            if session.isGroupComposer {
+                session.prepareNextGroupEntry()
+            } else {
+                end()
+            }
+        }
         return result
     }
 

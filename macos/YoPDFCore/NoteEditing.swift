@@ -166,9 +166,9 @@ extension PDFDocumentModel {
 
     /// Moves a sticker marker and its PDF note rectangle as one undoable edit.
     ///
-    /// ShuaMac stores one `/Text` annotation per thought in a group. Moving the
-    /// group translates every member together and writes the shared normalized
-    /// anchor on each note. When Shua's embedded metadata exists, its shared
+    /// Each entry remains a separate `/Text` annotation. Moving its marker
+    /// translates every member together and writes the shared normalized anchor
+    /// on each note. When Shua's embedded metadata exists, its shared
     /// `markerPosition` is updated too, so ShuaMac reopens the group at the new
     /// location.
     @discardableResult
@@ -185,16 +185,24 @@ extension PDFDocumentModel {
               })
         else { return false }
 
-        let groupID = NoteService.shuaAnchorID(of: note.annotation)
+        // Shua's persisted group ID is shared by hidden and visible thoughts.
+        // Resolve against every page annotation so moving a visible marker
+        // keeps hidden members' stored anchors in sync too. YoPDF threads use
+        // their marker's resolved entries.
         let annotations: [PDFAnnotation]
-        if let groupID {
-            annotations = page.annotations.filter {
-                NoteService.shuaAnchorID(of: $0) == groupID
+        if NoteService.isShuaThought(note.annotation) {
+            if let groupID = NoteService.shuaAnchorID(of: note.annotation) {
+                annotations = page.annotations.filter {
+                    NoteService.shuaAnchorID(of: $0) == groupID
+                }
+            } else {
+                annotations = NoteService.shuaStackMembers(of: note.annotation, on: page)
             }
         } else {
-            annotations = NoteService.shuaStackMembers(of: note.annotation, on: page)
+            annotations = marker.threadEntries.map(\.annotation)
         }
         guard !annotations.isEmpty,
+              annotations.contains(where: { $0 === note.annotation }),
               annotations.allSatisfy({
                   annotation in
                   annotation.page === page
@@ -295,12 +303,40 @@ extension PDFDocumentModel {
         guard let page = document.page(at: draft.pageIndex),
               page.document === document
         else { return .failure(.pageUnavailable) }
+
+        // Add Note at an anchor that already has a usable YoPDF or Shua marker
+        // joins that thread. A malformed YoPDF identity stays readable on its
+        // own; adding at its anchor creates a separate legacy entry rather than
+        // attempting an append that the identity validator must reject.
+        if let marker = noteMarkers.first(where: {
+            $0.pageIndex == draft.pageIndex
+                && abs($0.center.x - draft.bounds.midX) <= 0.5
+                && abs($0.center.y - draft.bounds.midY) <= 0.5
+                && NoteService.excerpt(of: $0.annotation) == draft.excerpt
+                && NoteService.isPageLevel($0.annotation) == draft.isPageLevel
+                && (!NoteService.isYoPDFNote($0.annotation)
+                    || $0.threadEntries.allSatisfy {
+                        NoteService.yoPDFThreadIdentityStatus(of: $0.annotation) != .conflicting
+                    })
+        }),
+        let existingThread = NoteService.selection(
+            for: marker.annotation,
+            on: page,
+            pageIndex: draft.pageIndex,
+            marker: marker
+        ) {
+            return addThought(to: existingThread, contents: text, style: style)
+        }
+
         guard let annotation = NoteService.annotation(
             for: draft,
             contents: text,
             style: style,
             on: page
         ) else { return .failure(.emptyContents) }
+        // Every newly created YoPDF note starts a durable thread. Legacy
+        // anchor groups take the append path above and remain unmodified.
+        NoteService.setYoPDFThreadIdentity(UUID(), order: 0, on: annotation)
 
         let edit = MarkupEdit(changes: [
             .insert(annotation: annotation, pageIndex: draft.pageIndex)
@@ -320,9 +356,10 @@ extension PDFDocumentModel {
         return .success(selection)
     }
 
-    /// Adds one thought to a Shua thread, including a thread that currently has
-    /// only one visible thought. Legacy geometry stacks are promoted to stable
-    /// embedded identity in the same undoable edit as the new annotation.
+    /// Adds one entry to a YoPDF or Shua thread, including a thread that
+    /// currently has only one visible entry. Legacy YoPDF notes remain grouped
+    /// by their shared anchor; identified threads retain their existing order
+    /// values. Shua geometry stacks are promoted with the new annotation.
     @discardableResult
     public func addThought(
         to group: NoteSelection,
@@ -331,14 +368,30 @@ extension PDFDocumentModel {
     ) -> Result<NoteSelection, NoteEditError> {
         guard let document else { return .failure(.noDocument) }
         guard isAttached(group) else { return .failure(.annotationUnavailable) }
-        guard NoteService.isShuaThought(group.annotation),
-              document.allowsCommenting
+        let isShuaThread = NoteService.isShuaThought(group.annotation)
+        let isYoPDFThread = NoteService.isYoPDFNote(group.annotation)
+        guard (isShuaThread || isYoPDFThread), document.allowsCommenting
         else { return .failure(.permissionDenied) }
-        if case .conflicting = NoteService.shuaThoughtGroupIdentityStatus(of: group.annotation) {
-            return .failure(.conflictingIdentity)
-        }
-        if NoteService.hasConflictingShuaIdentity(in: group) {
-            return .failure(.conflictingIdentity)
+        if isShuaThread {
+            if case .conflicting = NoteService.shuaThoughtGroupIdentityStatus(of: group.annotation) {
+                return .failure(.conflictingIdentity)
+            }
+            if NoteService.hasConflictingShuaIdentity(in: group) {
+                return .failure(.conflictingIdentity)
+            }
+        } else {
+            let statuses = group.threadEntries.map {
+                NoteService.yoPDFThreadIdentityStatus(of: $0.annotation)
+            }
+            let threadIDs = Set(statuses.compactMap { status -> UUID? in
+                guard case let .identified(id) = status else { return nil }
+                return id
+            })
+            if statuses.contains(.conflicting)
+                || threadIDs.count > 1
+                || (!threadIDs.isEmpty && statuses.contains(.legacy)) {
+                return .failure(.conflictingIdentity)
+            }
         }
 
         let text = contents.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -346,23 +399,38 @@ extension PDFDocumentModel {
         guard let page = document.page(at: group.pageIndex), page.document === document else {
             return .failure(.pageUnavailable)
         }
-        guard let plan = NoteService.groupedThoughtPlan(
-            for: group,
-            contents: text,
-            style: style,
-            on: page
-        ) else { return .failure(.annotationUnavailable) }
-
-        let identityChanges = plan.identityChanges.map {
-            MarkupEditChange.setShuaThoughtIdentity(
-                annotation: $0.annotation,
-                pageIndex: group.pageIndex,
-                from: $0.from,
-                to: $0.to
-            )
+        let identityChanges: [MarkupEditChange]
+        let annotation: PDFAnnotation
+        if NoteService.isShuaThought(group.annotation) {
+            guard let plan = NoteService.groupedThoughtPlan(
+                for: group,
+                contents: text,
+                style: style,
+                on: page
+            ) else { return .failure(.annotationUnavailable) }
+            identityChanges = plan.identityChanges.map {
+                .setShuaThoughtIdentity(
+                    annotation: $0.annotation,
+                    pageIndex: group.pageIndex,
+                    from: $0.from,
+                    to: $0.to
+                )
+            }
+            annotation = plan.annotation
+        } else if NoteService.isYoPDFNote(group.annotation) {
+            guard let plan = NoteService.groupedYoPDFNotePlan(
+                for: group,
+                contents: text,
+                style: style,
+                on: page
+            ) else { return .failure(.annotationUnavailable) }
+            identityChanges = []
+            annotation = plan.annotation
+        } else {
+            return .failure(.permissionDenied)
         }
         let edit = MarkupEdit(changes: identityChanges + [
-            .insert(annotation: plan.annotation, pageIndex: group.pageIndex),
+            .insert(annotation: annotation, pageIndex: group.pageIndex),
         ])
         guard performMarkupEdit(edit) else { return .failure(.permissionDenied) }
 

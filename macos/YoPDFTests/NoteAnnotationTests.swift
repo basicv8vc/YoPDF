@@ -441,6 +441,187 @@ final class NoteAnnotationTests: XCTestCase {
         XCTAssertEqual(try note(on: 0, in: model).contents, "First page")
     }
 
+    func testAppendingToLockedLegacyNoteDoesNotRewriteItAndRemainsUndoable() throws {
+        let model = openModel(at: try makeFixture())
+        let originalSelection = try addPageNote(to: model, contents: "Locked legacy note")
+        let original = try note(on: 0, in: model)
+        let marker = try XCTUnwrap(model.noteMarkers.first)
+        // Recreate a historical note that predates persisted thread identity.
+        original.removeValue(forAnnotationKey: NoteService.threadIDKey)
+        original.removeValue(forAnnotationKey: NoteService.threadOrderKey)
+        setFlags(MarkupPermissions.lockedFlag, on: original)
+
+        let page = try XCTUnwrap(model.document?.page(at: 0))
+        let draft = try XCTUnwrap(model.pageNoteDraft(at: marker.center, on: page))
+        guard case .success = model.addNote(
+            draft,
+            contents: "Second note",
+            paperColor: .rose
+        ) else {
+            return XCTFail("adding at the same anchor must not require changing the locked legacy note")
+        }
+
+        XCTAssertEqual(model.noteMarkers.count, 1)
+        XCTAssertEqual(model.noteMarkers.first?.threadEntries.count, 2)
+        XCTAssertEqual(NoteService.yoPDFThreadIdentityStatus(of: original), .legacy)
+        XCTAssertNil(original.value(forAnnotationKey: NoteService.threadIDKey))
+        XCTAssertNil(original.value(forAnnotationKey: NoteService.threadOrderKey))
+        XCTAssertEqual(
+            MarkupPermissions.flags(of: original) & MarkupPermissions.lockedFlag,
+            MarkupPermissions.lockedFlag
+        )
+
+        XCTAssertTrue(model.undoMarkup())
+        XCTAssertEqual(try notes(on: 0, in: model).count, 1)
+        XCTAssertTrue(model.redoMarkup())
+        XCTAssertEqual(try notes(on: 0, in: model).count, 2)
+        XCTAssertEqual(originalSelection.contents, "Locked legacy note")
+    }
+
+    func testNormalCreationPersistsThreadIdentityAndOrderAcrossSaveReopen() throws {
+        let url = try makeFixture(named: "note-thread-order-gaps")
+        let model = openModel(at: url)
+        var group = try addPageNote(to: model, contents: "First")
+        for contents in ["Second", "Third"] {
+            guard case let .success(updated) = model.addThought(
+                to: group,
+                contents: contents,
+                style: NoteStickerStyle(motif: .flower, palette: .sky)
+            ) else {
+                return XCTFail("legacy notes at a shared anchor must continue accepting entries")
+            }
+            group = updated
+        }
+
+        // No identity metadata is assigned by the test: creation and both
+        // appends use the same APIs the reader uses.
+        let createdAnnotations = try notes(on: 0, in: model)
+        let firstCreated = try XCTUnwrap(createdAnnotations.first)
+        let threadID = try XCTUnwrap(NoteService.yoPDFThreadID(of: firstCreated))
+        XCTAssertEqual(createdAnnotations.compactMap(NoteService.yoPDFThreadOrder(of:)), [0, 1, 2])
+        XCTAssertTrue(createdAnnotations.allSatisfy {
+            NoteService.yoPDFThreadIdentityStatus(of: $0) == .identified(threadID)
+        })
+        XCTAssertEqual(model.save(), .saved)
+
+        let reopened = openModel(at: url)
+        let page = try XCTUnwrap(reopened.document?.page(at: 0))
+        let initialMarker = try XCTUnwrap(reopened.noteMarkers.first)
+        XCTAssertEqual(initialMarker.threadEntries.map(\.contents), ["First", "Second", "Third"])
+        XCTAssertTrue(initialMarker.threadEntries.allSatisfy {
+            NoteService.yoPDFThreadIdentityStatus(of: $0.annotation) == .identified(threadID)
+        })
+        XCTAssertEqual(initialMarker.threadEntries.map {
+            NoteService.yoPDFThreadOrder(of: $0.annotation)
+        }, [0, 1, 2])
+
+        let middle = try XCTUnwrap(initialMarker.threadEntries.first { $0.contents == "Second" })
+        let middleSelection = try XCTUnwrap(NoteService.selection(
+            for: middle.annotation,
+            on: page,
+            pageIndex: 0,
+            marker: initialMarker
+        ))
+        let lockedTail = try XCTUnwrap(initialMarker.threadEntries.first { $0.contents == "Third" })
+        setFlags(MarkupPermissions.lockedFlag, on: lockedTail.annotation)
+        XCTAssertTrue(reopened.deleteNote(middleSelection))
+
+        let remainingMarker = try XCTUnwrap(reopened.noteMarkers.first)
+        let remainingGroup = try XCTUnwrap(reopened.noteSelection(at: remainingMarker.center, on: page))
+        guard case .success = reopened.addThought(
+            to: remainingGroup,
+            contents: "Fourth",
+            style: NoteStickerStyle(motif: .flower, palette: .mint)
+        ) else {
+            return XCTFail("an order gap must not require renumbering the locked tail member")
+        }
+
+        XCTAssertEqual(reopened.noteMarkers.first?.threadEntries.map(\.contents), ["First", "Third", "Fourth"])
+        XCTAssertEqual(NoteService.yoPDFThreadOrder(of: lockedTail.annotation), 2)
+        XCTAssertEqual(
+            MarkupPermissions.flags(of: lockedTail.annotation) & MarkupPermissions.lockedFlag,
+            MarkupPermissions.lockedFlag
+        )
+        let fourth = try XCTUnwrap(try notes(on: 0, in: reopened).first { $0.contents == "Fourth" })
+        XCTAssertEqual(NoteService.yoPDFThreadOrder(of: fourth), 3)
+
+        XCTAssertTrue(reopened.undoMarkup())
+        XCTAssertEqual(reopened.noteMarkers.first?.threadEntries.map(\.contents), ["First", "Third"])
+        XCTAssertTrue(reopened.redoMarkup())
+        XCTAssertEqual(reopened.noteMarkers.first?.threadEntries.map(\.contents), ["First", "Third", "Fourth"])
+        XCTAssertEqual(reopened.save(), .saved)
+
+        let saved = openModel(at: url)
+        XCTAssertEqual(saved.noteMarkers.first?.threadEntries.map(\.contents), ["First", "Third", "Fourth"])
+        XCTAssertEqual(
+            NoteService.yoPDFThreadOrder(of: try XCTUnwrap(try notes(on: 0, in: saved).first { $0.contents == "Fourth" })),
+            3
+        )
+    }
+
+    func testMalformedThreadOrderIsShownSeparatelyAndDoesNotBlockValidThread() throws {
+        let url = try makeFixture(named: "note-thread-malformed-order")
+        let model = openModel(at: url)
+        let group = try addPageNote(to: model, contents: "Valid member")
+        guard case .success = model.addThought(
+            to: group,
+            contents: "Malformed member",
+            style: NoteStickerStyle(motif: .flower, palette: .sand)
+        ) else {
+            return XCTFail("the second legacy member must be added")
+        }
+
+        let threadID = UUID()
+        let valid = try XCTUnwrap(try notes(on: 0, in: model).first { $0.contents == "Valid member" })
+        let malformed = try XCTUnwrap(try notes(on: 0, in: model).first { $0.contents == "Malformed member" })
+        NoteService.setYoPDFThreadIdentity(threadID, order: 0, on: valid)
+        XCTAssertTrue(malformed.setValue(threadID.uuidString, forAnnotationKey: NoteService.threadIDKey))
+        XCTAssertTrue(malformed.setValue("not-an-order", forAnnotationKey: NoteService.threadOrderKey))
+        XCTAssertEqual(model.save(), .saved)
+
+        let reopened = openModel(at: url)
+        XCTAssertEqual(reopened.noteMarkers.count, 2)
+        let validMarker = try XCTUnwrap(reopened.noteMarkers.first {
+            $0.threadEntries.allSatisfy {
+                NoteService.yoPDFThreadIdentityStatus(of: $0.annotation) == .identified(threadID)
+            }
+        })
+        XCTAssertEqual(validMarker.threadEntries.map(\.contents), ["Valid member"])
+        let savedMalformed = try XCTUnwrap(
+            try notes(on: 0, in: reopened).first { $0.contents == "Malformed member" }
+        )
+        let malformedMarker = try XCTUnwrap(reopened.noteMarkers.first {
+            $0.threadEntries.count == 1
+                && NoteService.yoPDFThreadIdentityStatus(of: $0.annotation) == .conflicting
+        })
+        XCTAssertEqual(malformedMarker.threadEntries.first?.contents, "Malformed member")
+
+        let page = try XCTUnwrap(reopened.document?.page(at: 0))
+        let validEntry = try XCTUnwrap(validMarker.threadEntries.first)
+        let validSelection = try XCTUnwrap(NoteService.selection(
+            for: validEntry.annotation,
+            on: page,
+            pageIndex: 0,
+            marker: validMarker
+        ))
+        guard case .success = reopened.addThought(
+            to: validSelection,
+            contents: "Appended to valid member",
+            style: NoteStickerStyle(motif: .flower, palette: .sky)
+        ) else {
+            return XCTFail("a malformed sibling must not block append to the validated thread")
+        }
+
+        XCTAssertEqual(reopened.noteMarkers.count, 2)
+        XCTAssertEqual(
+            reopened.noteMarkers.first(where: { $0.threadEntries.contains { $0.contents == "Valid member" } })?
+                .threadEntries.map(\.contents),
+            ["Valid member", "Appended to valid member"]
+        )
+        XCTAssertEqual(savedMalformed.contents, "Malformed member")
+        XCTAssertEqual(savedMalformed.value(forAnnotationKey: NoteService.threadOrderKey) as? String, "not-an-order")
+    }
+
     // MARK: - Cancelling
 
     func testCapturingAnAnchorDoesNotTouchTheDocument() throws {

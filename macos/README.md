@@ -23,7 +23,10 @@ annotation, either about the selected text or at a point the user clicks on the
 page. Six paper tints, a marker drawn over the page, editing, deletion and
 Undo/Redo all go through the same model pipeline as Highlight and Underline.
 Committed annotation edits auto-save after a short quiet period; a note draft
-remains in the composer until the user saves it into the PDF.
+remains in the composer until the user saves it into the PDF. Notes created at
+the same anchor open as a thread: saved notes appear as individual cards above
+an inline composer, and each entry remains its own standard `/Text` annotation
+so it can be edited, deleted, or read in another PDF app.
 
 P2d adds the first **sticker** stage: the 20 original ShuaMac illustrations are
 packaged in an Asset Catalog, and a note's motif, paper palette, template title
