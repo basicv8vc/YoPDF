@@ -178,6 +178,8 @@ struct PDFReaderView: View {
     private enum Prompt: Identifiable, Equatable {
         /// The note has text that is not in the document yet.
         case draftChanges(PendingAction)
+        /// "Save Note" could not write the draft, so the action is still waiting.
+        case draftSaveProblem(message: String, action: PendingAction)
         case unsavedChanges(PendingAction)
         case workspaceChanges
         case saveProblem(title: String, message: String, offersSaveAs: Bool, tabID: UUID?)
@@ -187,6 +189,8 @@ struct PDFReaderView: View {
             switch self {
             case let .draftChanges(action):
                 return "draft-\(String(describing: action))"
+            case let .draftSaveProblem(_, action):
+                return "draft-problem-\(String(describing: action))"
             case let .unsavedChanges(action):
                 return "unsaved-\(String(describing: action))"
             case .workspaceChanges:
@@ -202,6 +206,8 @@ struct PDFReaderView: View {
             switch self {
             case .draftChanges:
                 return "Save this note first?"
+            case .draftSaveProblem:
+                return "Couldn’t save the note"
             case .unsavedChanges:
                 return "Save changes before continuing?"
             case .workspaceChanges:
@@ -217,6 +223,8 @@ struct PDFReaderView: View {
             switch self {
             case let .draftChanges(action):
                 return Self.draftMessage(for: action)
+            case let .draftSaveProblem(message, _):
+                return message
             case let .unsavedChanges(action):
                 switch action {
                 case let .open(url):
@@ -273,6 +281,12 @@ struct PDFReaderView: View {
                 Button("Save Note") { saveDraftThen(action) }
                 Button("Discard Draft", role: .destructive) { discardDraftThen(action) }
                 Button("Cancel", role: .cancel) { cancel(action) }
+            case let .draftSaveProblem(_, action):
+                // The write failed, so the text is still in the composer. Give
+                // the user a way out of the draft without clicking through the
+                // same "Save this note first?" question again.
+                Button("Back to Draft", role: .cancel) { cancel(action) }
+                Button("Discard Draft", role: .destructive) { discardDraftThen(action) }
             case let .unsavedChanges(action):
                 Button("Save") { saveThen(action) }
                 Button("Don’t Save", role: .destructive) { discardThen(action) }
@@ -1717,12 +1731,21 @@ struct PDFReaderView: View {
         return nil
     }
 
+    /// "Save Note" in a draft prompt: resolves the draft so the interrupted
+    /// action can run, instead of merely writing through it.
+    ///
+    /// A draft with no text cannot be written at all, and a thread draft used
+    /// to stay open after a successful write. Either one could leave a session
+    /// behind that the next note click would protect again, so the store owns
+    /// both cases and always closes the composer on success.
     private func saveDraft(in tab: WorkspaceTabSession) -> String? {
         guard tab.composerStore.hasUncommittedChanges else { return nil }
-        if case let .failure(error) = tab.composerStore.commit(using: tab.model) {
+        switch tab.composerStore.resolvePendingDraft(using: tab.model) {
+        case .success:
+            return nil
+        case let .failure(error):
             return error.errorDescription ?? "The note was not saved."
         }
-        return nil
     }
 
     /// Saves every PDF in place. A failed, conflicting, or uncertain result
@@ -1776,12 +1799,22 @@ struct PDFReaderView: View {
             // attempt that is no longer running, so they must not survive into
             // the next ⌘Q.
             if action == .quit { QuitSession.coordinator.cancel() }
-            prompt = .saveProblem(
-                title: "Couldn’t save the note",
-                message: message + " Your text is still here.",
-                offersSaveAs: false,
-                tabID: session(for: action)?.id
-            )
+            if action == .quit {
+                prompt = .saveProblem(
+                    title: "Couldn’t save the note",
+                    message: message + " Your text is still here.",
+                    offersSaveAs: false,
+                    tabID: session(for: action)?.id
+                )
+            } else {
+                // The action is still pending. Without a "Discard Draft" here,
+                // dismissing this alert and clicking the note again would show
+                // the original draft prompt again — an unbreakable loop.
+                prompt = .draftSaveProblem(
+                    message: message + " Your text is still here.",
+                    action: action
+                )
+            }
         } else {
             if action == .quit {
                 continueQuit()

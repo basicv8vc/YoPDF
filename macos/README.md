@@ -623,6 +623,16 @@ database — the saved PDF is the whole document.
   state; Cancel closes the popover without a model call, so it cannot dirty the
   document or leave an Undo entry. A blank or whitespace-only body is refused by
   the model as well as disabled in the UI.
+- **"Save Note" in an action prompt resolves the draft, it does not just write
+  through it.** Clicking another marker, opening a file or quitting while a
+  composer holds text asks first. Answering Save Note commits the note and
+  *closes* the composer — including a thread composer that the popover's own
+  Save would keep open for another entry — so the interrupted action can open
+  the note it was asked for and the same question cannot come back on the next
+  click. A blank body has nothing to write, so it is dropped rather than
+  reported as a failed save. If a real body cannot be written, the draft stays
+  open and the failure offers "Back to Draft" and "Discard Draft" instead of
+  leaving the user in a loop.
 - **The input grows to four lines and then scrolls.** A vertical `TextField`
   with `lineLimit(1...4)` gives that behaviour; Return inserts a newline and
   `⌘Return` submits. The sticker face on the left opens the appearance popover

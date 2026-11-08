@@ -239,6 +239,15 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
         initialStyle = style
     }
 
+    /// Whether the draft has a body at all.
+    ///
+    /// Every note edit refuses an empty body, so a composer with blank text
+    /// cannot be written no matter what it looks like. It is not "a note that
+    /// has not been saved yet": there is no note, only an appearance choice.
+    public var hasEmptyContents: Bool {
+        Self.normalized(contents).isEmpty
+    }
+
     /// Whether the user has typed or restyled anything worth protecting.
     ///
     /// Whitespace-only body edits do not count: discarding them loses nothing,
@@ -429,8 +438,15 @@ public final class NoteComposerStore: ObservableObject {
 
     // MARK: - Committing
 
-    /// Commits the draft and closes the composer on success, or clears a
-    /// successfully saved thread entry so the user can add the next one.
+    /// Commits the draft and closes the composer on success.
+    ///
+    /// This is the action prompt's "Save Note", not the popover's own Save: the
+    /// user is leaving this draft to open a file, another note, or to quit, so
+    /// even a thread composer must close. Keeping a thread composer open for
+    /// another entry belongs to `NoteComposerView`, which commits through the
+    /// session and calls `prepareNextGroupEntry()` itself. If a successful
+    /// commit left a session behind here, the next note click could find it
+    /// dirty again and ask the same question a second time.
     ///
     /// On failure the session — and every character in it — stays exactly as it
     /// was, so the caller can report the problem without losing the draft.
@@ -438,14 +454,31 @@ public final class NoteComposerStore: ObservableObject {
     public func commit(using model: PDFDocumentModel) -> Result<NoteSelection, NoteEditError> {
         guard let session else { return .failure(.noDocument) }
         let result = session.commit(to: model)
-        if case .success = result {
-            if session.isGroupComposer {
-                session.prepareNextGroupEntry()
-            } else {
-                end()
-            }
-        }
+        if case .success = result { end() }
         return result
+    }
+
+    /// Resolves the draft an interrupted reader action is waiting on.
+    ///
+    /// A blank body has no note to write: the document refuses empty notes, so
+    /// such a draft holds only an appearance choice. Ending it is the only
+    /// honest answer to "Save Note" — there is no text to lose and no write to
+    /// make, and trying to write it would fail and leave the draft protected
+    /// forever. A real body is committed, and either way the composer closes so
+    /// the interrupted action can proceed.
+    ///
+    /// - Returns `.success(nil)` when nothing was written, `.success(note)` when
+    ///   a note was committed, or `.failure` when a real body could not be
+    ///   written. On failure the draft stays open so the text survives.
+    public func resolvePendingDraft(
+        using model: PDFDocumentModel
+    ) -> Result<NoteSelection?, NoteEditError> {
+        guard let session else { return .success(nil) }
+        guard !session.hasEmptyContents else {
+            end()
+            return .success(nil)
+        }
+        return commit(using: model).map { Optional.some($0) }
     }
 
     // MARK: - Revision
