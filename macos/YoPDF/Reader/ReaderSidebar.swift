@@ -802,6 +802,7 @@ private struct PDFPageThumbnailList: View {
                                             page: page,
                                             maximumSize: thumbnailSize,
                                             renderIdentity: PDFThumbnailRenderIdentity(
+                                                document: document,
                                                 loadGeneration: loadGeneration,
                                                 annotationRevision: annotationRevision,
                                                 pageIndex: pageIndex,
