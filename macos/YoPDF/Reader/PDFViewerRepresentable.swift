@@ -416,6 +416,21 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
         magnificationController.attach(to: self)
     }
 
+    /// Every path that opens a note popover funnels through here, including the
+    /// fallbacks for rotated pages whose page overlay never receives the mouse
+    /// event. Otherwise those paths leave the hover card on screen underneath
+    /// the popover and never suppress the next one.
+    private func activateNote(
+        _ note: NoteSelection,
+        in rect: CGRect,
+        markerID: ObjectIdentifier?
+    ) {
+        for overlay in overlayViews.values {
+            overlay.dismissHoverForNoteActivation(markerID: markerID)
+        }
+        onNoteActivated?(note, rect)
+    }
+
     override func mouseDown(with event: NSEvent) {
         let location = convert(event.locationInWindow, from: nil)
 
@@ -517,9 +532,10 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
                 if moved {
                     onNoteMoved?(note, destination)
                 } else {
-                    onNoteActivated?(
+                    activateNote(
                         note,
-                        containerRect(forPageRect: note.bounds, on: session.page)
+                        in: containerRect(forPageRect: note.bounds, on: session.page),
+                        markerID: session.marker.id
                     )
                 }
             }
@@ -529,7 +545,13 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
         if consumedMouseDown {
             consumedMouseDown = false
             if let pendingNoteActivation {
-                onNoteActivated?(pendingNoteActivation.0, pendingNoteActivation.1)
+                activateNote(
+                    pendingNoteActivation.0,
+                    in: pendingNoteActivation.1,
+                    markerID: noteMarker(
+                        at: convert(event.locationInWindow, from: nil)
+                    )?.id
+                )
             }
             pendingNoteActivation = nil
             mouseDownPoint = nil
@@ -556,7 +578,11 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
         // Notes first: a marker is small, sits above the page and is drawn over
         // any markup beneath it, so a click inside one is a request to open it.
         if let note = onNoteHit?(pagePoint, page) {
-            onNoteActivated?(note, containerRect(forPageRect: note.bounds, on: page))
+            activateNote(
+                note,
+                in: containerRect(forPageRect: note.bounds, on: page),
+                markerID: noteMarker(at: up)?.id
+            )
             return
         }
         _ = onMarkupClick?(pagePoint, page)
@@ -633,9 +659,10 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
                   let page = self.document?.page(at: marker.pageIndex),
                   let note = self.onNoteHit?(markerDisplayCenter(marker), page)
             else { return }
-            self.onNoteActivated?(
+            self.activateNote(
                 note,
-                self.containerRect(forPageRect: note.bounds, on: page)
+                in: self.containerRect(forPageRect: note.bounds, on: page),
+                markerID: marker.id
             )
         }
         overlay.onMarkerMoved = { [weak self] marker, center in
@@ -745,7 +772,11 @@ private final class MarkupSelectionOverlayView: NSView {
             guard markers != oldValue else { return }
             needsDisplay = true
             window?.invalidateCursorRects(for: self)
-            refreshHoverPreview()
+            // A note that was edited, deleted or moved while its card is
+            // showing must not keep describing the old state.
+            applyHover(hoverLifecycle.markersChanged(
+                containing: Set(markers.map(\.id))
+            ))
         }
     }
     var onMarkerActivated: ((NoteMarker) -> Void)?
@@ -762,17 +793,13 @@ private final class MarkupSelectionOverlayView: NSView {
     //
     // A sticker is opaque, so the note behind it used to be readable only after
     // a click. Hovering shows the same body in a card above the sticker.
+    // `NoteHoverLifecycle` owns every timing rule; this view only reports
+    // input and applies the action it returns.
 
     private static let hoverDelay: Duration = .milliseconds(160)
     private var hoverTrackingArea: NSTrackingArea?
-    /// Invalidates a queued preview when the pointer has already moved on.
-    private var hoverGeneration = 0
-    private var hoveredMarkerID: ObjectIdentifier?
+    private var hoverLifecycle = NoteHoverLifecycle()
     private var hoverCardView: NoteHoverCardView?
-    /// Set when a click opened a note. The card stays away until the pointer
-    /// leaves this sticker, so it cannot reappear underneath the popover that
-    /// the click just opened.
-    private var suppressedHoverMarkerID: ObjectIdentifier?
     private weak var observedClipView: NSView?
 
     override var isOpaque: Bool { false }
@@ -818,7 +845,7 @@ private final class MarkupSelectionOverlayView: NSView {
             didDragMarker = true
             // A drag started in PDFView rather than in this overlay still has to
             // put the hover card away.
-            hideHoverPreview()
+            applyHover(hoverLifecycle.hide())
         } else {
             previewCenter = nil
             didDragMarker = false
@@ -895,7 +922,7 @@ private final class MarkupSelectionOverlayView: NSView {
     override func viewDidMoveToSuperview() {
         super.viewDidMoveToSuperview()
         observeClipViewBounds()
-        if superview == nil { hideHoverPreview() }
+        if superview == nil { applyHover(hoverLifecycle.hide()) }
     }
 
     override func viewDidMoveToWindow() {
@@ -905,7 +932,7 @@ private final class MarkupSelectionOverlayView: NSView {
         // hover preview is the reason this is on.
         window?.acceptsMouseMovedEvents = true
         observeClipViewBounds()
-        if window == nil { hideHoverPreview() }
+        if window == nil { applyHover(hoverLifecycle.hide()) }
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -913,7 +940,7 @@ private final class MarkupSelectionOverlayView: NSView {
         super.setFrameSize(newSize)
         // The card is placed in page coordinates, so a resize — zoom, rotation,
         // a re-laid-out page — invalidates that placement.
-        if resized { hideHoverPreview() }
+        if resized { applyHover(hoverLifecycle.hide()) }
     }
 
     /// Scrolling moves the page under a pointer that is standing still, so the
@@ -942,7 +969,9 @@ private final class MarkupSelectionOverlayView: NSView {
     }
 
     @objc private func clipViewBoundsDidChange() {
-        revalidateHover()
+        // Scrolling moves the page under a stationary pointer. Cancel a queued
+        // preview before it can describe a sticker the pointer has left.
+        applyHover(hoverLifecycle.scrolled(pointerAt: currentPointerMarkerID()))
     }
 
     override func mouseMoved(with event: NSEvent) {
@@ -954,47 +983,65 @@ private final class MarkupSelectionOverlayView: NSView {
     }
 
     override func mouseExited(with event: NSEvent) {
-        // Leaving the page also re-arms the sticker whose note the user opened,
-        // so coming back to it shows the card again.
-        suppressedHoverMarkerID = nil
-        hideHoverPreview()
+        // Leaving the page also re-arms the sticker whose note the user opened.
+        applyHover(hoverLifecycle.pointerExited())
     }
 
     private func updateHover(at point: NSPoint) {
-        guard pressedMarker == nil else {
-            hideHoverPreview()
-            return
-        }
-        guard let marker = marker(at: point) else {
-            // Leaving every sticker re-arms the one the user just opened.
-            suppressedHoverMarkerID = nil
-            hideHoverPreview()
-            return
-        }
-        guard marker.id != suppressedHoverMarkerID else {
-            hideHoverPreview()
-            return
-        }
-        if marker.id == hoveredMarkerID, hoverCardView != nil { return }
-        scheduleHoverPreview(for: marker.id)
+        applyHover(hoverLifecycle.pointerMoved(
+            to: marker(at: point)?.id,
+            isPressed: pressedMarker != nil
+        ))
     }
 
-    private func scheduleHoverPreview(for markerID: ObjectIdentifier) {
-        // A different sticker replaces the previous card at once, rather than
-        // leaving the old body on screen for the length of the delay.
-        hideHoverPreview()
-        let generation = hoverGeneration
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(for: MarkupSelectionOverlayView.hoverDelay)
-            guard let self, self.hoverGeneration == generation else { return }
-            self.presentHoverPreview(for: markerID)
+    /// The sticker under the pointer right now, read from the window rather
+    /// than from a stale event. Used to re-check a queued or visible preview.
+    private func currentPointerMarkerID() -> ObjectIdentifier? {
+        guard let window else { return nil }
+        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        return marker(at: point)?.id
+    }
+
+    /// Every path that opens a note popover calls this, including the PDFView
+    /// fallbacks that never reach this overlay's `mouseDown`.
+    func dismissHoverForNoteActivation(markerID: ObjectIdentifier?) {
+        applyHover(hoverLifecycle.noteActivated(markerID: markerID))
+    }
+
+    private func applyHover(_ action: NoteHoverLifecycle.Action) {
+        switch action {
+        case .none, .cancel:
+            break
+        case .schedule(let markerID, let token):
+            // A different sticker replaces the previous card at once, rather
+            // than leaving the old body on screen for the length of the delay.
+            hideHoverPreview()
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: MarkupSelectionOverlayView.hoverDelay)
+                guard let self else { return }
+                // The page may have scrolled during the dwell: re-read the
+                // pointer instead of trusting the marker that started it.
+                let stillOnMarker = self.currentPointerMarkerID() == markerID
+                let finished = self.hoverLifecycle.delayFinished(
+                    markerID: markerID,
+                    token: token,
+                    pointerStillOnMarker: stillOnMarker
+                )
+                self.applyHover(finished)
+            }
+        case .show(let markerID):
+            if !presentHoverPreview(for: markerID) {
+                applyHover(hoverLifecycle.hide())
+            }
+        case .hide:
+            hideHoverPreview()
         }
     }
 
-    private func presentHoverPreview(for markerID: ObjectIdentifier) {
+    private func presentHoverPreview(for markerID: ObjectIdentifier) -> Bool {
         guard pressedMarker == nil,
               let marker = markers.first(where: { $0.id == markerID })
-        else { return }
+        else { return false }
 
         // Only the visible part of the page is available: a card above a sticker
         // at the top of the viewport would otherwise be drawn under the toolbar.
@@ -1008,8 +1055,7 @@ private final class MarkupSelectionOverlayView: NSView {
             container.height - NoteHoverCardLayout.inset * 2
         )
         guard width >= NoteHoverCardView.minimumWidth, maxHeight > 0 else {
-            hideHoverPreview()
-            return
+            return false
         }
 
         let preview = NoteHoverPreview(marker: marker)
@@ -1023,10 +1069,7 @@ private final class MarkupSelectionOverlayView: NSView {
             stickerFrame: stickerFrame,
             container: container
         )
-        guard frame.width > 0, frame.height > 0 else {
-            hideHoverPreview()
-            return
-        }
+        guard frame.width > 0, frame.height > 0 else { return false }
 
         let card = hoverCardView ?? NoteHoverCardView(frame: .zero)
         card.preview = preview
@@ -1035,36 +1078,10 @@ private final class MarkupSelectionOverlayView: NSView {
             addSubview(card, positioned: .above, relativeTo: nil)
         }
         hoverCardView = card
-        hoveredMarkerID = markerID
-    }
-
-    /// A note that was edited, deleted or moved while its card is showing must
-    /// not keep describing the old state.
-    private func refreshHoverPreview() {
-        guard let hoveredMarkerID else { return }
-        guard markers.contains(where: { $0.id == hoveredMarkerID }) else {
-            hideHoverPreview()
-            return
-        }
-        presentHoverPreview(for: hoveredMarkerID)
-    }
-
-    private func revalidateHover() {
-        guard hoverCardView != nil else { return }
-        guard let window else {
-            hideHoverPreview()
-            return
-        }
-        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
-        guard let marker = marker(at: point), marker.id == hoveredMarkerID else {
-            hideHoverPreview()
-            return
-        }
+        return true
     }
 
     private func hideHoverPreview() {
-        hoverGeneration &+= 1
-        hoveredMarkerID = nil
         if let hoverCardView {
             hoverCardView.removeFromSuperview()
             self.hoverCardView = nil
@@ -1078,7 +1095,7 @@ private final class MarkupSelectionOverlayView: NSView {
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         guard let marker = marker(at: point) else { return }
-        hideHoverPreview()
+        applyHover(hoverLifecycle.hide())
         pressedMarker = marker
         dragStartPagePoint = pagePoint(for: point)
         let center = CGPoint(x: marker.bounds.midX, y: marker.bounds.midY)
@@ -1122,13 +1139,13 @@ private final class MarkupSelectionOverlayView: NSView {
         if moved, let destination {
             // The pointer is still on the sticker after a move, so the card must
             // wait for the pointer to leave before it shows the new position.
-            suppressedHoverMarkerID = marker.id
+            applyHover(hoverLifecycle.noteActivated(markerID: marker.id))
             onMarkerMoved?(marker, destination)
         } else if self.marker(at: point)?.id == marker.id {
             // The click is about to open the note. Suppress the card until the
             // pointer leaves this sticker so it cannot reappear under the
             // popover that the click opens.
-            suppressedHoverMarkerID = marker.id
+            applyHover(hoverLifecycle.noteActivated(markerID: marker.id))
             onMarkerActivated?(marker)
         }
         needsDisplay = true
