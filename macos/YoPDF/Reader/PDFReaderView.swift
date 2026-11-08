@@ -47,20 +47,33 @@ private struct WorkspaceTabStrip: View {
     let closeTab: (UUID) -> Void
 
     /// Layout frames of the tabs, keyed by tab ID. Reported by each tab and
-    /// used only to translate a pointer position into a drop slot.
+    /// read only once, when a drag starts.
     @State private var tabFrames: [UUID: CGRect] = [:]
     /// Non-nil while a tab is being held and dragged along the strip.
     @State private var draggingTabID: UUID?
     /// Horizontal distance the dragged tab has travelled from its slot.
     @State private var dragTranslation: CGFloat = 0
-    /// Slot the dragged tab would land in, counted among the other tabs.
+    /// Slot the dragged tab would land in, counted among the other tabs. While
+    /// a drag is in flight this also drives the live reflow of those tabs.
     @State private var dropIndex = 0
+    /// Frozen geometry from the start of the drag. Deriving drop slots from
+    /// frames that the reflow is currently moving would feed the layout back
+    /// into the hit test and make the strip oscillate.
+    @State private var dragSnapshot: DragSnapshot?
+
+    private struct DragSnapshot {
+        let tabIDs: [UUID]
+        let slots: [UUID: WorkspaceTabReflow.Slot]
+        let draggingTabID: UUID
+    }
 
     /// Pointer positions and reported tab bounds share one space so they can be
     /// compared directly, even while the strip is scrolled.
     private static let stripSpace = "workspace-tab-strip"
     private static let tabSpacing: CGFloat = 4
-    private static let reorderAnimation = Animation.easeOut(duration: 0.16)
+    /// One animation for both the live reflow and the release commit, so the
+    /// offsets unwinding and the layout change cancel each other smoothly.
+    private static let reorderAnimation = Animation.easeOut(duration: 0.18)
 
     var body: some View {
         HStack(spacing: 8) {
@@ -71,7 +84,6 @@ private struct WorkspaceTabStrip: View {
                     }
                 }
                 .coordinateSpace(.named(Self.stripSpace))
-                .overlay { dropMarker }
                 .onPreferenceChange(WorkspaceTabFramePreferenceKey.self) { frames in
                     tabFrames = frames
                 }
@@ -148,9 +160,13 @@ private struct WorkspaceTabStrip: View {
                 )
             }
         )
-        // `offset` draws the lifted tab under the pointer without moving its
-        // slot, which keeps the drop math stable for the whole drag.
-        .offset(x: isDragging ? dragTranslation : 0)
+        // The lifted tab stays under the pointer while the other tabs slide
+        // into the order the drop will produce. Offsets never change a layout
+        // slot, so the frozen measurement remains valid for the whole drag.
+        .offset(x: isDragging ? dragTranslation : reflowOffset(for: tab.id))
+        // Only the stationary tabs animate into their new slots; the lifted
+        // tab must track the pointer with no easing lag.
+        .animation(isDragging ? nil : Self.reorderAnimation, value: dropIndex)
         .shadow(color: .black.opacity(isDragging ? 0.16 : 0), radius: 6, y: 2)
         .zIndex(isDragging ? 1 : 0)
     }
@@ -173,20 +189,32 @@ private struct WorkspaceTabStrip: View {
     private func reorderGesture(for tab: WorkspaceTabSession) -> some Gesture {
         DragGesture(minimumDistance: 4, coordinateSpace: .named(Self.stripSpace))
             .onChanged { value in
-                // Without measured tab frames there is no safe drop slot, so a
-                // missing measurement disables the drag instead of guessing.
-                guard workspace.tabs.count > 1, tabFrames[tab.id] != nil else { return }
-                draggingTabID = tab.id
+                guard workspace.tabs.count > 1 else { return }
+                if draggingTabID != tab.id || dragSnapshot == nil {
+                    // Freeze the geometry before any reflow starts. Without a
+                    // complete measurement the drag simply never begins.
+                    guard let snapshot = makeSnapshot(dragging: tab.id) else { return }
+                    dragSnapshot = snapshot
+                    draggingTabID = tab.id
+                }
+                guard let snapshot = dragSnapshot else { return }
                 dragTranslation = value.translation.width
-                dropIndex = insertionIndex(forPointerX: value.location.x, dragging: tab.id)
+                dropIndex = insertionIndex(forPointerX: value.location.x, in: snapshot)
             }
             .onEnded { value in
-                guard draggingTabID == tab.id else { return }
-                let target = insertionIndex(forPointerX: value.location.x, dragging: tab.id)
+                guard draggingTabID == tab.id, let snapshot = dragSnapshot else { return }
+                let target = insertionIndex(forPointerX: value.location.x, in: snapshot)
                 let currentIndex = workspace.tabs.firstIndex { $0.id == tab.id }
+                // Unwinding the offsets and committing the order in the same
+                // transaction makes the two movements cancel out: the other
+                // tabs stay where they are while the lifted one settles into
+                // its real slot. Releasing no longer performs a reorder, it
+                // only drops the tab.
                 withAnimation(Self.reorderAnimation) {
                     draggingTabID = nil
                     dragTranslation = 0
+                    dropIndex = 0
+                    dragSnapshot = nil
                     if currentIndex != target {
                         workspace.moveTab(tabID: tab.id, toInsertionIndex: target)
                     }
@@ -199,44 +227,44 @@ private struct WorkspaceTabStrip: View {
 
     // MARK: - Drop placement
 
-    /// A thin caret between tabs showing where the dragged tab will land.
-    @ViewBuilder
-    private var dropMarker: some View {
-        if let draggingTabID,
-           let draggedFrame = tabFrames[draggingTabID],
-           let markerX = markerX(for: dropIndex, dragging: draggingTabID)
-        {
-            GeometryReader { _ in
-                Capsule()
-                    .fill(Color.accentColor)
-                    .frame(width: 3, height: max(draggedFrame.height - 8, 12))
-                    .position(x: markerX, y: draggedFrame.midY)
+    /// Freezes the strip geometry before any reflow happens. A missing or
+    /// incomplete measurement disables the drag rather than guessing a slot.
+    private func makeSnapshot(dragging tabID: UUID) -> DragSnapshot? {
+        let tabIDs = workspace.tabs.map(\.id)
+        let slots: [UUID: WorkspaceTabReflow.Slot] = Dictionary(
+            uniqueKeysWithValues: tabIDs.compactMap { id in
+                tabFrames[id].map {
+                    (id, WorkspaceTabReflow.Slot(minX: Double($0.minX), width: Double($0.width)))
+                }
             }
-            .allowsHitTesting(false)
-        }
+        )
+        guard slots.count == tabIDs.count else { return nil }
+        return DragSnapshot(tabIDs: tabIDs, slots: slots, draggingTabID: tabID)
     }
 
-    /// Counts the tabs whose midpoint the pointer has passed. The dragged tab
-    /// is excluded, so the result is directly the index it should be inserted
-    /// at once it has been taken out of the strip.
-    private func insertionIndex(forPointerX pointerX: CGFloat, dragging tabID: UUID) -> Int {
-        workspace.tabs.reduce(0) { count, tab in
-            guard tab.id != tabID, let frame = tabFrames[tab.id] else { return count }
-            return pointerX > frame.midX ? count + 1 : count
-        }
+    /// Counts the tabs whose midpoint the pointer has passed, using the frozen
+    /// snapshot. The dragged tab is excluded, so the result is directly the
+    /// insertion index in the strip once it has been taken out.
+    private func insertionIndex(forPointerX pointerX: CGFloat, in snapshot: DragSnapshot) -> Int {
+        WorkspaceTabReflow.insertionIndex(
+            pointerX: Double(pointerX),
+            tabIDs: snapshot.tabIDs,
+            slots: snapshot.slots,
+            draggingTabID: snapshot.draggingTabID
+        )
     }
 
-    private func markerX(for index: Int, dragging tabID: UUID) -> CGFloat? {
-        let others = workspace.tabs.filter { $0.id != tabID }
-        guard let first = others.first else { return nil }
-
-        if index < others.count, let frame = tabFrames[others[index].id] {
-            return frame.minX - Self.tabSpacing / 2
-        }
-        guard let lastFrame = tabFrames[others[others.count - 1].id] else {
-            return tabFrames[first.id].map { $0.minX - Self.tabSpacing / 2 }
-        }
-        return lastFrame.maxX + Self.tabSpacing / 2
+    /// How far a stationary tab must slide to show the in-flight ordering.
+    private func reflowOffset(for tabID: UUID) -> CGFloat {
+        guard let snapshot = dragSnapshot, draggingTabID != nil else { return 0 }
+        let offsets = WorkspaceTabReflow.offsets(
+            tabIDs: snapshot.tabIDs,
+            slots: snapshot.slots,
+            spacing: Double(Self.tabSpacing),
+            draggingTabID: snapshot.draggingTabID,
+            insertionIndex: dropIndex
+        )
+        return CGFloat(offsets[tabID] ?? 0)
     }
 }
 
