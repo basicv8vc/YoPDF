@@ -687,4 +687,145 @@ final class NoteDraftProtectionTests: XCTestCase {
         XCTAssertEqual(a.quitConfirmationRequests, 0, "the coordinator only reports who is next")
         XCTAssertEqual(a.store.session?.contents, "first draft, plus more")
     }
+
+    // MARK: - Resolving a draft for an interrupted action
+
+    /// "Save Note" in the compose prompt used to keep a thread composer open.
+    /// The interrupted action then opened a new composer over that live
+    /// session, and the next note click found a draft still worth protecting —
+    /// the same "Save this note first?" alert, over and over.
+    func testResolvingAThreadDraftClosesItSoTheNextNoteOpens() throws {
+        let model = openModel(at: try makeFixture())
+        let note = try addPageNote(to: model)
+        XCTAssertTrue(note.isYoPDFNote, "the fixture note must be a thread note")
+        model.abandonUnsavedChanges()
+
+        let store = NoteComposerStore()
+        let opened = store.begin(
+            mode: .group(note),
+            anchorRect: .zero,
+            pageLabel: note.pageLabel,
+            excerpt: note.excerpt,
+            contents: "",
+            style: note.style
+        )
+        XCTAssertTrue(opened)
+        let session = try XCTUnwrap(store.session)
+        session.contents = "A thought to save"
+        XCTAssertTrue(store.hasUncommittedChanges)
+
+        switch store.resolvePendingDraft(using: model) {
+        case .success:
+            break
+        case let .failure(error):
+            return XCTFail("the thought must be written: \(error)")
+        }
+
+        XCTAssertNil(store.session, "a resolved draft must not stay on screen")
+        XCTAssertFalse(store.hasUncommittedChanges)
+        XCTAssertFalse(store.isPresented)
+        XCTAssertEqual(try notes(on: 0, in: model).count, 2, "the thought joined the thread")
+
+        // This is what `perform(.compose)` does right after the alert closes.
+        let reopened = store.begin(
+            mode: .group(note),
+            anchorRect: .zero,
+            pageLabel: note.pageLabel,
+            excerpt: note.excerpt,
+            contents: "",
+            style: note.style
+        )
+        XCTAssertTrue(reopened, "the clicked note must open instead of asking again")
+        XCTAssertFalse(store.hasUncommittedChanges)
+    }
+
+    /// A style-only draft has no body, and every note edit refuses an empty
+    /// body. Offering a "Save Note" that can never write anything used to leave
+    /// the draft protected forever, with only "Discard Draft" as a way out.
+    func testAppearanceOnlyDraftIsResolvedWithoutAnEmptyWrite() throws {
+        let model = openModel(at: try makeFixture())
+        let store = NoteComposerStore()
+        let session = try beginPageNoteDraft(in: model, store: store)
+        session.paper = .rose
+        XCTAssertTrue(store.hasUncommittedChanges)
+        XCTAssertTrue(session.hasEmptyContents)
+
+        switch store.resolvePendingDraft(using: model) {
+        case let .success(written):
+            XCTAssertNil(written, "nothing can be written for a blank note")
+        case let .failure(error):
+            return XCTFail("a blank draft must resolve cleanly: \(error)")
+        }
+
+        XCTAssertNil(store.session)
+        XCTAssertFalse(store.hasUncommittedChanges)
+        XCTAssertTrue(try notes(on: 0, in: model).isEmpty, "no empty note may be created")
+        XCTAssertFalse(model.hasUnsavedChanges)
+
+        let page = try XCTUnwrap(model.document?.page(at: 1))
+        let next = try XCTUnwrap(model.pageNoteDraft(at: CGPoint(x: 200, y: 200), on: page))
+        XCTAssertTrue(store.begin(
+            mode: .create(next),
+            anchorRect: .zero,
+            pageLabel: next.pageLabel,
+            excerpt: next.excerpt,
+            contents: "",
+            paper: .honey
+        ), "the next note must open normally")
+    }
+
+    /// A real body that cannot be written must not be dropped by the resolver:
+    /// the text stays in the composer so the error prompt can offer a choice.
+    func testUnwritableDraftSurvivesAFailedResolve() throws {
+        let model = openModel(at: try makeFixture())
+        let note = try addPageNote(to: model)
+        model.abandonUnsavedChanges()
+
+        let store = NoteComposerStore()
+        let session = try beginEditDraft(for: note, in: model, store: store)
+        session.contents = "Text that cannot be saved"
+        XCTAssertTrue(model.deleteNote(note))
+
+        guard case .failure = store.resolvePendingDraft(using: model) else {
+            return XCTFail("writing into a removed note must fail")
+        }
+        XCTAssertEqual(store.session?.contents, "Text that cannot be saved")
+        XCTAssertTrue(store.hasUncommittedChanges)
+    }
+
+    func testClearingAnEditedNoteDoesNotSilentlyDiscardTheEdit() throws {
+        let model = openModel(at: try makeFixture())
+        let note = try addPageNote(to: model)
+        model.abandonUnsavedChanges()
+        let originalContents = try XCTUnwrap(note.annotation.contents)
+
+        let store = NoteComposerStore()
+        let session = try beginEditDraft(for: note, in: model, store: store)
+        session.contents = ""
+        XCTAssertTrue(session.hasEmptyContents)
+        XCTAssertTrue(store.hasUncommittedChanges, "clearing the body is an unsaved edit")
+
+        guard case let .failure(error) = store.resolvePendingDraft(using: model) else {
+            return XCTFail("clearing an existing note must not resolve as a clean empty write")
+        }
+        XCTAssertEqual(error, .emptyContents)
+
+        XCTAssertNotNil(store.session, "the composer must stay open")
+        XCTAssertEqual(store.session?.contents, "")
+        XCTAssertTrue(store.hasUncommittedChanges, "the edit must still be protected")
+        XCTAssertEqual(note.annotation.contents, originalContents, "the document keeps its body")
+        XCTAssertFalse(model.hasUnsavedChanges, "no empty write may dirty the PDF")
+
+        // The user can still type a real body and save it through the same draft.
+        store.session?.contents = "Rewritten note"
+        switch store.resolvePendingDraft(using: model) {
+        case .success:
+            break
+        case let .failure(error):
+            return XCTFail("the recovered draft must be savable: \(error)")
+        }
+        XCTAssertNil(store.session)
+        XCTAssertNotEqual(note.annotation.contents, originalContents, "the recovered text is written")
+        XCTAssertTrue(model.hasUnsavedChanges)
+    }
 }
