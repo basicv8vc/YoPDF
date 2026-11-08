@@ -95,17 +95,6 @@ private struct WorkspaceTabStrip: View {
     }
 }
 
-private struct RecentDocumentsHeadingWidthPreferenceKey: PreferenceKey {
-    static let defaultValue: CGFloat = 110
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        let nextWidth = nextValue()
-        if nextWidth > 0 {
-            value = nextWidth
-        }
-    }
-}
-
 struct PDFReaderView: View {
 
     @ObservedObject var workspace: WorkspaceWindowModel
@@ -119,7 +108,6 @@ struct PDFReaderView: View {
     let canReceiveFinderOpenRequest: Bool
 
     @State private var isImporterPresented = false
-    @State private var recentDocumentsHeadingWidth = RecentDocumentsHeadingWidthPreferenceKey.defaultValue
     @State private var pendingRecentRelink: RecentDocument?
     @State private var finderOpenRequestID: UUID?
     @State private var isDropTargeted = false
@@ -1212,21 +1200,13 @@ struct PDFReaderView: View {
             .keyboardShortcut("o", modifiers: .command)
 
             if !recentDocuments.items.isEmpty {
-                VStack(alignment: .leading, spacing: 7) {
+                // The empty state is centre-aligned, so the recent rows use the
+                // same vertical axis as the icon and the Open PDF button.
+                VStack(alignment: .center, spacing: 7) {
                     Text("Recent Documents")
                         .font(.callout.weight(.medium))
                         .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: true, vertical: false)
-                        .background {
-                            GeometryReader { geometry in
-                                Color.clear.preference(
-                                    key: RecentDocumentsHeadingWidthPreferenceKey.self,
-                                    value: geometry.size.width
-                                )
-                            }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .center)
-                    VStack(alignment: .leading, spacing: 7) {
+                    VStack(alignment: .center, spacing: 7) {
                         ForEach(Array(recentDocuments.items.prefix(5))) { item in
                             Button {
                                 requestOpenRecent(item)
@@ -1234,21 +1214,17 @@ struct PDFReaderView: View {
                                 Text(item.displayName)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .frame(maxWidth: .infinity, alignment: .center)
                             }
                             .buttonStyle(ReaderInteractiveButtonStyle(insets: .init()))
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .frame(maxWidth: .infinity, alignment: .center)
                             .help(item.lastKnownPath)
                         }
                     }
-                    .padding(.leading, max(0, (360 - recentDocumentsHeadingWidth) / 2))
                 }
-                .frame(maxWidth: 360, alignment: .leading)
+                .frame(maxWidth: 360, alignment: .center)
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.top, 14)
-                .onPreferenceChange(RecentDocumentsHeadingWidthPreferenceKey.self) {
-                    recentDocumentsHeadingWidth = $0
-                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
