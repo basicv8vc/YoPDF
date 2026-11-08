@@ -46,7 +46,7 @@ final class RecentDocumentThumbnailProviderTests: XCTestCase {
     func testUnknownItemDoesNotWriteItsRenderBack() async throws {
         let provider = RecentDocumentThumbnailProvider(
             directory: root,
-            isItemKnown: { _ in false }
+            isItemCurrent: { _, _ in false }
         )
         let item = Self.makeItem(id: UUID(), path: pdfURL.path)
 
@@ -59,6 +59,120 @@ final class RecentDocumentThumbnailProviderTests: XCTestCase {
             contents.isEmpty,
             "no cache directory may survive for an entry that no longer exists"
         )
+    }
+
+    /// A render that finishes after its entry was relinked to another file
+    /// must not write the *old* file's preview back under the entry's id —
+    /// the write-back check compares the full render identity, not just the
+    /// UUID's existence.
+    func testRelinkedIdentityDoesNotWriteTheOldPreviewBack() async throws {
+        let item = Self.makeItem(id: UUID(), path: pdfURL.path)
+        let relinkedIdentity = RecentDocumentThumbnailCachePolicy.renderIdentity(
+            for: Self.makeItem(id: item.id, path: "/tmp/relinked-elsewhere.pdf")
+        )
+        let provider = RecentDocumentThumbnailProvider(
+            directory: root,
+            isItemCurrent: { _, identity in identity == relinkedIdentity }
+        )
+
+        let image = await provider.image(for: item, url: pdfURL)
+        XCTAssertNotNil(image, "the render itself still succeeds")
+
+        let cacheRoot = root.appendingPathComponent("YoPDF/RecentThumbnails")
+        let contents = (try? FileManager.default.contentsOfDirectory(atPath: cacheRoot.path)) ?? []
+        XCTAssertTrue(
+            contents.isEmpty,
+            "a superseded render must not recreate the cache entry it lost"
+        )
+    }
+
+    /// Regression: relinking an entry to a different PDF that shares the old
+    /// file's size and modification date must serve the *new* file's preview,
+    /// not the cached image of the file the entry used to point at.
+    func testRelinkToSameSizeSameDateFileGetsItsOwnPreview() async throws {
+        let provider = RecentDocumentThumbnailProvider(directory: root)
+        let urlA = root.appendingPathComponent("original.pdf")
+        let urlB = root.appendingPathComponent("replacement.pdf")
+        try Self.writeOnePagePDF(to: urlA, gray: 0.9)
+        try Self.writeOnePagePDF(to: urlB, gray: 0.15)
+        try Self.equalizeSizes(urlA, urlB)
+        let sharedDate = Date(timeIntervalSince1970: 1_700_000_000)
+        for url in [urlA, urlB] {
+            try FileManager.default.setAttributes(
+                [.modificationDate: sharedDate], ofItemAtPath: url.path
+            )
+        }
+        let sizeA = try FileManager.default.attributesOfItem(atPath: urlA.path)[.size] as? Int
+        let sizeB = try FileManager.default.attributesOfItem(atPath: urlB.path)[.size] as? Int
+        XCTAssertEqual(sizeA, sizeB, "fixture precondition: identical file sizes")
+
+        let id = UUID()
+        let imageA = await provider.image(
+            for: Self.makeItem(id: id, path: urlA.path), url: urlA
+        )
+        let imageB = await provider.image(
+            for: Self.makeItem(id: id, path: urlB.path), url: urlB
+        )
+
+        XCTAssertNotNil(imageA)
+        XCTAssertNotNil(imageB)
+        XCTAssertNotEqual(
+            imageA?.tiffRepresentation, imageB?.tiffRepresentation,
+            "the relinked entry must show the replacement file's first page"
+        )
+
+        // The item directory keeps only the newest preview, and it must be
+        // the replacement's stamp — the old stamp can never serve again.
+        func fileID(_ url: URL) throws -> UInt64 {
+            (try url.resourceValues(forKeys: [.fileIdentifierKey]).fileIdentifier) ?? 0
+        }
+        let stampA = RecentDocumentThumbnailCachePolicy.stamp(
+            modificationDate: sharedDate,
+            fileSize: Int64(sizeA ?? 0),
+            fileIdentifier: try fileID(urlA)
+        )
+        let stampB = RecentDocumentThumbnailCachePolicy.stamp(
+            modificationDate: sharedDate,
+            fileSize: Int64(sizeB ?? 0),
+            fileIdentifier: try fileID(urlB)
+        )
+        XCTAssertNotEqual(stampA, stampB, "distinct files must get distinct stamps")
+
+        let itemDirectory = root.appendingPathComponent(
+            "YoPDF/RecentThumbnails/\(id.uuidString)", isDirectory: true
+        )
+        let contents = try FileManager.default.contentsOfDirectory(atPath: itemDirectory.path)
+        XCTAssertEqual(
+            contents,
+            [RecentDocumentThumbnailCachePolicy.fileName(stamp: stampB)],
+            "the cached preview belongs to the replacement file, not the old one"
+        )
+    }
+
+    // MARK: - Store change hook (no-window Clear Menu path)
+
+    /// Clear Menu with every window closed relies on the store's change hook
+    /// reaching the prune: no grid and no window observer exists then. The
+    /// hook must fire with the post-change list for every membership change.
+    func testStoreChangeHookFiresForRemovalClearAndOpen() throws {
+        let suiteName = "YoPDFStoreHookTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = RecentDocumentsStore(
+            defaults: defaults,
+            bookmarkDataProvider: { _ in Data([1, 2, 3]) }
+        )
+        var observed: [[RecentDocument]] = []
+        store.itemsDidChange = { observed.append($0) }
+
+        XCTAssertTrue(store.recordOpened(URL(fileURLWithPath: "/tmp/hook-sample.pdf")))
+        store.remove(store.items[0])
+        XCTAssertTrue(store.recordOpened(URL(fileURLWithPath: "/tmp/hook-sample.pdf")))
+        store.clear()
+
+        XCTAssertEqual(observed.count, 4)
+        XCTAssertEqual(observed.map(\.count), [1, 0, 1, 0])
     }
 
     // MARK: - Pruning
@@ -115,7 +229,8 @@ final class RecentDocumentThumbnailProviderTests: XCTestCase {
     }
 
     /// A minimal one-page PDF so the renderer has real content to draw.
-    private static func writeOnePagePDF(to url: URL) throws {
+    /// `gray` tints the page so two fixtures render visibly different images.
+    private static func writeOnePagePDF(to url: URL, gray: CGFloat = 0.95) throws {
         var mediaBox = CGRect(x: 0, y: 0, width: 300, height: 400)
         guard let consumer = CGDataConsumer(url: url as CFURL),
               let context = CGContext(consumer: consumer, mediaBox: &mediaBox, nil)
@@ -123,7 +238,7 @@ final class RecentDocumentThumbnailProviderTests: XCTestCase {
             throw XCTUnwrapFailure()
         }
         context.beginPDFPage(nil)
-        context.setFillColor(CGColor(gray: 0.95, alpha: 1))
+        context.setFillColor(CGColor(gray: gray, alpha: 1))
         context.fill(mediaBox)
         context.setFillColor(CGColor(gray: 0.2, alpha: 1))
         context.fill(CGRect(x: 40, y: 320, width: 220, height: 36))
@@ -133,6 +248,23 @@ final class RecentDocumentThumbnailProviderTests: XCTestCase {
         }
         context.endPDFPage()
         context.closePDF()
+    }
+
+    /// Pads the smaller of the two files with trailing newlines (harmless to
+    /// PDF readers) so both fixtures share one file size — the precondition
+    /// of the same-size relink regression test.
+    private static func equalizeSizes(_ a: URL, _ b: URL) throws {
+        let fileManager = FileManager.default
+        let sizeA = (try fileManager.attributesOfItem(atPath: a.path)[.size] as? Int) ?? 0
+        let sizeB = (try fileManager.attributesOfItem(atPath: b.path)[.size] as? Int) ?? 0
+        let target = max(sizeA, sizeB)
+        for (url, size) in [(a, sizeA), (b, sizeB)] where size < target {
+            let padding = Data(repeating: UInt8(ascii: "\n"), count: target - size)
+            let handle = try FileHandle(forWritingTo: url)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: padding)
+        }
     }
 
     private struct XCTUnwrapFailure: Error {}

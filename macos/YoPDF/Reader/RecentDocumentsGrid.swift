@@ -43,15 +43,8 @@ struct RecentDocumentsGrid: View {
         }
         .frame(maxWidth: 760, alignment: .center)
         .frame(maxWidth: .infinity, alignment: .center)
-        // Re-runs whenever the list changes, so removing one entry prunes its
-        // preview immediately. The reader window also prunes on change, which
-        // covers Clear Menu: there the grid disappears with the list, so this
-        // task would never run again.
-        .task(id: store.items) {
-            RecentDocumentThumbnailProvider.shared.prune(
-                keeping: Set(store.items.map(\.id))
-            )
-        }
+        // Cache pruning follows the recent list itself (wired in AppDelegate),
+        // so it also runs when this grid — or every window — is gone.
     }
 }
 

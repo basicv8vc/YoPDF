@@ -17,8 +17,10 @@ import YoPDFCore
 final class RecentDocumentThumbnailProvider {
 
     static let shared = RecentDocumentThumbnailProvider(
-        isItemKnown: { id in
-            RecentDocumentsStore.shared.items.contains { $0.id == id }
+        isItemCurrent: { id, identity in
+            guard let item = RecentDocumentsStore.shared.items.first(where: { $0.id == id })
+            else { return false }
+            return RecentDocumentThumbnailCachePolicy.renderIdentity(for: item) == identity
         }
     )
 
@@ -26,18 +28,19 @@ final class RecentDocumentThumbnailProvider {
     private let memory = NSCache<NSString, NSImage>()
     private let directory: URL
     private let fileManager: FileManager
-    /// Reports whether a recent entry still exists. A render that finishes
-    /// after its entry was removed (or the list cleared) must not write its
-    /// image back to disk.
-    private let isItemKnown: @MainActor (UUID) -> Bool
+    /// Reports whether the stored entry with this id still *is* the entry the
+    /// load started for — same path and same bookmark, so a render that
+    /// finishes after the entry was removed, cleared, or relinked to another
+    /// file must not write its image back to disk.
+    private let isItemCurrent: @MainActor (UUID, String) -> Bool
 
     init(
         directory: URL? = nil,
         fileManager: FileManager = .default,
-        isItemKnown: @escaping @MainActor (UUID) -> Bool = { _ in true }
+        isItemCurrent: @escaping @MainActor (UUID, String) -> Bool = { _, _ in true }
     ) {
         self.fileManager = fileManager
-        self.isItemKnown = isItemKnown
+        self.isItemCurrent = isItemCurrent
         let base = directory
             ?? fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? fileManager.temporaryDirectory
@@ -55,6 +58,7 @@ final class RecentDocumentThumbnailProvider {
     }
 
     func image(for item: RecentDocument, url: URL?) async -> NSImage? {
+        let identity = RecentDocumentThumbnailCachePolicy.renderIdentity(for: item)
         let stamp = Self.stamp(for: url, fileManager: fileManager)
         let key = "\(item.id.uuidString)/\(stamp)" as NSString
         if let cached = memory.object(forKey: key) { return cached }
@@ -78,11 +82,12 @@ final class RecentDocumentThumbnailProvider {
 
         guard let data = await renderer.render(url: url) else { return nil }
 
-        // The render is awaited, so the entry may have been removed or the
-        // list cleared while it was in flight. Such an image is returned to a
-        // cell that no longer exists; writing it back would recreate the very
-        // cache files a prune just deleted.
-        guard isItemKnown(item.id) else {
+        // The render is awaited, so the entry may have been removed, cleared,
+        // or relinked to a different file while it was in flight. Such an
+        // image is returned to a cell that no longer shows this file; writing
+        // it back would recreate the very cache files a prune just deleted,
+        // or attach the old document's page to the relinked entry.
+        guard isItemCurrent(item.id, identity) else {
             return NSImage(data: data)
         }
 
@@ -116,17 +121,18 @@ final class RecentDocumentThumbnailProvider {
     }
 
     private static func stamp(for url: URL?, fileManager: FileManager) -> String {
-        guard let url,
-              let attributes = try? fileManager.attributesOfItem(atPath: url.path),
-              let size = attributes[.size] as? NSNumber,
-              let date = attributes[.modificationDate] as? Date
-        else {
+        guard let url else {
             return RecentDocumentThumbnailCachePolicy.stamp(
                 modificationDate: nil, fileSize: nil
             )
         }
+        let values = try? url.resourceValues(
+            forKeys: [.fileSizeKey, .contentModificationDateKey, .fileIdentifierKey]
+        )
         return RecentDocumentThumbnailCachePolicy.stamp(
-            modificationDate: date, fileSize: size.int64Value
+            modificationDate: values?.contentModificationDate,
+            fileSize: values?.fileSize.map(Int64.init),
+            fileIdentifier: values?.fileIdentifier
         )
     }
 }

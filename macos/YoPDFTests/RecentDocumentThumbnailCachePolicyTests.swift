@@ -46,6 +46,28 @@ final class RecentDocumentThumbnailCachePolicyTests: XCTestCase {
         XCTAssertNotEqual(first, second)
     }
 
+    /// Regression: a relink can land on a *different* file that shares the
+    /// old file's size and modification date; only the volume file identifier
+    /// tells them apart, so it must be part of the stamp.
+    func testStampSeparatesDifferentFilesWithTheSameSizeAndDate() {
+        let original = RecentDocumentThumbnailCachePolicy.stamp(
+            modificationDate: epoch, fileSize: 4_096, fileIdentifier: 101
+        )
+        let replacement = RecentDocumentThumbnailCachePolicy.stamp(
+            modificationDate: epoch, fileSize: 4_096, fileIdentifier: 202
+        )
+        XCTAssertNotEqual(original, replacement)
+
+        // Entries whose attributes cannot be read keep the two-part stamp.
+        let withoutIdentity = RecentDocumentThumbnailCachePolicy.stamp(
+            modificationDate: epoch, fileSize: 4_096
+        )
+        XCTAssertEqual(withoutIdentity, RecentDocumentThumbnailCachePolicy.stamp(
+            modificationDate: epoch, fileSize: 4_096
+        ))
+        XCTAssertNotEqual(withoutIdentity, original)
+    }
+
     func testRenderIdentitySurvivesUnrelatedChanges() {
         let item = RecentDocument(
             displayName: "paper.pdf",

@@ -82,6 +82,16 @@ public final class RecentDocumentsStore: ObservableObject {
     /// opening another PDF must not replace the only copy of unknown data.
     private var hasUnreadableStoredValue = false
 
+    /// Fired on the main actor whenever the *set* of entries changes — an
+    /// open, a relink, a removal, or Clear Menu. Reading-position updates do
+    /// not fire it. The app layer wires this to preview-cache pruning, which
+    /// must also run when no reader window exists to observe the store.
+    public var itemsDidChange: (@MainActor ([RecentDocument]) -> Void)?
+
+    private func notifyItemsChanged() {
+        itemsDidChange?(items)
+    }
+
     public init(
         defaults: UserDefaults = .standard,
         bookmarkDataProvider: (@MainActor (URL) throws -> Data)? = nil
@@ -172,6 +182,7 @@ public final class RecentDocumentsStore: ObservableObject {
         resolvedURLs = resolvedURLs.filter { retainedIDs.contains($0.key) }
         staleBookmarkIDs.formIntersection(retainedIDs)
         persist()
+        notifyItemsChanged()
         return true
     }
 
@@ -231,6 +242,7 @@ public final class RecentDocumentsStore: ObservableObject {
         staleBookmarkIDs.subtract(duplicateIDs)
         staleBookmarkIDs.formIntersection(retainedIDs)
         persist()
+        notifyItemsChanged()
         return true
     }
 
@@ -266,6 +278,7 @@ public final class RecentDocumentsStore: ObservableObject {
         resolvedURLs[item.id] = nil
         staleBookmarkIDs.remove(item.id)
         persist()
+        notifyItemsChanged()
     }
 
     public func clear() {
@@ -274,6 +287,7 @@ public final class RecentDocumentsStore: ObservableObject {
         staleBookmarkIDs.removeAll()
         hasUnreadableStoredValue = false
         defaults.removeObject(forKey: Self.storageKey)
+        notifyItemsChanged()
     }
 
     private func loadStoredValue() {

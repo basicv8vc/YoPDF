@@ -33,6 +33,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // menu items from claiming ⇧⌘[ / ⇧⌘], and makes ⌘N open a real
         // window instead of merging it into a native tab bar.
         NSWindow.allowsAutomaticWindowTabbing = false
+        installRecentThumbnailCacheJanitor()
+    }
+
+    /// Recent previews are sensitive (first pages of the user's files), so
+    /// their cache must follow the recent list everywhere it changes —
+    /// including File → Open Recent → Clear Menu *after every reader window
+    /// was closed*, when neither the empty-state grid nor a window observer
+    /// exists. The hook is owned by the store, which lives for the whole app
+    /// run, so this cleanup cannot be outlived by any window lifecycle.
+    private func installRecentThumbnailCacheJanitor() {
+        let store = RecentDocumentsStore.shared
+        store.itemsDidChange = { items in
+            RecentDocumentThumbnailProvider.shared.prune(
+                keeping: Set(items.map(\.id))
+            )
+        }
+        // Previews left behind by a previous session — or by a Clear Menu
+        // that ran while the app had no windows — are removed once at launch,
+        // before any window can show them.
+        RecentDocumentThumbnailProvider.shared.prune(
+            keeping: Set(store.items.map(\.id))
+        )
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {

@@ -18,13 +18,20 @@ public enum RecentDocumentThumbnailCachePolicy {
     ///
     /// The date keeps microsecond precision: two same-size writes within the
     /// same second must not share one cache key, or an edited file would keep
-    /// serving the previous page image.
-    public static func stamp(modificationDate: Date?, fileSize: Int64?) -> String {
+    /// serving the previous page image. The volume file identifier separates
+    /// two *different* files that share size and date — exactly what a relink
+    /// to a replacement written in the same second produces.
+    public static func stamp(
+        modificationDate: Date?, fileSize: Int64?, fileIdentifier: UInt64? = nil
+    ) -> String {
         guard let modificationDate, let fileSize else { return "unknown" }
         let microseconds = Int64(
             (modificationDate.timeIntervalSince1970 * 1_000_000).rounded()
         )
-        return "\(microseconds)-\(fileSize)"
+        guard let fileIdentifier else {
+            return "\(microseconds)-\(fileSize)"
+        }
+        return "\(fileIdentifier)-\(microseconds)-\(fileSize)"
     }
 
     /// Identity of the work that loads one entry's preview. A relink keeps the
