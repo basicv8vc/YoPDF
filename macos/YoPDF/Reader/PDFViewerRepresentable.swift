@@ -745,6 +745,7 @@ private final class MarkupSelectionOverlayView: NSView {
             guard markers != oldValue else { return }
             needsDisplay = true
             window?.invalidateCursorRects(for: self)
+            refreshHoverPreview()
         }
     }
     var onMarkerActivated: ((NoteMarker) -> Void)?
@@ -756,6 +757,23 @@ private final class MarkupSelectionOverlayView: NSView {
     private var dragStartCenter: CGPoint?
     private var previewCenter: CGPoint?
     private var didDragMarker = false
+
+    // MARK: - Hover preview
+    //
+    // A sticker is opaque, so the note behind it used to be readable only after
+    // a click. Hovering shows the same body in a card above the sticker.
+
+    private static let hoverDelay: Duration = .milliseconds(160)
+    private var hoverTrackingArea: NSTrackingArea?
+    /// Invalidates a queued preview when the pointer has already moved on.
+    private var hoverGeneration = 0
+    private var hoveredMarkerID: ObjectIdentifier?
+    private var hoverCardView: NoteHoverCardView?
+    /// Set when a click opened a note. The card stays away until the pointer
+    /// leaves this sticker, so it cannot reappear underneath the popover that
+    /// the click just opened.
+    private var suppressedHoverMarkerID: ObjectIdentifier?
+    private weak var observedClipView: NSView?
 
     override var isOpaque: Bool { false }
 
@@ -798,6 +816,9 @@ private final class MarkupSelectionOverlayView: NSView {
         if let marker, let center {
             previewCenter = clampedCenter(center, for: marker)
             didDragMarker = true
+            // A drag started in PDFView rather than in this overlay still has to
+            // put the hover card away.
+            hideHoverPreview()
         } else {
             previewCenter = nil
             didDragMarker = false
@@ -852,9 +873,208 @@ private final class MarkupSelectionOverlayView: NSView {
         }
     }
 
+    // MARK: - Hover preview
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTrackingArea {
+            removeTrackingArea(hoverTrackingArea)
+        }
+        // `.inVisibleRect` keeps the region correct across scrolling and zooming
+        // without recomputing a rectangle on every layout pass.
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverTrackingArea = area
+    }
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        observeClipViewBounds()
+        if superview == nil { hideHoverPreview() }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        observeClipViewBounds()
+        if window == nil { hideHoverPreview() }
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        let resized = newSize != frame.size
+        super.setFrameSize(newSize)
+        // The card is placed in page coordinates, so a resize — zoom, rotation,
+        // a re-laid-out page — invalidates that placement.
+        if resized { hideHoverPreview() }
+    }
+
+    /// Scrolling moves the page under a pointer that is standing still, so the
+    /// card has to be re-checked instead of trusted to follow the sticker.
+    private func observeClipViewBounds() {
+        let clipView = enclosingScrollView?.contentView
+        guard clipView !== observedClipView else { return }
+
+        if let observedClipView {
+            NotificationCenter.default.removeObserver(
+                self,
+                name: NSView.boundsDidChangeNotification,
+                object: observedClipView
+            )
+        }
+        observedClipView = clipView
+
+        guard let clipView else { return }
+        clipView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(clipViewBoundsDidChange),
+            name: NSView.boundsDidChangeNotification,
+            object: clipView
+        )
+    }
+
+    @objc private func clipViewBoundsDidChange() {
+        revalidateHover()
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        updateHover(at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        updateHover(at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        // Leaving the page also re-arms the sticker whose note the user opened,
+        // so coming back to it shows the card again.
+        suppressedHoverMarkerID = nil
+        hideHoverPreview()
+    }
+
+    private func updateHover(at point: NSPoint) {
+        guard pressedMarker == nil else {
+            hideHoverPreview()
+            return
+        }
+        guard let marker = marker(at: point) else {
+            // Leaving every sticker re-arms the one the user just opened.
+            suppressedHoverMarkerID = nil
+            hideHoverPreview()
+            return
+        }
+        guard marker.id != suppressedHoverMarkerID else {
+            hideHoverPreview()
+            return
+        }
+        if marker.id == hoveredMarkerID, hoverCardView != nil { return }
+        scheduleHoverPreview(for: marker.id)
+    }
+
+    private func scheduleHoverPreview(for markerID: ObjectIdentifier) {
+        // A different sticker replaces the previous card at once, rather than
+        // leaving the old body on screen for the length of the delay.
+        hideHoverPreview()
+        let generation = hoverGeneration
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: MarkupSelectionOverlayView.hoverDelay)
+            guard let self, self.hoverGeneration == generation else { return }
+            self.presentHoverPreview(for: markerID)
+        }
+    }
+
+    private func presentHoverPreview(for markerID: ObjectIdentifier) {
+        guard pressedMarker == nil,
+              let marker = markers.first(where: { $0.id == markerID })
+        else { return }
+
+        // Only the visible part of the page is available: a card above a sticker
+        // at the top of the viewport would otherwise be drawn under the toolbar.
+        let container = bounds.intersection(visibleRect)
+        let width = min(
+            NoteHoverCardView.preferredWidth,
+            container.width - NoteHoverCardLayout.inset * 2
+        )
+        let maxHeight = min(
+            NoteHoverCardView.maximumHeight,
+            container.height - NoteHoverCardLayout.inset * 2
+        )
+        guard width >= NoteHoverCardView.minimumWidth, maxHeight > 0 else {
+            hideHoverPreview()
+            return
+        }
+
+        let preview = NoteHoverPreview(marker: marker)
+        let cardSize = NoteHoverCardView.size(for: preview, width: width, maxHeight: maxHeight)
+        let stickerFrame = displayedBounds(for: marker).offsetBy(
+            dx: -pageBounds.minX,
+            dy: -pageBounds.minY
+        )
+        let frame = NoteHoverCardLayout.frame(
+            cardSize: cardSize,
+            stickerFrame: stickerFrame,
+            container: container
+        )
+        guard frame.width > 0, frame.height > 0 else {
+            hideHoverPreview()
+            return
+        }
+
+        let card = hoverCardView ?? NoteHoverCardView()
+        card.preview = preview
+        card.frame = frame.integral
+        if card.superview !== self {
+            addSubview(card, positioned: .above, relativeTo: nil)
+        }
+        hoverCardView = card
+        hoveredMarkerID = markerID
+    }
+
+    /// A note that was edited, deleted or moved while its card is showing must
+    /// not keep describing the old state.
+    private func refreshHoverPreview() {
+        guard let hoveredMarkerID else { return }
+        guard markers.contains(where: { $0.id == hoveredMarkerID }) else {
+            hideHoverPreview()
+            return
+        }
+        presentHoverPreview(for: hoveredMarkerID)
+    }
+
+    private func revalidateHover() {
+        guard hoverCardView != nil else { return }
+        guard let window else {
+            hideHoverPreview()
+            return
+        }
+        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        guard let marker = marker(at: point), marker.id == hoveredMarkerID else {
+            hideHoverPreview()
+            return
+        }
+    }
+
+    private func hideHoverPreview() {
+        hoverGeneration &+= 1
+        hoveredMarkerID = nil
+        if let hoverCardView {
+            hoverCardView.removeFromSuperview()
+            self.hoverCardView = nil
+        }
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         guard let marker = marker(at: point) else { return }
+        hideHoverPreview()
         pressedMarker = marker
         dragStartPagePoint = pagePoint(for: point)
         let center = CGPoint(x: marker.bounds.midX, y: marker.bounds.midY)
@@ -896,8 +1116,15 @@ private final class MarkupSelectionOverlayView: NSView {
         previewCenter = nil
         didDragMarker = false
         if moved, let destination {
+            // The pointer is still on the sticker after a move, so the card must
+            // wait for the pointer to leave before it shows the new position.
+            suppressedHoverMarkerID = marker.id
             onMarkerMoved?(marker, destination)
         } else if self.marker(at: point)?.id == marker.id {
+            // The click is about to open the note. Suppress the card until the
+            // pointer leaves this sticker so it cannot reappear under the
+            // popover that the click opens.
+            suppressedHoverMarkerID = marker.id
             onMarkerActivated?(marker)
         }
         needsDisplay = true
