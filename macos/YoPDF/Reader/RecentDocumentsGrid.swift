@@ -13,24 +13,30 @@ struct RecentDocumentsGrid: View {
     let onOpen: (RecentDocument) -> Void
     let onRelink: (RecentDocument) -> Void
 
-    private static let maximumItems = 5
+    /// Short windows use smaller page previews so both rows stay visible.
+    var compact = false
+
+    /// The store keeps ten items; showing all of them is two rows at the
+    /// default window width (five adaptive columns per row).
+    private static let maximumItems = 10
 
     var body: some View {
-        VStack(alignment: .center, spacing: 14) {
+        VStack(alignment: .center, spacing: compact ? 8 : 14) {
             Text("Recent Documents")
                 .font(.callout.weight(.medium))
                 .foregroundStyle(.secondary)
 
             LazyVGrid(
                 columns: [GridItem(.adaptive(minimum: 118, maximum: 152), spacing: 16)],
-                spacing: 18
+                spacing: compact ? 10 : 18
             ) {
                 ForEach(Array(store.items.prefix(Self.maximumItems))) { item in
                     RecentDocumentCell(
                         item: item,
                         store: store,
                         onOpen: onOpen,
-                        onRelink: onRelink
+                        onRelink: onRelink,
+                        compact: compact
                     )
                 }
             }
@@ -47,21 +53,27 @@ struct RecentDocumentsGrid: View {
 
 private struct RecentDocumentCell: View {
     /// The fixed box every preview is centred in, regardless of page ratio.
-    private static let previewBox = CGSize(width: 96, height: 124)
+    private static let regularPreviewBox = CGSize(width: 96, height: 124)
+    private static let compactPreviewBox = CGSize(width: 70, height: 92)
 
     let item: RecentDocument
     @ObservedObject var store: RecentDocumentsStore
     let onOpen: (RecentDocument) -> Void
     let onRelink: (RecentDocument) -> Void
+    let compact: Bool
 
     @State private var isHovered = false
     @State private var image: NSImage?
+
+    private var previewBox: CGSize {
+        compact ? Self.compactPreviewBox : Self.regularPreviewBox
+    }
 
     var body: some View {
         Button {
             onOpen(item)
         } label: {
-            VStack(spacing: 8) {
+            VStack(spacing: compact ? 5 : 8) {
                 ZStack(alignment: .bottomLeading) {
                     pagePreview
                     if isNew {
@@ -88,7 +100,12 @@ private struct RecentDocumentCell: View {
                         .lineLimit(1)
                 }
             }
-            .padding(EdgeInsets(top: 8, leading: 6, bottom: 8, trailing: 6))
+            .padding(EdgeInsets(
+                top: compact ? 4 : 8,
+                leading: 6,
+                bottom: compact ? 4 : 8,
+                trailing: 6
+            ))
             .background {
                 RoundedRectangle(cornerRadius: 8)
                     .fill(isHovered ? Color.primary.opacity(0.06) : .clear)
@@ -137,7 +154,7 @@ private struct RecentDocumentCell: View {
                     .scaledToFit()
             } else {
                 Image(systemName: "doc.richtext")
-                    .font(.system(size: 24, weight: .light))
+                    .font(.system(size: compact ? 18 : 24, weight: .light))
                     .foregroundStyle(.tertiary)
             }
         }
@@ -148,14 +165,14 @@ private struct RecentDocumentCell: View {
                 .stroke(Color.black.opacity(0.14), lineWidth: 0.6)
         }
         .shadow(color: .black.opacity(0.14), radius: 3, y: 2)
-        .frame(width: Self.previewBox.width, height: Self.previewBox.height)
+        .frame(width: previewBox.width, height: previewBox.height)
     }
 
     private func fittedSize(_ original: CGSize) -> CGSize {
-        guard original.width > 0, original.height > 0 else { return Self.previewBox }
+        guard original.width > 0, original.height > 0 else { return previewBox }
         let scale = min(
-            Self.previewBox.width / original.width,
-            Self.previewBox.height / original.height
+            previewBox.width / original.width,
+            previewBox.height / original.height
         )
         return CGSize(width: original.width * scale, height: original.height * scale)
     }

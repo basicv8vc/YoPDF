@@ -1179,33 +1179,49 @@ struct PDFReaderView: View {
     private static let fallbackAnchor = CGRect(x: 180, y: 180, width: 1, height: 1)
 
     private var emptyState: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "doc.richtext")
-                .font(.system(size: 52, weight: .light))
-                .foregroundStyle(.tertiary)
-            Text("Open a PDF to get started")
-                .font(.title3.weight(.medium))
-            Text("Drag a PDF here, or choose one from disk.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            Button("Open PDF…") {
-                isImporterPresented = true
-            }
-            .buttonStyle(
-                ReaderInteractiveButtonStyle(
-                    isProminent: true,
-                    insets: EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16)
-                )
-            )
-            .keyboardShortcut("o", modifiers: .command)
+        GeometryReader { geometry in
+            // Ten recent documents occupy two rows. Short windows shrink the
+            // page previews and the surrounding spacing; if that still does
+            // not fit, the page scrolls instead of clipping the second row.
+            let compact = geometry.size.height < 620
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(spacing: compact ? 10 : 16) {
+                    Image(systemName: "doc.richtext")
+                        .font(.system(size: compact ? 40 : 52, weight: .light))
+                        .foregroundStyle(.tertiary)
+                    Text("Open a PDF to get started")
+                        .font(.title3.weight(.medium))
+                    Text("Drag a PDF here, or choose one from disk.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Button("Open PDF…") {
+                        isImporterPresented = true
+                    }
+                    .buttonStyle(
+                        ReaderInteractiveButtonStyle(
+                            isProminent: true,
+                            insets: EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16)
+                        )
+                    )
+                    .keyboardShortcut("o", modifiers: .command)
 
-            if !recentDocuments.items.isEmpty {
-                RecentDocumentsGrid(
-                    store: recentDocuments,
-                    onOpen: { requestOpenRecent($0) },
-                    onRelink: { beginRecentRelink($0) }
+                    if !recentDocuments.items.isEmpty {
+                        RecentDocumentsGrid(
+                            store: recentDocuments,
+                            onOpen: { requestOpenRecent($0) },
+                            onRelink: { beginRecentRelink($0) },
+                            compact: compact
+                        )
+                        .padding(.top, compact ? 4 : 14)
+                    }
+                }
+                // Centres the page while it fits, and grows into a scrollable
+                // content area when the window becomes too short.
+                .frame(
+                    maxWidth: .infinity,
+                    minHeight: geometry.size.height,
+                    alignment: .center
                 )
-                .padding(.top, 14)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
