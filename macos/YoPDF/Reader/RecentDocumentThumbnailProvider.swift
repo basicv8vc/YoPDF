@@ -120,6 +120,25 @@ final class RecentDocumentThumbnailProvider {
         return stale.count
     }
 
+    /// Drops every cached preview of one entry — directory and memory. Used
+    /// after a relink: the entry keeps its UUID, so pruning rightly keeps its
+    /// directory, but the preview inside belongs to the file the entry no
+    /// longer points at. Deleting it means the old page cannot outlive the
+    /// relink even when the grid stays hidden and never renders the new file.
+    @discardableResult
+    func invalidate(id: UUID) -> Bool {
+        let itemDirectory = directory.appendingPathComponent(
+            RecentDocumentThumbnailCachePolicy.directoryName(for: id),
+            isDirectory: true
+        )
+        let existed = fileManager.fileExists(atPath: itemDirectory.path)
+        try? fileManager.removeItem(at: itemDirectory)
+        // The in-memory key includes the stamp, which is not known here; like
+        // prune, drop everything and let survivors reload from disk.
+        memory.removeAllObjects()
+        return existed
+    }
+
     private static func stamp(for url: URL?, fileManager: FileManager) -> String {
         guard let url else {
             return RecentDocumentThumbnailCachePolicy.stamp(

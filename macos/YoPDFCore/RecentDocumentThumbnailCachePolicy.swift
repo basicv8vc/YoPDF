@@ -21,6 +21,12 @@ public enum RecentDocumentThumbnailCachePolicy {
     /// serving the previous page image. The volume file identifier separates
     /// two *different* files that share size and date — exactly what a relink
     /// to a replacement written in the same second produces.
+    ///
+    /// Known limitation: `fileIdentifier` is stable per volume, but not
+    /// guaranteed across filesystems and mount situations. An unstable
+    /// identifier only costs a cache miss and re-render; a true cross-volume
+    /// collision (same identifier, size and microsecond date) would need a
+    /// path-based fallback, deliberately left out for now.
     public static func stamp(
         modificationDate: Date?, fileSize: Int64?, fileIdentifier: UInt64? = nil
     ) -> String {

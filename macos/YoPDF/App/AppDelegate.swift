@@ -44,10 +44,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// run, so this cleanup cannot be outlived by any window lifecycle.
     private func installRecentThumbnailCacheJanitor() {
         let store = RecentDocumentsStore.shared
-        store.itemsDidChange = { items in
-            RecentDocumentThumbnailProvider.shared.prune(
-                keeping: Set(items.map(\.id))
-            )
+        store.itemsDidChange = { change, items in
+            let provider = RecentDocumentThumbnailProvider.shared
+            provider.prune(keeping: Set(items.map(\.id)))
+            // Pruning keys on UUIDs, and a relink keeps the entry's UUID —
+            // so the old file's preview would survive pruning inside a
+            // directory that still has a rightful owner. A relink therefore
+            // drops that entry's previews outright.
+            if case .relinked(let id) = change {
+                provider.invalidate(id: id)
+            }
         }
         // Previews left behind by a previous session — or by a Clear Menu
         // that ran while the app had no windows — are removed once at launch,

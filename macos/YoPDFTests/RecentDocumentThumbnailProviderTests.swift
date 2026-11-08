@@ -153,7 +153,8 @@ final class RecentDocumentThumbnailProviderTests: XCTestCase {
 
     /// Clear Menu with every window closed relies on the store's change hook
     /// reaching the prune: no grid and no window observer exists then. The
-    /// hook must fire with the post-change list for every membership change.
+    /// hook must fire with the change kind and the post-change list for every
+    /// membership change.
     func testStoreChangeHookFiresForRemovalClearAndOpen() throws {
         let suiteName = "YoPDFStoreHookTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -163,16 +164,93 @@ final class RecentDocumentThumbnailProviderTests: XCTestCase {
             defaults: defaults,
             bookmarkDataProvider: { _ in Data([1, 2, 3]) }
         )
-        var observed: [[RecentDocument]] = []
-        store.itemsDidChange = { observed.append($0) }
+        var observed: [(RecentDocumentsListChange, Int)] = []
+        store.itemsDidChange = { change, items in
+            observed.append((change, items.count))
+        }
 
         XCTAssertTrue(store.recordOpened(URL(fileURLWithPath: "/tmp/hook-sample.pdf")))
         store.remove(store.items[0])
         XCTAssertTrue(store.recordOpened(URL(fileURLWithPath: "/tmp/hook-sample.pdf")))
         store.clear()
 
-        XCTAssertEqual(observed.count, 4)
-        XCTAssertEqual(observed.map(\.count), [1, 0, 1, 0])
+        XCTAssertEqual(observed.map(\.0), [.opened, .removed, .opened, .cleared])
+        XCTAssertEqual(observed.map(\.1), [1, 0, 1, 0])
+    }
+
+    /// A relink keeps the entry's UUID, so pruning keeps its cache directory;
+    /// the preview inside belongs to the file the entry no longer points at.
+    /// The relink hook must drop that entry's previews outright.
+    func testRelinkDropsTheOldPreviewWhileTheGridIsHidden() async throws {
+        let suiteName = "YoPDFRelinkHookTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = RecentDocumentsStore(
+            defaults: defaults,
+            bookmarkDataProvider: { _ in Data([4, 5, 6]) }
+        )
+        let provider = RecentDocumentThumbnailProvider(directory: root)
+        // The same wiring AppDelegate installs for the whole app lifetime.
+        store.itemsDidChange = { change, items in
+            provider.prune(keeping: Set(items.map(\.id)))
+            if case .relinked(let id) = change {
+                provider.invalidate(id: id)
+            }
+        }
+
+        store.recordOpened(pdfURL)
+        guard let entry = store.items.first else {
+            return XCTFail("the opened file must appear in the list")
+        }
+        _ = await provider.image(for: entry, url: pdfURL)
+        let itemDirectory = root.appendingPathComponent(
+            "YoPDF/RecentThumbnails/\(entry.id.uuidString)", isDirectory: true
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: itemDirectory.path),
+            "precondition: the first file's preview is cached"
+        )
+
+        // Relink to a different PDF; the grid stays hidden afterwards, so no
+        // render of the replacement ever runs in this scenario.
+        let replacementURL = root.appendingPathComponent("replacement.pdf")
+        try Self.writeOnePagePDF(to: replacementURL, gray: 0.15)
+        try store.relink(entry, to: replacementURL)
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: itemDirectory.path),
+            "the previous file's preview must not survive the relink"
+        )
+        let cacheRoot = root.appendingPathComponent("YoPDF/RecentThumbnails")
+        XCTAssertTrue(
+            (try? FileManager.default.contentsOfDirectory(atPath: cacheRoot.path))?.isEmpty ?? false,
+            "nothing else may be left behind either"
+        )
+    }
+
+    /// After an invalidation the entry can be cached again: the next render
+    /// writes a fresh preview, and no stale image is served meanwhile.
+    func testInvalidatedEntryRendersAndCachesAgain() async throws {
+        let provider = RecentDocumentThumbnailProvider(directory: root)
+        let item = Self.makeItem(id: UUID(), path: pdfURL.path)
+
+        _ = await provider.image(for: item, url: pdfURL)
+        let itemDirectory = root.appendingPathComponent(
+            "YoPDF/RecentThumbnails/\(item.id.uuidString)", isDirectory: true
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: itemDirectory.path))
+
+        XCTAssertTrue(provider.invalidate(id: item.id))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: itemDirectory.path))
+        XCTAssertFalse(
+            provider.invalidate(id: item.id),
+            "a second invalidation has nothing left to remove"
+        )
+
+        let image = await provider.image(for: item, url: pdfURL)
+        XCTAssertNotNil(image)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: itemDirectory.path))
     }
 
     // MARK: - Pruning
