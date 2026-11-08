@@ -105,15 +105,32 @@ final class NoteHoverCardView: NSView {
     private func drawIcon(_ motif: NoteMotif, in rect: CGRect) {
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current?.imageInterpolation = .high
+        // The card is flipped so text can be laid out top-down, but the short
+        // `NSImage.draw(in:from:operation:fraction:)` overload ignores that and
+        // paints the artwork upside down. Every image here has to be drawn with
+        // `respectFlipped: true`. The sticker on the page can use the short
+        // overload only because its overlay is not flipped.
         if let name = motif.assetName, let image = NSImage(named: NSImage.Name(name)) {
-            image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1)
-        } else {
-            NSImage(
-                systemSymbolName: NoteStickerStyle.defaultSymbol,
-                accessibilityDescription: nil
-            )?
-            .withSymbolConfiguration(.init(paletteColors: [.brown]))?
-            .draw(in: rect.insetBy(dx: 1, dy: 1))
+            image.draw(
+                in: rect,
+                from: .zero,
+                operation: .sourceOver,
+                fraction: 1,
+                respectFlipped: true,
+                hints: nil
+            )
+        } else if let symbol = NSImage(
+            systemSymbolName: NoteStickerStyle.defaultSymbol,
+            accessibilityDescription: nil
+        )?.withSymbolConfiguration(.init(paletteColors: [.brown])) {
+            symbol.draw(
+                in: rect.insetBy(dx: 1, dy: 1),
+                from: .zero,
+                operation: .sourceOver,
+                fraction: 1,
+                respectFlipped: true,
+                hints: nil
+            )
         }
         NSGraphicsContext.restoreGraphicsState()
     }
