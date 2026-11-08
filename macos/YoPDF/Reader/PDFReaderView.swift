@@ -32,49 +32,71 @@ private struct ReaderPDFDropDestination: ViewModifier {
     }
 }
 
+/// Reports each tab's layout frame in the tab strip's own coordinate space so a
+/// drag can decide which slot the pointer is over.
+private struct WorkspaceTabFramePreferenceKey: PreferenceKey {
+    static let defaultValue: [UUID: CGRect] = [:]
+
+    static func reduce(value: inout [UUID: CGRect], nextValue: () -> [UUID: CGRect]) {
+        value.merge(nextValue()) { _, new in new }
+    }
+}
+
 private struct WorkspaceTabStrip: View {
     @ObservedObject var workspace: WorkspaceWindowModel
     let closeTab: (UUID) -> Void
 
+    /// Layout frames of the tabs, keyed by tab ID. Reported by each tab and
+    /// read only once, when a drag starts.
+    @State private var tabFrames: [UUID: CGRect] = [:]
+    /// Visual state of an in-flight drag. Deliberately plain `@State`, not
+    /// `@GestureState`: the commit must clear it inside the same
+    /// `withAnimation` transaction that reorders the strip, so the offset
+    /// unwind and the relayout cancel each other frame by frame. SwiftUI's
+    /// own reset of a `@GestureState` lands in a separate transaction, which
+    /// made the two swapped tabs visibly bounce on release.
+    @State private var draggingTabID: UUID?
+    /// Horizontal distance the dragged tab has travelled from its slot.
+    @State private var dragTranslation: CGFloat = 0
+    /// Slot the dragged tab would land in, counted among the other tabs. While
+    /// a drag is in flight this also drives the live reflow of those tabs.
+    @State private var dropIndex = 0
+    /// Frozen geometry from the start of the drag. Deriving drop slots from
+    /// frames that the reflow is currently moving would feed the layout back
+    /// into the hit test and make the strip oscillate.
+    @State private var dragSnapshot: DragSnapshot?
+    /// Tracks whether SwiftUI still considers the drag gesture alive. Its
+    /// automatic reset is the only cancellation signal a `DragGesture`
+    /// offers: `.onEnded` is guaranteed only for successful ends, so a
+    /// gesture cancelled by the system never reaches it and would otherwise
+    /// leave the visual state above dangling — the defect the review flagged.
+    @GestureState private var gestureTracksDrag = false
+
+    private struct DragSnapshot {
+        let tabIDs: [UUID]
+        let slots: [UUID: WorkspaceTabReflow.Slot]
+        let draggingTabID: UUID
+    }
+
+    /// Pointer positions and reported tab bounds share one space so they can be
+    /// compared directly, even while the strip is scrolled.
+    private static let stripSpace = "workspace-tab-strip"
+    private static let tabSpacing: CGFloat = 4
+    /// One animation for both the live reflow and the release commit, so the
+    /// offsets unwinding and the layout change cancel each other smoothly.
+    private static let reorderAnimation = Animation.easeOut(duration: 0.18)
+
     var body: some View {
         HStack(spacing: 8) {
             ScrollView(.horizontal) {
-                HStack(spacing: 4) {
+                HStack(spacing: Self.tabSpacing) {
                     ForEach(workspace.tabs) { tab in
-                        let isActive = tab.id == workspace.activeTabID
-                        HStack(spacing: 2) {
-                            Button {
-                                workspace.activate(tabID: tab.id)
-                            } label: {
-                                Text(tab.title)
-                                    .lineLimit(1)
-                                    .frame(maxWidth: 190, alignment: .leading)
-                                    .padding(.leading, 10)
-                                    .padding(.vertical, 6)
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel(tab.title)
-                            .accessibilityIdentifier("workspace-tab-\(tab.id.uuidString)")
-                            .accessibilityAddTraits(isActive ? .isSelected : [])
-
-                            if workspace.tabs.count > 1 {
-                                Button {
-                                    closeTab(tab.id)
-                                } label: {
-                                    Image(systemName: "xmark")
-                                        .font(.system(size: 9, weight: .semibold))
-                                        .frame(width: 22, height: 22)
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel("Close \(tab.title)")
-                                .accessibilityIdentifier("workspace-tab-close-\(tab.id.uuidString)")
-                            }
-                        }
-                        .background(
-                            isActive ? Color.accentColor.opacity(0.16) : Color.clear,
-                            in: RoundedRectangle(cornerRadius: 7)
-                        )
+                        tabView(tab)
                     }
+                }
+                .coordinateSpace(.named(Self.stripSpace))
+                .onPreferenceChange(WorkspaceTabFramePreferenceKey.self) { frames in
+                    tabFrames = frames
                 }
             }
             .scrollIndicators(.hidden)
@@ -92,6 +114,190 @@ private struct WorkspaceTabStrip: View {
         .padding(.horizontal, 10)
         .frame(height: 38)
         .background(.bar)
+        .onChange(of: gestureTracksDrag) { _, tracked in
+            guard !tracked else { return }
+            // A successful release runs .onEnded first, which clears the
+            // visual state inside its own commit transaction; the deferred
+            // check below therefore only fires for a cancelled gesture.
+            // Deferring by one runloop turn is what keeps the two exit paths
+            // distinguishable, because the gesture-state reset and .onEnded
+            // happen within the same turn.
+            DispatchQueue.main.async {
+                guard draggingTabID != nil else { return }
+                withAnimation(Self.reorderAnimation) {
+                    draggingTabID = nil
+                    dragTranslation = 0
+                    dropIndex = 0
+                    dragSnapshot = nil
+                }
+            }
+        }
+    }
+
+    // MARK: - Tabs
+
+    private func tabView(_ tab: WorkspaceTabSession) -> some View {
+        let isActive = tab.id == workspace.activeTabID
+        let isDragging = draggingTabID == tab.id
+
+        return HStack(spacing: 2) {
+            Button {
+                workspace.activate(tabID: tab.id)
+            } label: {
+                Text(tab.title)
+                    .lineLimit(1)
+                    .frame(maxWidth: 190, alignment: .leading)
+                    .padding(.leading, 10)
+                    .padding(.vertical, 6)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(tab.title)
+            .accessibilityIdentifier("workspace-tab-\(tab.id.uuidString)")
+            .accessibilityAddTraits(isActive ? .isSelected : [])
+
+            if workspace.tabs.count > 1 {
+                Button {
+                    closeTab(tab.id)
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .semibold))
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close \(tab.title)")
+                .accessibilityIdentifier("workspace-tab-close-\(tab.id.uuidString)")
+            }
+        }
+        // The whole capsule is the drag handle, not just the title text: the
+        // rounded background and the empty space next to the label are hit
+        // targets too. A simultaneous gesture leaves a plain click to the title
+        // Button and needs 4 points of travel before a drag starts, so the
+        // close Button keeps its own action instead of being swallowed.
+        .contentShape(Rectangle())
+        .simultaneousGesture(reorderGesture(for: tab))
+        .contextMenu { tabContextMenu(for: tab) }
+        .background(
+            isActive ? Color.accentColor.opacity(0.16) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 7)
+        )
+        .background(
+            GeometryReader { geometry in
+                Color.clear.preference(
+                    key: WorkspaceTabFramePreferenceKey.self,
+                    value: [tab.id: geometry.frame(in: .named(Self.stripSpace))]
+                )
+            }
+        )
+        // The lifted tab stays under the pointer while the other tabs slide
+        // into the order the drop will produce. Offsets never change a layout
+        // slot, so the frozen measurement remains valid for the whole drag.
+        .offset(x: isDragging ? dragTranslation : reflowOffset(for: tab.id))
+        // Only the stationary tabs animate into their new slots; the lifted
+        // tab must track the pointer with no easing lag.
+        .animation(isDragging ? nil : Self.reorderAnimation, value: dropIndex)
+        .shadow(color: .black.opacity(isDragging ? 0.16 : 0), radius: 6, y: 2)
+        .zIndex(isDragging ? 1 : 0)
+    }
+
+    /// Right-click counterpart of the keyboard commands. It moves the tab that
+    /// was clicked, which need not be the active one, and leaves selection alone.
+    @ViewBuilder
+    private func tabContextMenu(for tab: WorkspaceTabSession) -> some View {
+        Button("Move Tab Left") {
+            _ = workspace.moveTab(tabID: tab.id, direction: .previous)
+        }
+        .disabled(workspace.tabs.count < 2)
+
+        Button("Move Tab Right") {
+            _ = workspace.moveTab(tabID: tab.id, direction: .next)
+        }
+        .disabled(workspace.tabs.count < 2)
+    }
+
+    private func reorderGesture(for tab: WorkspaceTabSession) -> some Gesture {
+        DragGesture(minimumDistance: 4, coordinateSpace: .named(Self.stripSpace))
+            .updating($gestureTracksDrag) { _, state, _ in
+                state = true
+            }
+            .onChanged { value in
+                guard workspace.tabs.count > 1 else { return }
+                if draggingTabID != tab.id || dragSnapshot == nil {
+                    // Freeze the geometry before any reflow starts. Without a
+                    // complete measurement the drag simply never begins.
+                    guard let snapshot = makeSnapshot(dragging: tab.id) else { return }
+                    dragSnapshot = snapshot
+                    draggingTabID = tab.id
+                }
+                guard let snapshot = dragSnapshot else { return }
+                dragTranslation = value.translation.width
+                dropIndex = insertionIndex(forPointerX: value.location.x, in: snapshot)
+            }
+            .onEnded { value in
+                guard draggingTabID == tab.id, let snapshot = dragSnapshot else { return }
+                let target = insertionIndex(forPointerX: value.location.x, in: snapshot)
+                let currentIndex = workspace.tabs.firstIndex { $0.id == tab.id }
+                // Unwinding the offsets and committing the order in the same
+                // transaction makes the two movements cancel out exactly: the
+                // stationary tabs never move while the lifted one glides into
+                // its slot. Splitting the unwind and the relayout across
+                // transactions is what made the swapped tabs bounce on
+                // release, so this block must stay atomic.
+                withAnimation(Self.reorderAnimation) {
+                    draggingTabID = nil
+                    dragTranslation = 0
+                    dropIndex = 0
+                    dragSnapshot = nil
+                    if currentIndex != target {
+                        workspace.moveTab(tabID: tab.id, toInsertionIndex: target)
+                    }
+                    // A non-active tab is selected only on release, so the PDF
+                    // being read does not change underneath a drag in progress.
+                    workspace.activate(tabID: tab.id)
+                }
+            }
+    }
+
+    // MARK: - Drop placement
+
+    /// Freezes the strip geometry before any reflow happens. A missing or
+    /// incomplete measurement disables the drag rather than guessing a slot.
+    private func makeSnapshot(dragging tabID: UUID) -> DragSnapshot? {
+        let tabIDs = workspace.tabs.map(\.id)
+        let slots: [UUID: WorkspaceTabReflow.Slot] = Dictionary(
+            uniqueKeysWithValues: tabIDs.compactMap { id in
+                tabFrames[id].map {
+                    (id, WorkspaceTabReflow.Slot(minX: Double($0.minX), width: Double($0.width)))
+                }
+            }
+        )
+        guard slots.count == tabIDs.count else { return nil }
+        return DragSnapshot(tabIDs: tabIDs, slots: slots, draggingTabID: tabID)
+    }
+
+    /// Counts the tabs whose midpoint the pointer has passed, using the frozen
+    /// snapshot. The dragged tab is excluded, so the result is directly the
+    /// insertion index in the strip once it has been taken out.
+    private func insertionIndex(forPointerX pointerX: CGFloat, in snapshot: DragSnapshot) -> Int {
+        WorkspaceTabReflow.insertionIndex(
+            pointerX: Double(pointerX),
+            tabIDs: snapshot.tabIDs,
+            slots: snapshot.slots,
+            draggingTabID: snapshot.draggingTabID
+        )
+    }
+
+    /// How far a stationary tab must slide to show the in-flight ordering.
+    private func reflowOffset(for tabID: UUID) -> CGFloat {
+        guard let snapshot = dragSnapshot, draggingTabID != nil else { return 0 }
+        let offsets = WorkspaceTabReflow.offsets(
+            tabIDs: snapshot.tabIDs,
+            slots: snapshot.slots,
+            spacing: Double(Self.tabSpacing),
+            draggingTabID: snapshot.draggingTabID,
+            insertionIndex: dropIndex
+        )
+        return CGFloat(offsets[tabID] ?? 0)
     }
 }
 
@@ -365,19 +571,7 @@ struct PDFReaderView: View {
     }
 
     private var focusedReader: some View {
-        lifecycleReader
-            .focusedSceneValue(\.documentModel, model)
-            .focusedSceneValue(\.openDocument, { isImporterPresented = true })
-            .focusedSceneValue(\.newWorkspaceTab, { _ = workspace.createTab() })
-            .focusedSceneValue(\.closeWorkspaceTab, { requestCloseTab(workspace.activeTabID) })
-            .focusedSceneValue(
-                \.selectPreviousWorkspaceTab,
-                { workspace.activateAdjacentTab(direction: .previous) }
-            )
-            .focusedSceneValue(
-                \.selectNextWorkspaceTab,
-                { workspace.activateAdjacentTab(direction: .next) }
-            )
+        tabFocusedReader
             .focusedSceneValue(\.openRecentDocument, { requestOpenRecent($0) })
             .focusedSceneValue(\.saveDocument, { requestSave() })
             .focusedSceneValue(\.saveDocumentAs, { requestSaveAs() })
@@ -395,6 +589,31 @@ struct PDFReaderView: View {
                     select: { showSidebarSection($0) }
                 )
             )
+    }
+
+    /// Tab commands live in their own link of the chain: one very long
+    /// `.focusedSceneValue` expression makes Swift's type checker time out.
+    private var tabFocusedReader: some View {
+        lifecycleReader
+            .focusedSceneValue(\.documentModel, model)
+            .focusedSceneValue(\.openDocument, { isImporterPresented = true })
+            .focusedSceneValue(\.newWorkspaceTab, { _ = workspace.createTab() })
+            .focusedSceneValue(\.closeWorkspaceTab, { requestCloseTab(workspace.activeTabID) })
+            .focusedSceneValue(
+                \.selectPreviousWorkspaceTab,
+                { workspace.activateAdjacentTab(direction: .previous) }
+            )
+            .focusedSceneValue(
+                \.selectNextWorkspaceTab,
+                { workspace.activateAdjacentTab(direction: .next) }
+            )
+            .focusedSceneValue(\.workspaceTabMove, workspaceTabMoveActions)
+    }
+
+    private var workspaceTabMoveActions: WorkspaceTabMoveActions {
+        WorkspaceTabMoveActions(tabCount: workspace.tabs.count) { direction in
+            _ = workspace.moveActiveTab(direction: direction)
+        }
     }
 
     private var lifecycleReader: some View {

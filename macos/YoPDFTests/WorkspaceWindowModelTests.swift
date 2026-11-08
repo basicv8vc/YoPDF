@@ -430,4 +430,72 @@ final class WorkspaceWindowModelTests: XCTestCase {
         frontWindow.closeAllSessions()
         backgroundWindow.closeAllSessions()
     }
+
+    /// Dragging a tab only reorders the strip: every session, its document, and
+    /// the active selection must be the same objects before and after.
+    func testMovingATabReordersTheStripWithoutRebuildingSessions() throws {
+        let firstURL = try PDFFixtureFactory.writeTemporaryPDF(named: "workspace-reorder-first")
+        let secondURL = try PDFFixtureFactory.writeTemporaryPDF(named: "workspace-reorder-second")
+        defer {
+            try? FileManager.default.removeItem(at: firstURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: secondURL.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        guard case let .opened(firstID) = workspace.open(firstURL),
+              case let .opened(secondID) = workspace.open(secondURL)
+        else {
+            return XCTFail("Both fixture PDFs should open in their own tabs.")
+        }
+        let firstSession = try XCTUnwrap(workspace.session(tabID: firstID))
+        let secondSession = try XCTUnwrap(workspace.session(tabID: secondID))
+        XCTAssertEqual(workspace.tabs.map(\.id), [firstID, secondID])
+
+        XCTAssertTrue(workspace.moveTab(tabID: secondID, toInsertionIndex: 0))
+        XCTAssertEqual(workspace.tabs.map(\.id), [secondID, firstID])
+        XCTAssertEqual(workspace.activeTabID, secondID)
+        XCTAssertTrue(workspace.session(tabID: firstID) === firstSession)
+        XCTAssertTrue(workspace.session(tabID: secondID) === secondSession)
+        XCTAssertEqual(firstSession.model.fileURL, firstURL)
+
+        workspace.closeAllSessions()
+    }
+
+    /// Keyboard and right-click moves share the drag's model path: the tab
+    /// order changes while every PDF session and the visible document survive.
+    func testMovingATabByDirectionKeepsSessionsAndSelection() throws {
+        let firstURL = try PDFFixtureFactory.writeTemporaryPDF(named: "workspace-direction-first")
+        let secondURL = try PDFFixtureFactory.writeTemporaryPDF(named: "workspace-direction-second")
+        defer {
+            try? FileManager.default.removeItem(at: firstURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: secondURL.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        guard case let .opened(firstID) = workspace.open(firstURL),
+              case let .opened(secondID) = workspace.open(secondURL)
+        else {
+            return XCTFail("Both fixture PDFs should open in their own tabs.")
+        }
+        let firstSession = try XCTUnwrap(workspace.session(tabID: firstID))
+        let secondSession = try XCTUnwrap(workspace.session(tabID: secondID))
+        XCTAssertEqual(workspace.tabs.map(\.id), [firstID, secondID])
+
+        // A context-menu move targets the tab that was right-clicked, which
+        // need not be the selected one, and must not switch the visible PDF.
+        XCTAssertTrue(workspace.moveTab(tabID: firstID, direction: .previous))
+        XCTAssertEqual(workspace.tabs.map(\.id), [secondID, firstID])
+        XCTAssertEqual(workspace.activeTabID, secondID)
+
+        // The menu-bar shortcut instead moves the selected tab.
+        XCTAssertTrue(workspace.moveActiveTab(direction: .next))
+        XCTAssertEqual(workspace.tabs.map(\.id), [firstID, secondID])
+        XCTAssertEqual(workspace.activeTabID, secondID)
+        XCTAssertTrue(workspace.session(tabID: firstID) === firstSession)
+        XCTAssertTrue(workspace.session(tabID: secondID) === secondSession)
+        XCTAssertEqual(firstSession.model.fileURL, firstURL)
+        XCTAssertEqual(secondSession.model.fileURL, secondURL)
+
+        workspace.closeAllSessions()
+    }
 }
