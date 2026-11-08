@@ -121,6 +121,9 @@ targets:
       - path: YoPDF/App/WorkspaceWindowModel.swift
       - path: YoPDF/Reader/ReaderNavigationState.swift
       - path: YoPDF/Reader/ReaderSidebarItems.swift
+      # The preview provider is unit tested because its lifecycle rules (what
+      # may be written back, what a prune must remove) guard sensitive data.
+      - path: YoPDF/Reader/RecentDocumentThumbnailProvider.swift
       # The sticker tests load the real Asset Catalog. Adding it to the test
       # bundle keeps them independent of where the .app was built; the separate
       # verification script checks the actual application bundle.

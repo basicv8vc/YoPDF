@@ -15,9 +15,25 @@ public enum RecentDocumentThumbnailCachePolicy {
     /// A file-name-safe stamp for a source file's current state. Missing
     /// attributes produce a weak stamp: the preview is still cached, but a
     /// later readable inspection replaces it.
+    ///
+    /// The date keeps microsecond precision: two same-size writes within the
+    /// same second must not share one cache key, or an edited file would keep
+    /// serving the previous page image.
     public static func stamp(modificationDate: Date?, fileSize: Int64?) -> String {
         guard let modificationDate, let fileSize else { return "unknown" }
-        return "\(Int(modificationDate.timeIntervalSince1970))-\(fileSize)"
+        let microseconds = Int64(
+            (modificationDate.timeIntervalSince1970 * 1_000_000).rounded()
+        )
+        return "\(microseconds)-\(fileSize)"
+    }
+
+    /// Identity of the work that loads one entry's preview. A relink keeps the
+    /// entry's UUID but points its bookmark at a different file, so the loading
+    /// task must also depend on the known path and a bookmark fingerprint —
+    /// otherwise a window that did not perform the relink keeps showing the
+    /// previous document's image under the new name.
+    public static func renderIdentity(for item: RecentDocument) -> String {
+        "\(item.id.uuidString)|\(item.lastKnownPath)|\(item.bookmarkData.hashValue)"
     }
 
     public static func fileName(stamp: String) -> String {

@@ -16,16 +16,30 @@ import YoPDFCore
 @MainActor
 final class RecentDocumentThumbnailProvider {
 
-    static let shared = RecentDocumentThumbnailProvider()
+    static let shared = RecentDocumentThumbnailProvider(
+        isItemKnown: { id in
+            RecentDocumentsStore.shared.items.contains { $0.id == id }
+        }
+    )
 
     private let renderer = FirstPageRenderer()
     private let memory = NSCache<NSString, NSImage>()
     private let directory: URL
     private let fileManager: FileManager
+    /// Reports whether a recent entry still exists. A render that finishes
+    /// after its entry was removed (or the list cleared) must not write its
+    /// image back to disk.
+    private let isItemKnown: @MainActor (UUID) -> Bool
 
-    init(fileManager: FileManager = .default) {
+    init(
+        directory: URL? = nil,
+        fileManager: FileManager = .default,
+        isItemKnown: @escaping @MainActor (UUID) -> Bool = { _ in true }
+    ) {
         self.fileManager = fileManager
-        let base = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first
+        self.isItemKnown = isItemKnown
+        let base = directory
+            ?? fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? fileManager.temporaryDirectory
         let cacheDirectory = base.appendingPathComponent(
             "YoPDF/RecentThumbnails", isDirectory: true
@@ -36,7 +50,7 @@ final class RecentDocumentThumbnailProvider {
         try? (cacheDirectory as NSURL).setResourceValue(
             true, forKey: .isExcludedFromBackupKey
         )
-        directory = cacheDirectory
+        self.directory = cacheDirectory
         memory.countLimit = 24
     }
 
@@ -64,6 +78,14 @@ final class RecentDocumentThumbnailProvider {
 
         guard let data = await renderer.render(url: url) else { return nil }
 
+        // The render is awaited, so the entry may have been removed or the
+        // list cleared while it was in flight. Such an image is returned to a
+        // cell that no longer exists; writing it back would recreate the very
+        // cache files a prune just deleted.
+        guard isItemKnown(item.id) else {
+            return NSImage(data: data)
+        }
+
         // A new stamp supersedes every older preview for the same item.
         try? fileManager.removeItem(at: itemDirectory)
         try? fileManager.createDirectory(
@@ -75,14 +97,22 @@ final class RecentDocumentThumbnailProvider {
         return image
     }
 
-    /// Drops previews whose recent entry was removed or cleared.
-    func prune(keeping ids: Set<UUID>) {
+    /// Drops previews whose recent entry was removed or cleared, together
+    /// with their in-memory copies. Returns the number of removed entries so
+    /// callers can log or react, and so tests can assert the cleanup.
+    @discardableResult
+    func prune(keeping ids: Set<UUID>) -> Int {
         let stale = RecentDocumentThumbnailCachePolicy.staleDirectories(
             in: directory, keeping: ids, fileManager: fileManager
         )
         for url in stale {
             try? fileManager.removeItem(at: url)
         }
+        guard !stale.isEmpty else { return 0 }
+        // NSCache cannot be enumerated per key, so a removal drops every
+        // cached image; the survivors are cheap to reload from disk.
+        memory.removeAllObjects()
+        return stale.count
     }
 
     private static func stamp(for url: URL?, fileManager: FileManager) -> String {

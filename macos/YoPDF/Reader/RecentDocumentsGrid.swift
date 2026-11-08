@@ -43,7 +43,11 @@ struct RecentDocumentsGrid: View {
         }
         .frame(maxWidth: 760, alignment: .center)
         .frame(maxWidth: .infinity, alignment: .center)
-        .task {
+        // Re-runs whenever the list changes, so removing one entry prunes its
+        // preview immediately. The reader window also prunes on change, which
+        // covers Clear Menu: there the grid disappears with the list, so this
+        // task would never run again.
+        .task(id: store.items) {
             RecentDocumentThumbnailProvider.shared.prune(
                 keeping: Set(store.items.map(\.id))
             )
@@ -114,9 +118,11 @@ private struct RecentDocumentCell: View {
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
-        .task(id: item.id) {
+        .task(id: RecentDocumentThumbnailCachePolicy.renderIdentity(for: item)) {
             // Resolving the bookmark is main-actor work; rendering happens in
-            // the provider's actor and never blocks the empty state.
+            // the provider's actor and never blocks the empty state. The task
+            // identity includes the path and bookmark fingerprint, so a relink
+            // (which keeps the entry's UUID) reloads the preview everywhere.
             let url = try? store.resolveURL(for: item)
             image = await RecentDocumentThumbnailProvider.shared.image(
                 for: item, url: url

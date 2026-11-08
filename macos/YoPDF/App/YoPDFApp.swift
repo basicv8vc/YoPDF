@@ -72,5 +72,16 @@ private struct ReaderWindow: View {
                 openWindowAction(id: "reader")
             }
         }
+        // Recent-document previews are sensitive (first pages of the user's
+        // files), so their cache must follow the list everywhere it changes.
+        // The grid prunes while it is visible; this observer covers the cases
+        // where the grid is gone — File → Open Recent → Clear Menu removes
+        // the empty state together with the list, and an open document hides
+        // it entirely. Clearing must not leave preview images on disk.
+        .onChange(of: recentDocuments.items) { _, items in
+            RecentDocumentThumbnailProvider.shared.prune(
+                keeping: Set(items.map(\.id))
+            )
+        }
     }
 }

@@ -34,6 +34,63 @@ final class RecentDocumentThumbnailCachePolicyTests: XCTestCase {
         XCTAssertNotEqual(original, resized)
     }
 
+    /// Regression: two equal-size writes within the same wall-clock second
+    /// used to collapse onto one stamp and keep serving the stale preview.
+    func testStampSeparatesWritesWithinTheSameSecond() {
+        let first = RecentDocumentThumbnailCachePolicy.stamp(
+            modificationDate: epoch.addingTimeInterval(0.25), fileSize: 4_096
+        )
+        let second = RecentDocumentThumbnailCachePolicy.stamp(
+            modificationDate: epoch.addingTimeInterval(0.75), fileSize: 4_096
+        )
+        XCTAssertNotEqual(first, second)
+    }
+
+    func testRenderIdentitySurvivesUnrelatedChanges() {
+        let item = RecentDocument(
+            displayName: "paper.pdf",
+            bookmarkData: Data([1, 2, 3]),
+            lastOpenedAt: Date(timeIntervalSince1970: 100),
+            lastKnownPath: "/tmp/paper.pdf"
+        )
+        var reread = item
+        reread.lastOpenedAt = Date(timeIntervalSince1970: 900)
+        reread.readingPosition.pageIndex = 4
+
+        XCTAssertEqual(
+            RecentDocumentThumbnailCachePolicy.renderIdentity(for: item),
+            RecentDocumentThumbnailCachePolicy.renderIdentity(for: reread)
+        )
+    }
+
+    /// A relink keeps the entry's UUID, so the loading task must depend on the
+    /// target path and bookmark as well — otherwise a window that did not
+    /// perform the relink keeps the previous document's preview.
+    func testRenderIdentityChangesWhenTheEntryIsRelinked() {
+        let item = RecentDocument(
+            displayName: "paper.pdf",
+            bookmarkData: Data([1, 2, 3]),
+            lastKnownPath: "/tmp/paper.pdf"
+        )
+
+        var movedToAnotherFile = item
+        movedToAnotherFile.lastKnownPath = "/tmp/other.pdf"
+        movedToAnotherFile.bookmarkData = Data([9, 9])
+
+        var samePathNewBookmark = item
+        samePathNewBookmark.bookmarkData = Data([7, 7, 7])
+
+        let identity = RecentDocumentThumbnailCachePolicy.renderIdentity(for: item)
+        XCTAssertNotEqual(
+            identity,
+            RecentDocumentThumbnailCachePolicy.renderIdentity(for: movedToAnotherFile)
+        )
+        XCTAssertNotEqual(
+            identity,
+            RecentDocumentThumbnailCachePolicy.renderIdentity(for: samePathNewBookmark)
+        )
+    }
+
     func testMissingAttributesFallBackToWeakStamp() {
         let weak = RecentDocumentThumbnailCachePolicy.stamp(
             modificationDate: nil, fileSize: nil
