@@ -72,11 +72,15 @@ final class WorkspaceTabReflowTests: XCTestCase {
         XCTAssertNil(result[second])
     }
 
-    /// A cancelled drag resets the gesture state to inactive and the pointer
-    /// back to wherever it was, which must reproduce the pre-drag layout: the
-    /// restore slot is the dragged tab's own position, and every stationary
-    /// tab's offset is zero no matter how far the drag had progressed.
-    func testCancelledDragRestoresTheOriginalLayout() {
+    /// Geometry precondition for a cancelled drag. Cancellation itself is
+    /// handled in the SwiftUI layer (a `@GestureState` flag flipping to
+    /// `false` clears the visual drag state without calling `moveTab`, so the
+    /// committed order is untouched by construction). What this test pins down
+    /// is the pure-geometry half: when the insertion index returns to the
+    /// dragged tab's own slot, every stationary tab's offset unwinds to zero —
+    /// so restoring the visuals requires nothing beyond dropping the snapshot.
+    /// The gesture-lifecycle behavior itself needs UI-level verification.
+    func testAbandonedDragSnapshotUnwindsToTheOriginalLayout() {
         // Mid-drag the strip could be showing any in-flight order...
         let inFlight = offsets(dragging: second, insertionIndex: 2)
         assertOffset(inFlight[third], equals: -124)
