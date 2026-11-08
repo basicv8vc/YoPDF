@@ -6,6 +6,15 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>YoPDF</title>
         <item>
+            <title>2026.11.8</title>
+            <pubDate>Sun, 08 Nov 2026 18:18:13 +0900</pubDate>
+            <link>https://github.com/basicv8vc/YoPDF/releases</link>
+            <sparkle:version>7</sparkle:version>
+            <sparkle:shortVersionString>2026.11.8</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.8/YoPDF-2026.11.8-build7-universal.dmg" length="6483660" type="application/octet-stream" sparkle:edSignature="LTlpZdTQxnuzBk90M7Bmj0vQy0TBrEZsUUFHkdbzky07+T+fn7SRCz0IRkNtV8sW8xlAqrH10puMzwqc0LsECQ=="/>
+        </item>
+        <item>
             <title>2026.11.7</title>
             <pubDate>Sat, 07 Nov 2026 22:17:16 +0900</pubDate>
             <link>https://github.com/basicv8vc/YoPDF/releases</link>
@@ -26,6 +35,6 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: S/EpG5ChdYAKRjb6x98FaEjKL+klX+lx+fLDNrk8doLl6vICAsPDE6u2EAyRSHn5ubRVkcj8qmf8y/aB+quIAA==
-length: 1825
+edSignature: kfxyjXYc/8Bx6w7PEoaL22+2NvXgfV6saNIOcGrFAVEa/erNrFJOV2c81koUClCRoCHnXzJczRFTbyjRfw7CAQ==
+length: 2523
 -->
