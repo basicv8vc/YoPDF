@@ -1200,30 +1200,11 @@ struct PDFReaderView: View {
             .keyboardShortcut("o", modifiers: .command)
 
             if !recentDocuments.items.isEmpty {
-                // The empty state is centre-aligned, so the recent rows use the
-                // same vertical axis as the icon and the Open PDF button.
-                VStack(alignment: .center, spacing: 7) {
-                    Text("Recent Documents")
-                        .font(.callout.weight(.medium))
-                        .foregroundStyle(.secondary)
-                    VStack(alignment: .center, spacing: 7) {
-                        ForEach(Array(recentDocuments.items.prefix(5))) { item in
-                            Button {
-                                requestOpenRecent(item)
-                            } label: {
-                                Text(item.displayName)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                                    .frame(maxWidth: .infinity, alignment: .center)
-                            }
-                            .buttonStyle(ReaderInteractiveButtonStyle(insets: .init()))
-                            .frame(maxWidth: .infinity, alignment: .center)
-                            .help(item.lastKnownPath)
-                        }
-                    }
-                }
-                .frame(maxWidth: 360, alignment: .center)
-                .frame(maxWidth: .infinity, alignment: .center)
+                RecentDocumentsGrid(
+                    store: recentDocuments,
+                    onOpen: { requestOpenRecent($0) },
+                    onRelink: { beginRecentRelink($0) }
+                )
                 .padding(.top, 14)
             }
         }
