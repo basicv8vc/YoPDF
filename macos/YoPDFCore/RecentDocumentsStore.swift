@@ -51,6 +51,20 @@ public enum RecentDocumentsError: Error, Equatable {
     case storageUnavailable
 }
 
+/// What the latest change to the recent list was. A relink keeps the entry's
+/// UUID, so consumers that key caches by UUID need the kind to know the
+/// entry's file identity changed underneath them.
+public enum RecentDocumentsListChange: Equatable, Sendable {
+    /// A file was opened: a new entry, or an existing one moved to the top.
+    case opened
+    /// An entry's bookmark was re-pointed at a different file (same UUID).
+    case relinked(UUID)
+    /// One entry was removed.
+    case removed
+    /// The whole list was cleared.
+    case cleared
+}
+
 /// Stores recent PDFs and reading positions in UserDefaults, using security-
 /// scoped bookmarks instead of a document database. The last-known path is a
 /// matching hint; it does not grant access to the file.
@@ -81,6 +95,16 @@ public final class RecentDocumentsStore: ObservableObject {
     /// An unreadable value is preserved until the user explicitly clears it;
     /// opening another PDF must not replace the only copy of unknown data.
     private var hasUnreadableStoredValue = false
+
+    /// Fired on the main actor whenever the *set* of entries changes — an
+    /// open, a relink, a removal, or Clear Menu. Reading-position updates do
+    /// not fire it. The app layer wires this to preview-cache pruning, which
+    /// must also run when no reader window exists to observe the store.
+    public var itemsDidChange: (@MainActor (RecentDocumentsListChange, [RecentDocument]) -> Void)?
+
+    private func notifyItemsChanged(_ change: RecentDocumentsListChange) {
+        itemsDidChange?(change, items)
+    }
 
     public init(
         defaults: UserDefaults = .standard,
@@ -172,6 +196,7 @@ public final class RecentDocumentsStore: ObservableObject {
         resolvedURLs = resolvedURLs.filter { retainedIDs.contains($0.key) }
         staleBookmarkIDs.formIntersection(retainedIDs)
         persist()
+        notifyItemsChanged(.opened)
         return true
     }
 
@@ -231,6 +256,7 @@ public final class RecentDocumentsStore: ObservableObject {
         staleBookmarkIDs.subtract(duplicateIDs)
         staleBookmarkIDs.formIntersection(retainedIDs)
         persist()
+        notifyItemsChanged(.relinked(previous.id))
         return true
     }
 
@@ -266,6 +292,7 @@ public final class RecentDocumentsStore: ObservableObject {
         resolvedURLs[item.id] = nil
         staleBookmarkIDs.remove(item.id)
         persist()
+        notifyItemsChanged(.removed)
     }
 
     public func clear() {
@@ -274,6 +301,7 @@ public final class RecentDocumentsStore: ObservableObject {
         staleBookmarkIDs.removeAll()
         hasUnreadableStoredValue = false
         defaults.removeObject(forKey: Self.storageKey)
+        notifyItemsChanged(.cleared)
     }
 
     private func loadStoredValue() {

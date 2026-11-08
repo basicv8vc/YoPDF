@@ -95,17 +95,6 @@ private struct WorkspaceTabStrip: View {
     }
 }
 
-private struct RecentDocumentsHeadingWidthPreferenceKey: PreferenceKey {
-    static let defaultValue: CGFloat = 110
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        let nextWidth = nextValue()
-        if nextWidth > 0 {
-            value = nextWidth
-        }
-    }
-}
-
 struct PDFReaderView: View {
 
     @ObservedObject var workspace: WorkspaceWindowModel
@@ -119,7 +108,6 @@ struct PDFReaderView: View {
     let canReceiveFinderOpenRequest: Bool
 
     @State private var isImporterPresented = false
-    @State private var recentDocumentsHeadingWidth = RecentDocumentsHeadingWidthPreferenceKey.defaultValue
     @State private var pendingRecentRelink: RecentDocument?
     @State private var finderOpenRequestID: UUID?
     @State private var isDropTargeted = false
@@ -1205,64 +1193,49 @@ struct PDFReaderView: View {
     private static let fallbackAnchor = CGRect(x: 180, y: 180, width: 1, height: 1)
 
     private var emptyState: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "doc.richtext")
-                .font(.system(size: 52, weight: .light))
-                .foregroundStyle(.tertiary)
-            Text("Open a PDF to get started")
-                .font(.title3.weight(.medium))
-            Text("Drag a PDF here, or choose one from disk.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            Button("Open PDF…") {
-                isImporterPresented = true
-            }
-            .buttonStyle(
-                ReaderInteractiveButtonStyle(
-                    isProminent: true,
-                    insets: EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16)
-                )
-            )
-            .keyboardShortcut("o", modifiers: .command)
-
-            if !recentDocuments.items.isEmpty {
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("Recent Documents")
-                        .font(.callout.weight(.medium))
+        GeometryReader { geometry in
+            // Ten recent documents occupy two rows. Short windows shrink the
+            // page previews and the surrounding spacing; if that still does
+            // not fit, the page scrolls instead of clipping the second row.
+            let compact = geometry.size.height < 620
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(spacing: compact ? 10 : 16) {
+                    Image(systemName: "doc.richtext")
+                        .font(.system(size: compact ? 40 : 52, weight: .light))
+                        .foregroundStyle(.tertiary)
+                    Text("Open a PDF to get started")
+                        .font(.title3.weight(.medium))
+                    Text("Drag a PDF here, or choose one from disk.")
+                        .font(.callout)
                         .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: true, vertical: false)
-                        .background {
-                            GeometryReader { geometry in
-                                Color.clear.preference(
-                                    key: RecentDocumentsHeadingWidthPreferenceKey.self,
-                                    value: geometry.size.width
-                                )
-                            }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .center)
-                    VStack(alignment: .leading, spacing: 7) {
-                        ForEach(Array(recentDocuments.items.prefix(5))) { item in
-                            Button {
-                                requestOpenRecent(item)
-                            } label: {
-                                Text(item.displayName)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .buttonStyle(ReaderInteractiveButtonStyle(insets: .init()))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .help(item.lastKnownPath)
-                        }
+                    Button("Open PDF…") {
+                        isImporterPresented = true
                     }
-                    .padding(.leading, max(0, (360 - recentDocumentsHeadingWidth) / 2))
+                    .buttonStyle(
+                        ReaderInteractiveButtonStyle(
+                            isProminent: true,
+                            insets: EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16)
+                        )
+                    )
+                    .keyboardShortcut("o", modifiers: .command)
+
+                    if !recentDocuments.items.isEmpty {
+                        RecentDocumentsGrid(
+                            store: recentDocuments,
+                            onOpen: { requestOpenRecent($0) },
+                            onRelink: { beginRecentRelink($0) },
+                            compact: compact
+                        )
+                        .padding(.top, compact ? 4 : 14)
+                    }
                 }
-                .frame(maxWidth: 360, alignment: .leading)
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.top, 14)
-                .onPreferenceChange(RecentDocumentsHeadingWidthPreferenceKey.self) {
-                    recentDocumentsHeadingWidth = $0
-                }
+                // Centres the page while it fits, and grows into a scrollable
+                // content area when the window becomes too short.
+                .frame(
+                    maxWidth: .infinity,
+                    minHeight: geometry.size.height,
+                    alignment: .center
+                )
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
