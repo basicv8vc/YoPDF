@@ -14,6 +14,11 @@ import YoPDFCore
 /// order with its own paper colour as a number badge, and when the thread does
 /// not fit the card says how many notes are left rather than cutting one
 /// mid-sentence.
+///
+/// The card is a container: a backdrop (Liquid Glass on macOS 26 and later, the
+/// painted paper on older systems) plus a content layer that draws the text on
+/// top of it. Splitting the two is what lets the glass sit behind the text,
+/// since a view always draws its own content above its subviews.
 @MainActor
 final class NoteHoverCardView: NSView {
 
@@ -24,7 +29,11 @@ final class NoteHoverCardView: NSView {
     static let maximumHeight: CGFloat = 236
 
     var preview: NoteHoverPreview? {
-        didSet { needsDisplay = true }
+        didSet {
+            contentView.preview = preview
+            paperView.preview = preview
+            applyGlassTint()
+        }
     }
 
     /// The size `preview` needs, already clamped to the caller's limits.
@@ -39,7 +48,24 @@ final class NoteHoverCardView: NSView {
         CardLayout(preview: preview, width: width, maxHeight: maxHeight).size
     }
 
-    /// Text below is laid out top-down, so a card row reads like a paragraph.
+    private let contentView = NoteHoverCardContentView()
+    private let paperView = NoteHoverCardPaperView()
+
+    /// Present only on macOS 26 and later, where AppKit provides the system
+    /// glass material. `nil` means the painted paper backdrop is in use.
+    private var glassView: NSView?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        buildBackdrop()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    /// Text is laid out top-down, so a card row reads like a paragraph.
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { false }
 
@@ -47,11 +73,73 @@ final class NoteHoverCardView: NSView {
     /// note or the drag that moves the sticker.
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
+    override func layout() {
+        super.layout()
+        paperView.frame = bounds
+        glassView?.frame = bounds
+        contentView.frame = bounds
+    }
+
+    // MARK: - Backdrop
+
+    private func buildBackdrop() {
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView()
+            glass.style = .regular
+            glass.cornerRadius = CardMetrics.cornerRadius
+            // The content has to go through `contentView`: it is the only
+            // subview the glass guarantees sits above the material. Adding the
+            // card's own content as a plain subview could draw it underneath.
+            glass.contentView = contentView
+            addSubview(glass)
+            glassView = glass
+            // Over a white PDF page the system glass has almost nothing to
+            // refract, so its rim alone is too faint. A soft shadow restores
+            // the card's separation from the paper without repainting an
+            // opaque background.
+            glass.wantsLayer = true
+            glass.layer?.shadowColor = NSColor.black.cgColor
+            glass.layer?.shadowOpacity = 0.16
+            glass.layer?.shadowRadius = 7
+            glass.layer?.shadowOffset = CGSize(width: 0, height: -2)
+            applyGlassTint()
+        } else {
+            // macOS 14 and 15 have no glass material, so the sticker's own
+            // paper stays as the backdrop.
+            addSubview(paperView)
+            addSubview(contentView)
+        }
+    }
+
+    /// Keeps the sticker's paper colour recognisable inside the glass without
+    /// turning the card opaque again.
+    private func applyGlassTint() {
+        guard #available(macOS 26.0, *),
+              let glass = glassView as? NSGlassEffectView
+        else { return }
+        glass.tintColor = preview?.palette.color.withAlphaComponent(
+            CardMetrics.glassTintAlpha
+        )
+    }
+}
+
+// MARK: - Content
+
+/// Everything drawn on top of the backdrop.
+private final class NoteHoverCardContentView: NSView {
+
+    var preview: NoteHoverPreview? {
+        didSet { needsDisplay = true }
+    }
+
+    override var isFlipped: Bool { true }
+    override var isOpaque: Bool { false }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
     override func draw(_ dirtyRect: NSRect) {
         guard let preview, bounds.width > 1, bounds.height > 1 else { return }
         let layout = CardLayout(preview: preview, width: bounds.width, maxHeight: bounds.height)
 
-        drawPaper(tint: preview.palette.color)
         drawIcon(preview.motif, in: layout.iconRect)
         draw(layout.title, in: layout.titleRect)
         if let count = layout.count {
@@ -72,35 +160,6 @@ final class NoteHoverCardView: NSView {
     }
 
     // MARK: - Drawing
-
-    private func drawPaper(tint: NSColor) {
-        let path = NSBezierPath(
-            roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
-            xRadius: CardMetrics.cornerRadius,
-            yRadius: CardMetrics.cornerRadius
-        )
-
-        // The page behind a sticker is usually white, so a white card needs a
-        // soft drop shadow to separate its edges from the paper.
-        NSGraphicsContext.saveGraphicsState()
-        let shadow = NSShadow()
-        shadow.shadowColor = CardMetrics.warmInk.withAlphaComponent(0.16)
-        shadow.shadowBlurRadius = 6
-        shadow.shadowOffset = NSSize(width: 0, height: 2)
-        shadow.set()
-        NSColor.white.setFill()
-        path.fill()
-        NSGraphicsContext.restoreGraphicsState()
-
-        // The sticker's own paper shows through, which is what makes the card
-        // read as the same note rather than a generic tooltip.
-        tint.withAlphaComponent(0.20).setFill()
-        path.fill()
-
-        CardMetrics.warmInk.withAlphaComponent(0.18).setStroke()
-        path.lineWidth = 1
-        path.stroke()
-    }
 
     private func drawIcon(_ motif: NoteMotif, in rect: CGRect) {
         NSGraphicsContext.saveGraphicsState()
@@ -176,6 +235,50 @@ final class NoteHoverCardView: NSView {
     }
 }
 
+// MARK: - Painted paper backdrop
+
+/// The pre-Liquid-Glass backdrop: a rounded white card tinted with the
+/// sticker's own paper so it reads as the same note rather than a tooltip.
+private final class NoteHoverCardPaperView: NSView {
+
+    var preview: NoteHoverPreview? {
+        didSet { needsDisplay = true }
+    }
+
+    override var isOpaque: Bool { false }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let preview, bounds.width > 1, bounds.height > 1 else { return }
+        let path = NSBezierPath(
+            roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
+            xRadius: CardMetrics.cornerRadius,
+            yRadius: CardMetrics.cornerRadius
+        )
+
+        // The page behind a sticker is usually white, so a white card needs a
+        // soft drop shadow to separate its edges from the paper.
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = CardMetrics.warmInk.withAlphaComponent(0.16)
+        shadow.shadowBlurRadius = 6
+        shadow.shadowOffset = NSSize(width: 0, height: 2)
+        shadow.set()
+        NSColor.white.setFill()
+        path.fill()
+        NSGraphicsContext.restoreGraphicsState()
+
+        // The sticker's own paper shows through, which is what makes the card
+        // read as the same note rather than a generic tooltip.
+        preview.palette.color.withAlphaComponent(0.20).setFill()
+        path.fill()
+
+        CardMetrics.warmInk.withAlphaComponent(0.18).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+    }
+}
+
 // MARK: - Metrics
 
 @MainActor
@@ -202,6 +305,11 @@ private enum CardMetrics {
 
     static let footerSpacing: CGFloat = 6
     static let footerHeight: CGFloat = 14
+
+    /// A bare hint of the sticker's paper. A stronger tint turns system glass
+    /// into a flat yellow panel on a white page; the numbered badges already
+    /// carry each note's own colour.
+    static let glassTintAlpha: CGFloat = 0.10
 
     static let ink = NSColor(srgbRed: 0.25, green: 0.20, blue: 0.17, alpha: 1)
     static let warmInk = NSColor(srgbRed: 0.44, green: 0.31, blue: 0.24, alpha: 1)

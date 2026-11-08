@@ -1028,7 +1028,7 @@ private final class MarkupSelectionOverlayView: NSView {
             return
         }
 
-        let card = hoverCardView ?? NoteHoverCardView()
+        let card = hoverCardView ?? NoteHoverCardView(frame: .zero)
         card.preview = preview
         card.frame = frame.integral
         if card.superview !== self {
