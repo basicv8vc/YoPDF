@@ -94,6 +94,14 @@ final class WorkspaceWindowModel: ObservableObject {
         guard state.activate(tabID: tabID) else { return }
     }
 
+    /// Commits a tab strip drag. The ordering rule lives in `WorkspaceState`;
+    /// this republishes the result so the tab strip and the reader's active
+    /// model stay in sync without touching any PDF session.
+    @discardableResult
+    func moveTab(tabID: UUID, toInsertionIndex insertionIndex: Int) -> Bool {
+        state.move(tabID: tabID, toInsertionIndex: insertionIndex)
+    }
+
     /// Terminal-style cyclic tab selection. The wrapping rule lives in
     /// `WorkspaceState`; this only forwards to the window's published state so
     /// the tab strip and the reader's focused model update together.

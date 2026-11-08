@@ -72,6 +72,30 @@ public struct WorkspaceState: Equatable, Sendable {
         return activeTabID
     }
 
+    /// Reorders the tab strip, which is how the user drags a PDF tab into a new
+    /// horizontal position.
+    ///
+    /// `insertionIndex` counts slots in the tab strip *after* the moved tab has
+    /// been taken out, which is what an insertion marker drawn between the
+    /// remaining tabs reports. Passing the moved tab's own index is therefore a
+    /// no-op rather than an off-by-one slide. Out-of-range values are clamped
+    /// so a drag that ends past either end of the strip still lands on the
+    /// first or last slot instead of being rejected.
+    ///
+    /// Selection is carried by tab identity, so the active PDF keeps rendering
+    /// while its neighbours change places around it. Returns `false` only when
+    /// `tabID` is not part of this workspace.
+    @discardableResult
+    public mutating func move(tabID: UUID, toInsertionIndex insertionIndex: Int) -> Bool {
+        guard let currentIndex = tabs.firstIndex(where: { $0.id == tabID }) else {
+            return false
+        }
+
+        let moved = tabs.remove(at: currentIndex)
+        tabs.insert(moved, at: min(max(insertionIndex, 0), tabs.count))
+        return true
+    }
+
     /// Removes a tab while keeping one window tab alive and selecting a valid
     /// neighbor when the active tab is closed.
     @discardableResult
