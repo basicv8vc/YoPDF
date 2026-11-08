@@ -5,8 +5,10 @@ import XCTest
 final class PDFThumbnailRenderIdentityTests: XCTestCase {
 
     func testSwitchingPDFInTheSameWindowInvalidatesPageThumbnail() {
-        let firstDocument = identity(loadGeneration: 1)
-        let secondDocument = identity(loadGeneration: 2)
+        // The same PDFDocument instance reloaded: only the generation moved.
+        let document = PDFDocument()
+        let firstDocument = identity(document: document, loadGeneration: 1)
+        let secondDocument = identity(document: document, loadGeneration: 2)
 
         XCTAssertNotEqual(firstDocument, secondDocument)
     }
@@ -34,21 +36,31 @@ final class PDFThumbnailRenderIdentityTests: XCTestCase {
     }
 
     func testAddingAnnotationInvalidatesPageThumbnail() {
-        let beforeAnnotation = identity(annotationRevision: 4)
-        let afterAnnotation = identity(annotationRevision: 5)
+        // Same document instance: only the annotation revision moved.
+        let document = PDFDocument()
+        let beforeAnnotation = identity(document: document, annotationRevision: 4)
+        let afterAnnotation = identity(document: document, annotationRevision: 5)
 
         XCTAssertNotEqual(beforeAnnotation, afterAnnotation)
     }
 
     func testThumbnailIdentityIncludesPageIndexAndSize() {
-        let original = identity()
+        // Same document instance: only pageIndex / thumbnailSize moved.
+        let document = PDFDocument()
+        let original = identity(document: document)
 
-        XCTAssertNotEqual(original, identity(pageIndex: 1))
-        XCTAssertNotEqual(original, identity(thumbnailSize: CGSize(width: 181, height: 234)))
+        XCTAssertNotEqual(original, identity(document: document, pageIndex: 1))
+        XCTAssertNotEqual(
+            original,
+            identity(document: document, thumbnailSize: CGSize(width: 181, height: 234))
+        )
     }
 
+    /// Every caller must pass an explicit document so field-isolation tests can
+    /// share one instance (only the field under test moves) while the
+    /// cross-document test passes two distinct instances.
     private func identity(
-        document: PDFDocument = PDFDocument(),
+        document: PDFDocument,
         loadGeneration: Int = 1,
         annotationRevision: Int = 0,
         pageIndex: Int = 0,
