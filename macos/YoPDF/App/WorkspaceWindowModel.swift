@@ -102,6 +102,20 @@ final class WorkspaceWindowModel: ObservableObject {
         state.move(tabID: tabID, toInsertionIndex: insertionIndex)
     }
 
+    /// Keyboard / context-menu counterpart of a drag: slides one tab by a
+    /// single slot. The ordering rule stays in `WorkspaceState`, and no PDF
+    /// session is touched.
+    @discardableResult
+    func moveTab(tabID: UUID, direction: WorkspaceTabDirection) -> Bool {
+        state.move(tabID: tabID, direction: direction)
+    }
+
+    /// Menu-bar commands move the selected tab of the focused window.
+    @discardableResult
+    func moveActiveTab(direction: WorkspaceTabDirection) -> Bool {
+        state.moveActiveTab(direction: direction)
+    }
+
     /// Terminal-style cyclic tab selection. The wrapping rule lives in
     /// `WorkspaceState`; this only forwards to the window's published state so
     /// the tab strip and the reader's focused model update together.

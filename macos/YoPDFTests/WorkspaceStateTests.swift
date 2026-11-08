@@ -157,4 +157,83 @@ final class WorkspaceStateTests: XCTestCase {
         XCTAssertEqual(state.tabs, [only])
         XCTAssertEqual(state.activeTabID, only.id)
     }
+
+    // MARK: - One-slot moves (keyboard / context menu)
+
+    func testMoveByDirectionSlidesOneSlotAndKeepsTheActiveTab() {
+        let first = WorkspaceTabIdentity()
+        let second = WorkspaceTabIdentity()
+        let third = WorkspaceTabIdentity()
+        var state = WorkspaceState(initialTab: first)
+        XCTAssertTrue(state.insert(second, activate: false))
+        XCTAssertTrue(state.insert(third, activate: false))
+        XCTAssertTrue(state.activate(tabID: second.id))
+
+        XCTAssertTrue(state.move(tabID: second.id, direction: .previous))
+        XCTAssertEqual(state.tabs, [second, first, third])
+        XCTAssertEqual(state.activeTabID, second.id)
+
+        XCTAssertTrue(state.move(tabID: second.id, direction: .next))
+        XCTAssertEqual(state.tabs, [first, second, third])
+        XCTAssertEqual(state.activeTabID, second.id)
+        XCTAssertEqual(state.activePaneID, second.paneID)
+    }
+
+    func testMoveByDirectionWrapsAtBothEnds() {
+        let first = WorkspaceTabIdentity()
+        let second = WorkspaceTabIdentity()
+        let third = WorkspaceTabIdentity()
+        var state = WorkspaceState(initialTab: first)
+        XCTAssertTrue(state.insert(second, activate: false))
+        XCTAssertTrue(state.insert(third, activate: false))
+
+        // The leftmost tab wraps to the last slot; moving the same tab right
+        // from there wraps back to the first, so a held shortcut never stalls.
+        XCTAssertTrue(state.move(tabID: first.id, direction: .previous))
+        XCTAssertEqual(state.tabs, [second, third, first])
+        XCTAssertTrue(state.move(tabID: first.id, direction: .next))
+        XCTAssertEqual(state.tabs, [first, second, third])
+    }
+
+    func testMoveActiveTabFollowsTheSelection() {
+        let first = WorkspaceTabIdentity()
+        let second = WorkspaceTabIdentity()
+        let third = WorkspaceTabIdentity()
+        var state = WorkspaceState(initialTab: first)
+        XCTAssertTrue(state.insert(second, activate: false))
+        XCTAssertTrue(state.insert(third, activate: false))
+        XCTAssertTrue(state.activate(tabID: second.id))
+
+        XCTAssertTrue(state.moveActiveTab(direction: .previous))
+        XCTAssertEqual(state.tabs, [second, first, third])
+        XCTAssertEqual(state.activeTabID, second.id)
+
+        XCTAssertTrue(state.activate(tabID: third.id))
+        XCTAssertTrue(state.moveActiveTab(direction: .previous))
+        XCTAssertEqual(state.tabs, [second, third, first])
+        XCTAssertEqual(state.activeTabID, third.id)
+
+        // second is now leftmost, so moving it left wraps to the end.
+        XCTAssertTrue(state.activate(tabID: second.id))
+        XCTAssertTrue(state.moveActiveTab(direction: .previous))
+        XCTAssertEqual(state.tabs, [third, first, second])
+        XCTAssertEqual(state.activeTabID, second.id)
+    }
+
+    func testMoveByDirectionRejectsSingleTabAndUnknownTab() {
+        let only = WorkspaceTabIdentity()
+        var state = WorkspaceState(initialTab: only)
+
+        XCTAssertFalse(state.move(tabID: only.id, direction: .previous))
+        XCTAssertFalse(state.move(tabID: only.id, direction: .next))
+        XCTAssertFalse(state.moveActiveTab(direction: .previous))
+        XCTAssertFalse(state.moveActiveTab(direction: .next))
+        XCTAssertEqual(state.tabs, [only])
+        XCTAssertEqual(state.activeTabID, only.id)
+
+        XCTAssertTrue(state.insert(WorkspaceTabIdentity(), activate: false))
+        XCTAssertFalse(state.move(tabID: UUID(), direction: .previous))
+        XCTAssertFalse(state.move(tabID: UUID(), direction: .next))
+        XCTAssertEqual(state.activeTabID, only.id)
+    }
 }

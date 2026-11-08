@@ -96,6 +96,39 @@ public struct WorkspaceState: Equatable, Sendable {
         return true
     }
 
+    /// Slides one tab a single slot toward `direction`, wrapping at both ends.
+    ///
+    /// Menu-bar commands and a tab's context menu use this instead of a drag,
+    /// so they share the drag's ordering rule. Because `move` counts slots in
+    /// the strip with the moved tab removed, moving right inserts at
+    /// `index + 1` and moving left inserts at `index - 1`. Wrapping sends the
+    /// leftmost tab to the last slot and the rightmost tab to the first, so a
+    /// held-down shortcut keeps cycling instead of stalling at an edge.
+    @discardableResult
+    public mutating func move(tabID: UUID, direction: WorkspaceTabDirection) -> Bool {
+        guard tabs.count > 1,
+              let index = tabs.firstIndex(where: { $0.id == tabID })
+        else { return false }
+
+        let insertionIndex: Int
+        switch direction {
+        case .previous:
+            insertionIndex = index == 0 ? tabs.count - 1 : index - 1
+        case .next:
+            insertionIndex = index == tabs.count - 1 ? 0 : index + 1
+        }
+        return move(tabID: tabID, toInsertionIndex: insertionIndex)
+    }
+
+    /// Moves the tab whose PDF is currently visible. Menu-bar commands act on
+    /// the focused window's selection; the context menu instead passes the tab
+    /// the user right-clicked, which need not be the active one.
+    @discardableResult
+    public mutating func moveActiveTab(direction: WorkspaceTabDirection) -> Bool {
+        guard let activeTabID else { return false }
+        return move(tabID: activeTabID, direction: direction)
+    }
+
     /// Removes a tab while keeping one window tab alive and selecting a valid
     /// neighbor when the active tab is closed.
     @discardableResult

@@ -49,7 +49,7 @@ private struct WorkspaceTabStrip: View {
     /// Layout frames of the tabs, keyed by tab ID. Reported by each tab and
     /// used only to translate a pointer position into a drop slot.
     @State private var tabFrames: [UUID: CGRect] = [:]
-    /// Non-nil while a tab title is being held and dragged along the strip.
+    /// Non-nil while a tab is being held and dragged along the strip.
     @State private var draggingTabID: UUID?
     /// Horizontal distance the dragged tab has travelled from its slot.
     @State private var dragTranslation: CGFloat = 0
@@ -114,11 +114,6 @@ private struct WorkspaceTabStrip: View {
             .accessibilityLabel(tab.title)
             .accessibilityIdentifier("workspace-tab-\(tab.id.uuidString)")
             .accessibilityAddTraits(isActive ? .isSelected : [])
-            // Holding the title and moving reorders the strip; a plain click
-            // still reaches the button because the drag needs 4 points first.
-            // The close button stays outside the gesture so it cannot be
-            // triggered by an accidental drag.
-            .simultaneousGesture(reorderGesture(for: tab))
 
             if workspace.tabs.count > 1 {
                 Button {
@@ -133,6 +128,14 @@ private struct WorkspaceTabStrip: View {
                 .accessibilityIdentifier("workspace-tab-close-\(tab.id.uuidString)")
             }
         }
+        // The whole capsule is the drag handle, not just the title text: the
+        // rounded background and the empty space next to the label are hit
+        // targets too. A simultaneous gesture leaves a plain click to the title
+        // Button and needs 4 points of travel before a drag starts, so the
+        // close Button keeps its own action instead of being swallowed.
+        .contentShape(Rectangle())
+        .simultaneousGesture(reorderGesture(for: tab))
+        .contextMenu { tabContextMenu(for: tab) }
         .background(
             isActive ? Color.accentColor.opacity(0.16) : Color.clear,
             in: RoundedRectangle(cornerRadius: 7)
@@ -150,6 +153,21 @@ private struct WorkspaceTabStrip: View {
         .offset(x: isDragging ? dragTranslation : 0)
         .shadow(color: .black.opacity(isDragging ? 0.16 : 0), radius: 6, y: 2)
         .zIndex(isDragging ? 1 : 0)
+    }
+
+    /// Right-click counterpart of the keyboard commands. It moves the tab that
+    /// was clicked, which need not be the active one, and leaves selection alone.
+    @ViewBuilder
+    private func tabContextMenu(for tab: WorkspaceTabSession) -> some View {
+        Button("Move Tab Left") {
+            _ = workspace.moveTab(tabID: tab.id, direction: .previous)
+        }
+        .disabled(workspace.tabs.count < 2)
+
+        Button("Move Tab Right") {
+            _ = workspace.moveTab(tabID: tab.id, direction: .next)
+        }
+        .disabled(workspace.tabs.count < 2)
     }
 
     private func reorderGesture(for tab: WorkspaceTabSession) -> some Gesture {
@@ -172,6 +190,9 @@ private struct WorkspaceTabStrip: View {
                     if currentIndex != target {
                         workspace.moveTab(tabID: tab.id, toInsertionIndex: target)
                     }
+                    // A non-active tab is selected only on release, so the PDF
+                    // being read does not change underneath a drag in progress.
+                    workspace.activate(tabID: tab.id)
                 }
             }
     }
@@ -487,19 +508,7 @@ struct PDFReaderView: View {
     }
 
     private var focusedReader: some View {
-        lifecycleReader
-            .focusedSceneValue(\.documentModel, model)
-            .focusedSceneValue(\.openDocument, { isImporterPresented = true })
-            .focusedSceneValue(\.newWorkspaceTab, { _ = workspace.createTab() })
-            .focusedSceneValue(\.closeWorkspaceTab, { requestCloseTab(workspace.activeTabID) })
-            .focusedSceneValue(
-                \.selectPreviousWorkspaceTab,
-                { workspace.activateAdjacentTab(direction: .previous) }
-            )
-            .focusedSceneValue(
-                \.selectNextWorkspaceTab,
-                { workspace.activateAdjacentTab(direction: .next) }
-            )
+        tabFocusedReader
             .focusedSceneValue(\.openRecentDocument, { requestOpenRecent($0) })
             .focusedSceneValue(\.saveDocument, { requestSave() })
             .focusedSceneValue(\.saveDocumentAs, { requestSaveAs() })
@@ -517,6 +526,31 @@ struct PDFReaderView: View {
                     select: { showSidebarSection($0) }
                 )
             )
+    }
+
+    /// Tab commands live in their own link of the chain: one very long
+    /// `.focusedSceneValue` expression makes Swift's type checker time out.
+    private var tabFocusedReader: some View {
+        lifecycleReader
+            .focusedSceneValue(\.documentModel, model)
+            .focusedSceneValue(\.openDocument, { isImporterPresented = true })
+            .focusedSceneValue(\.newWorkspaceTab, { _ = workspace.createTab() })
+            .focusedSceneValue(\.closeWorkspaceTab, { requestCloseTab(workspace.activeTabID) })
+            .focusedSceneValue(
+                \.selectPreviousWorkspaceTab,
+                { workspace.activateAdjacentTab(direction: .previous) }
+            )
+            .focusedSceneValue(
+                \.selectNextWorkspaceTab,
+                { workspace.activateAdjacentTab(direction: .next) }
+            )
+            .focusedSceneValue(\.workspaceTabMove, workspaceTabMoveActions)
+    }
+
+    private var workspaceTabMoveActions: WorkspaceTabMoveActions {
+        WorkspaceTabMoveActions(tabCount: workspace.tabs.count) { direction in
+            _ = workspace.moveActiveTab(direction: direction)
+        }
     }
 
     private var lifecycleReader: some View {

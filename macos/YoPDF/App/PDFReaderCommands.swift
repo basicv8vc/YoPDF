@@ -19,6 +19,7 @@ struct PDFReaderCommands: Commands {
     @FocusedValue(\.closeWorkspaceTab) private var closeWorkspaceTab
     @FocusedValue(\.selectPreviousWorkspaceTab) private var selectPreviousWorkspaceTab
     @FocusedValue(\.selectNextWorkspaceTab) private var selectNextWorkspaceTab
+    @FocusedValue(\.workspaceTabMove) private var workspaceTabMove
     @FocusedValue(\.openRecentDocument) private var openRecentDocument
     @FocusedValue(\.saveDocument) private var saveDocument
     @FocusedValue(\.saveDocumentAs) private var saveDocumentAs
@@ -102,6 +103,23 @@ struct PDFReaderCommands: Commands {
             }
             .keyboardShortcut("]", modifiers: [.command, .shift])
             .disabled(selectNextWorkspaceTab == nil)
+
+            Divider()
+
+            // Keyboard-only counterpart of dragging a tab. Both directions wrap
+            // at the ends, so holding a key keeps cycling instead of stalling at
+            // an edge (see WorkspaceState.move(tabID:direction:)).
+            Button("Move Tab Left") {
+                workspaceTabMove?.move(.previous)
+            }
+            .keyboardShortcut(.leftArrow, modifiers: [.command, .shift])
+            .disabled((workspaceTabMove?.tabCount ?? 0) < 2)
+
+            Button("Move Tab Right") {
+                workspaceTabMove?.move(.next)
+            }
+            .keyboardShortcut(.rightArrow, modifiers: [.command, .shift])
+            .disabled((workspaceTabMove?.tabCount ?? 0) < 2)
         }
 
         // Annotation edits use the model's own history rather than PDFKit's

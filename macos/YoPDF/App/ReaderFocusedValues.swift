@@ -31,6 +31,17 @@ struct SelectNextWorkspaceTabActionKey: FocusedValueKey {
     typealias Value = @MainActor () -> Void
 }
 
+/// Slides the selected tab left/right from the menu bar. The count lets the
+/// commands grey out when a one-tab workspace has nothing to reorder.
+struct WorkspaceTabMoveActions {
+    let tabCount: Int
+    let move: @MainActor (WorkspaceTabDirection) -> Void
+}
+
+struct WorkspaceTabMoveActionsKey: FocusedValueKey {
+    typealias Value = WorkspaceTabMoveActions
+}
+
 /// Opens a saved recent URL through the focused reader's unsaved-work prompts.
 struct OpenRecentDocumentActionKey: FocusedValueKey {
     typealias Value = @MainActor (RecentDocument) -> Void
@@ -114,6 +125,11 @@ extension FocusedValues {
     var selectNextWorkspaceTab: (@MainActor () -> Void)? {
         get { self[SelectNextWorkspaceTabActionKey.self] }
         set { self[SelectNextWorkspaceTabActionKey.self] = newValue }
+    }
+
+    var workspaceTabMove: WorkspaceTabMoveActions? {
+        get { self[WorkspaceTabMoveActionsKey.self] }
+        set { self[WorkspaceTabMoveActionsKey.self] = newValue }
     }
 
     var openRecentDocument: (@MainActor (RecentDocument) -> Void)? {
