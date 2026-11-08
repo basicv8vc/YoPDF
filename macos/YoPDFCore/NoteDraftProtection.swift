@@ -460,23 +460,36 @@ public final class NoteComposerStore: ObservableObject {
 
     /// Resolves the draft an interrupted reader action is waiting on.
     ///
-    /// A blank body has no note to write: the document refuses empty notes, so
-    /// such a draft holds only an appearance choice. Ending it is the only
-    /// honest answer to "Save Note" — there is no text to lose and no write to
-    /// make, and trying to write it would fail and leave the draft protected
-    /// forever. A real body is committed, and either way the composer closes so
-    /// the interrupted action can proceed.
+    /// A new note or thread entry with a blank body has nothing to write: the
+    /// document refuses empty notes, so such a draft holds only an appearance
+    /// choice. Ending it is the only honest answer to "Save Note" — there is no
+    /// text to lose and no write to make, and trying to write it would fail and
+    /// leave the draft protected forever.
+    ///
+    /// Clearing the body of an *existing* note is different. The edit itself is
+    /// the unsaved work, and `updateNote` refuses an empty body, so dropping the
+    /// draft would silently discard what the user just did. That case fails with
+    /// `.emptyContents` and leaves the composer open, so the action prompt can
+    /// offer "Back to Draft" or an explicit "Discard Draft".
+    ///
+    /// A real body is committed, and either way the composer closes on success
+    /// so the interrupted action can proceed.
     ///
     /// - Returns `.success(nil)` when nothing was written, `.success(note)` when
-    ///   a note was committed, or `.failure` when a real body could not be
-    ///   written. On failure the draft stays open so the text survives.
+    ///   a note was committed, or `.failure` when the draft could not be
+    ///   resolved. On failure the draft stays open so the edit survives.
     public func resolvePendingDraft(
         using model: PDFDocumentModel
     ) -> Result<NoteSelection?, NoteEditError> {
         guard let session else { return .success(nil) }
-        guard !session.hasEmptyContents else {
-            end()
-            return .success(nil)
+        if session.hasEmptyContents {
+            switch session.mode {
+            case .create, .group:
+                end()
+                return .success(nil)
+            case .edit:
+                return .failure(.emptyContents)
+            }
         }
         return commit(using: model).map { Optional.some($0) }
     }

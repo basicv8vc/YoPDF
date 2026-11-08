@@ -629,10 +629,11 @@ database — the saved PDF is the whole document.
   *closes* the composer — including a thread composer that the popover's own
   Save would keep open for another entry — so the interrupted action can open
   the note it was asked for and the same question cannot come back on the next
-  click. A blank body has nothing to write, so it is dropped rather than
-  reported as a failed save. If a real body cannot be written, the draft stays
-  open and the failure offers "Back to Draft" and "Discard Draft" instead of
-  leaving the user in a loop.
+  click. A blank body on a *new* note or thread entry has nothing to write, so
+  it is dropped; clearing the body of an *existing* note is an unsaved edit and
+  is refused as an empty save, keeping the composer open. If a real body cannot
+  be written, the draft stays open and the failure offers "Back to Draft" and
+  "Discard Draft" instead of leaving the user in a loop.
 - **The input grows to four lines and then scrolls.** A vertical `TextField`
   with `lineLimit(1...4)` gives that behaviour; Return inserts a newline and
   `⌘Return` submits. The sticker face on the left opens the appearance popover

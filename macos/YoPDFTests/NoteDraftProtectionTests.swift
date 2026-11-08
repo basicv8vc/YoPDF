@@ -792,4 +792,40 @@ final class NoteDraftProtectionTests: XCTestCase {
         XCTAssertEqual(store.session?.contents, "Text that cannot be saved")
         XCTAssertTrue(store.hasUncommittedChanges)
     }
+
+    func testClearingAnEditedNoteDoesNotSilentlyDiscardTheEdit() throws {
+        let model = openModel(at: try makeFixture())
+        let note = try addPageNote(to: model)
+        model.abandonUnsavedChanges()
+        let originalContents = try XCTUnwrap(note.annotation.contents)
+
+        let store = NoteComposerStore()
+        let session = try beginEditDraft(for: note, in: model, store: store)
+        session.contents = ""
+        XCTAssertTrue(session.hasEmptyContents)
+        XCTAssertTrue(store.hasUncommittedChanges, "clearing the body is an unsaved edit")
+
+        guard case let .failure(error) = store.resolvePendingDraft(using: model) else {
+            return XCTFail("clearing an existing note must not resolve as a clean empty write")
+        }
+        XCTAssertEqual(error, .emptyContents)
+
+        XCTAssertNotNil(store.session, "the composer must stay open")
+        XCTAssertEqual(store.session?.contents, "")
+        XCTAssertTrue(store.hasUncommittedChanges, "the edit must still be protected")
+        XCTAssertEqual(note.annotation.contents, originalContents, "the document keeps its body")
+        XCTAssertFalse(model.hasUnsavedChanges, "no empty write may dirty the PDF")
+
+        // The user can still type a real body and save it through the same draft.
+        store.session?.contents = "Rewritten note"
+        switch store.resolvePendingDraft(using: model) {
+        case .success:
+            break
+        case let .failure(error):
+            return XCTFail("the recovered draft must be savable: \(error)")
+        }
+        XCTAssertNil(store.session)
+        XCTAssertNotEqual(note.annotation.contents, originalContents, "the recovered text is written")
+        XCTAssertTrue(model.hasUnsavedChanges)
+    }
 }
