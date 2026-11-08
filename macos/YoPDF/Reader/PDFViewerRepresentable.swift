@@ -900,6 +900,10 @@ private final class MarkupSelectionOverlayView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        // A tracking area only reports `mouseMoved` when the window forwards
+        // mouse-moved events. Nothing else in the reader needs them, so the
+        // hover preview is the reason this is on.
+        window?.acceptsMouseMovedEvents = true
         observeClipViewBounds()
         if window == nil { hideHoverPreview() }
     }
