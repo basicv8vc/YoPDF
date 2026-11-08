@@ -72,6 +72,23 @@ final class WorkspaceTabReflowTests: XCTestCase {
         XCTAssertNil(result[second])
     }
 
+    /// A cancelled drag resets the gesture state to inactive and the pointer
+    /// back to wherever it was, which must reproduce the pre-drag layout: the
+    /// restore slot is the dragged tab's own position, and every stationary
+    /// tab's offset is zero no matter how far the drag had progressed.
+    func testCancelledDragRestoresTheOriginalLayout() {
+        // Mid-drag the strip could be showing any in-flight order...
+        let inFlight = offsets(dragging: second, insertionIndex: 2)
+        assertOffset(inFlight[third], equals: -124)
+
+        // ...cancelling returns the tab to its own slot, and every offset
+        // unwinds to zero.
+        let restore = offsets(dragging: second, insertionIndex: 1)
+        assertOffset(restore[first], equals: 0)
+        assertOffset(restore[third], equals: 0)
+        XCTAssertNil(restore[second])
+    }
+
     func testOffsetsClampInsertionIndexToTheStrip() {
         let pastEnd = offsets(dragging: second, insertionIndex: 99)
         assertOffset(pastEnd[third], equals: -124)

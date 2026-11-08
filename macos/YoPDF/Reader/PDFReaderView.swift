@@ -49,22 +49,26 @@ private struct WorkspaceTabStrip: View {
     /// Layout frames of the tabs, keyed by tab ID. Reported by each tab and
     /// read only once, when a drag starts.
     @State private var tabFrames: [UUID: CGRect] = [:]
-    /// Non-nil while a tab is being held and dragged along the strip.
-    @State private var draggingTabID: UUID?
-    /// Horizontal distance the dragged tab has travelled from its slot.
-    @State private var dragTranslation: CGFloat = 0
-    /// Slot the dragged tab would land in, counted among the other tabs. While
-    /// a drag is in flight this also drives the live reflow of those tabs.
-    @State private var dropIndex = 0
-    /// Frozen geometry from the start of the drag. Deriving drop slots from
-    /// frames that the reflow is currently moving would feed the layout back
-    /// into the hit test and make the strip oscillate.
-    @State private var dragSnapshot: DragSnapshot?
+    /// Everything an in-flight drag needs to draw itself. Held in a
+    /// `@GestureState` because SwiftUI resets it when the gesture finishes
+    /// **or is cancelled**, while `.onEnded` is only guaranteed to run on a
+    /// successful end — relying on it to clear visual state would leave a
+    /// cancelled drag with a lifted tab and stale reflow offsets.
+    @GestureState private var drag: TabDrag = .inactive
 
-    private struct DragSnapshot {
+    private struct DragSnapshot: Equatable {
         let tabIDs: [UUID]
         let slots: [UUID: WorkspaceTabReflow.Slot]
         let draggingTabID: UUID
+    }
+
+    private struct TabDrag: Equatable {
+        static let inactive = TabDrag(snapshot: nil, tabID: nil, translation: 0, dropIndex: 0)
+
+        let snapshot: DragSnapshot?
+        let tabID: UUID?
+        let translation: CGFloat
+        let dropIndex: Int
     }
 
     /// Pointer positions and reported tab bounds share one space so they can be
@@ -109,7 +113,7 @@ private struct WorkspaceTabStrip: View {
 
     private func tabView(_ tab: WorkspaceTabSession) -> some View {
         let isActive = tab.id == workspace.activeTabID
-        let isDragging = draggingTabID == tab.id
+        let isDragging = drag.tabID == tab.id
 
         return HStack(spacing: 2) {
             Button {
@@ -163,10 +167,11 @@ private struct WorkspaceTabStrip: View {
         // The lifted tab stays under the pointer while the other tabs slide
         // into the order the drop will produce. Offsets never change a layout
         // slot, so the frozen measurement remains valid for the whole drag.
-        .offset(x: isDragging ? dragTranslation : reflowOffset(for: tab.id))
+        .offset(x: isDragging ? drag.translation : reflowOffset(for: tab.id))
         // Only the stationary tabs animate into their new slots; the lifted
-        // tab must track the pointer with no easing lag.
-        .animation(isDragging ? nil : Self.reorderAnimation, value: dropIndex)
+        // tab must track the pointer with no easing lag. Animating on the
+        // whole drag value also smooths the reset when a drag is cancelled.
+        .animation(isDragging ? nil : Self.reorderAnimation, value: drag)
         .shadow(color: .black.opacity(isDragging ? 0.16 : 0), radius: 6, y: 2)
         .zIndex(isDragging ? 1 : 0)
     }
@@ -188,33 +193,36 @@ private struct WorkspaceTabStrip: View {
 
     private func reorderGesture(for tab: WorkspaceTabSession) -> some Gesture {
         DragGesture(minimumDistance: 4, coordinateSpace: .named(Self.stripSpace))
-            .onChanged { value in
+            .updating($drag) { value, state, _ in
                 guard workspace.tabs.count > 1 else { return }
-                if draggingTabID != tab.id || dragSnapshot == nil {
-                    // Freeze the geometry before any reflow starts. Without a
-                    // complete measurement the drag simply never begins.
-                    guard let snapshot = makeSnapshot(dragging: tab.id) else { return }
-                    dragSnapshot = snapshot
-                    draggingTabID = tab.id
+                // Freeze the geometry before any reflow starts. Without a
+                // complete measurement the drag simply never begins.
+                let snapshot: DragSnapshot
+                if state.tabID == tab.id, let frozen = state.snapshot {
+                    snapshot = frozen
+                } else if let fresh = makeSnapshot(dragging: tab.id) {
+                    snapshot = fresh
+                } else {
+                    return
                 }
-                guard let snapshot = dragSnapshot else { return }
-                dragTranslation = value.translation.width
-                dropIndex = insertionIndex(forPointerX: value.location.x, in: snapshot)
+                state = TabDrag(
+                    snapshot: snapshot,
+                    tabID: tab.id,
+                    translation: value.translation.width,
+                    dropIndex: insertionIndex(forPointerX: value.location.x, in: snapshot)
+                )
             }
             .onEnded { value in
-                guard draggingTabID == tab.id, let snapshot = dragSnapshot else { return }
+                // Only a successful release commits. The gesture state may
+                // already have been reset by the time this runs, so the slot
+                // is derived from the live frames instead: until this point
+                // the data order never changed and offsets never move a
+                // layout slot, so the frames still describe the drag-start
+                // layout exactly as the frozen snapshot did.
+                guard let snapshot = makeSnapshot(dragging: tab.id) else { return }
                 let target = insertionIndex(forPointerX: value.location.x, in: snapshot)
                 let currentIndex = workspace.tabs.firstIndex { $0.id == tab.id }
-                // Unwinding the offsets and committing the order in the same
-                // transaction makes the two movements cancel out: the other
-                // tabs stay where they are while the lifted one settles into
-                // its real slot. Releasing no longer performs a reorder, it
-                // only drops the tab.
                 withAnimation(Self.reorderAnimation) {
-                    draggingTabID = nil
-                    dragTranslation = 0
-                    dropIndex = 0
-                    dragSnapshot = nil
                     if currentIndex != target {
                         workspace.moveTab(tabID: tab.id, toInsertionIndex: target)
                     }
@@ -256,13 +264,13 @@ private struct WorkspaceTabStrip: View {
 
     /// How far a stationary tab must slide to show the in-flight ordering.
     private func reflowOffset(for tabID: UUID) -> CGFloat {
-        guard let snapshot = dragSnapshot, draggingTabID != nil else { return 0 }
+        guard let snapshot = drag.snapshot, drag.tabID != nil else { return 0 }
         let offsets = WorkspaceTabReflow.offsets(
             tabIDs: snapshot.tabIDs,
             slots: snapshot.slots,
             spacing: Double(Self.tabSpacing),
             draggingTabID: snapshot.draggingTabID,
-            insertionIndex: dropIndex
+            insertionIndex: drag.dropIndex
         )
         return CGFloat(offsets[tabID] ?? 0)
     }
