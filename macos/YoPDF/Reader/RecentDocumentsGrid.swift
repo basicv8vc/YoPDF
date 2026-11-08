@@ -37,6 +37,11 @@ struct RecentDocumentsGrid: View {
         }
         .frame(maxWidth: 760, alignment: .center)
         .frame(maxWidth: .infinity, alignment: .center)
+        .task {
+            RecentDocumentThumbnailProvider.shared.prune(
+                keeping: Set(store.items.map(\.id))
+            )
+        }
     }
 }
 
@@ -50,6 +55,7 @@ private struct RecentDocumentCell: View {
     let onRelink: (RecentDocument) -> Void
 
     @State private var isHovered = false
+    @State private var image: NSImage?
 
     var body: some View {
         Button {
@@ -91,6 +97,14 @@ private struct RecentDocumentCell: View {
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
+        .task(id: item.id) {
+            // Resolving the bookmark is main-actor work; rendering happens in
+            // the provider's actor and never blocks the empty state.
+            let url = try? store.resolveURL(for: item)
+            image = await RecentDocumentThumbnailProvider.shared.image(
+                for: item, url: url
+            )
+        }
         .help(item.lastKnownPath)
         .accessibilityLabel("Open \(item.displayName)")
         .contextMenu {
@@ -108,18 +122,27 @@ private struct RecentDocumentCell: View {
         }
     }
 
-    /// The white page outline keeps a stable shape while a document is loading;
-    /// the real first-page image is fitted inside it without stretching.
+    /// The first page is fitted to the page's real ratio inside a fixed box,
+    /// so portrait, landscape and slide decks all stay centred like Finder's
+    /// icon view. A missing or unreadable file keeps the generic outline.
     private var pagePreview: some View {
-        let outline = fittedSize(CGSize(width: 3, height: 4))
+        let outline = fittedSize(image?.size ?? CGSize(width: 3, height: 4))
         return ZStack {
             RoundedRectangle(cornerRadius: 3)
                 .fill(Color.white)
-            Image(systemName: "doc.richtext")
-                .font(.system(size: 24, weight: .light))
-                .foregroundStyle(.tertiary)
+            if let image {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+            } else {
+                Image(systemName: "doc.richtext")
+                    .font(.system(size: 24, weight: .light))
+                    .foregroundStyle(.tertiary)
+            }
         }
         .frame(width: outline.width, height: outline.height)
+        .clipShape(RoundedRectangle(cornerRadius: 3))
         .overlay {
             RoundedRectangle(cornerRadius: 3)
                 .stroke(Color.black.opacity(0.14), lineWidth: 0.6)
