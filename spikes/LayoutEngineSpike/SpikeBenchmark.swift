@@ -94,30 +94,121 @@ struct BenchmarkMain {
         print("  - Model geometry throughput: \(String(format: "%.0f", achievableEvals)) evaluations/sec (Model computation only; UI frame rate depends on view hierarchy)")
         print("  - Accumulated geometry checksum: \(String(format: "%.2f", geometryChecksum)) (verifies observable consumption)")
 
-        // Dynamic ratio clamping test
+        // Benchmark 2: Dynamic Ratio Clamping Invariant Verification
         print("\n[Benchmark 2] Dynamic Ratio Clamping Invariant Verification")
         var violations = 0
+
+        // Suite 2A: Horizontal Split Stress Test (1,000 deterministic iterations)
         for i in 0..<1_000 {
-            let width = 650.0 + Double(i % 500)
-            let requestedRatio = -1.0 + Double(i % 300) / 100.0 // from -1.0 to +2.0
-            let testTree = WorkspaceLayoutTree(
+            let width = 641.0 + Double(i % 1359)
+            let height = 500.0 + Double(i % 500)
+            let ratio: Double
+            if i % 100 == 0 {
+                ratio = .nan
+            } else if i % 100 == 1 {
+                ratio = .infinity
+            } else if i % 100 == 2 {
+                ratio = -.infinity
+            } else {
+                ratio = -1.0 + Double(i % 300) / 100.0 // from -1.0 to +2.0
+            }
+
+            let tree = WorkspaceLayoutTree(
                 root: .split(
                     axis: .horizontal,
-                    ratio: requestedRatio,
+                    ratio: ratio,
                     first: .leaf(p1),
                     second: .leaf(p2)
                 )
             )
-            let frames = testTree.paneFrames(in: CGSize(width: width, height: 900), policy: policy)
+            let frames = tree.paneFrames(in: CGSize(width: width, height: height), policy: policy)
             for (_, frame) in frames {
                 if frame.width < policy.minimumLeafWidth - 0.01 || frame.height < policy.minimumLeafHeight - 0.01 {
                     violations += 1
                 }
             }
         }
-        print("  - Stress test iterations: 1,000")
-        print("  - Violations of minimumLeafWidth/Height: \(violations)")
-        print("  - Status: PASSED (100% Invariant Satisfaction)")
+
+        // Suite 2B: Vertical Split Stress Test (1,000 deterministic iterations)
+        for i in 0..<1_000 {
+            let width = 600.0 + Double(i % 600)
+            let height = 481.0 + Double(i % 1319)
+            let ratio: Double
+            if i % 100 == 0 {
+                ratio = .nan
+            } else if i % 100 == 1 {
+                ratio = .infinity
+            } else if i % 100 == 2 {
+                ratio = -.infinity
+            } else {
+                ratio = -1.0 + Double(i % 300) / 100.0 // from -1.0 to +2.0
+            }
+
+            let tree = WorkspaceLayoutTree(
+                root: .split(
+                    axis: .vertical,
+                    ratio: ratio,
+                    first: .leaf(p1),
+                    second: .leaf(p2)
+                )
+            )
+            let frames = tree.paneFrames(in: CGSize(width: width, height: height), policy: policy)
+            for (_, frame) in frames {
+                if frame.width < policy.minimumLeafWidth - 0.01 || frame.height < policy.minimumLeafHeight - 0.01 {
+                    violations += 1
+                }
+            }
+        }
+
+        // Suite 2C: Asymmetric Nested Split Stress Test (1,000 deterministic iterations)
+        // first: P1 (min width 320, min height 240)
+        // second: (P2 | P3) (min width 320 + 1 + 320 = 641, min height 240)
+        // Total minimum width: 320 + 1 + 641 = 962 pt
+        for i in 0..<1_000 {
+            let width = 962.0 + Double(i % 1538) // 962 to 2500 pt
+            let height = 500.0 + Double(i % 500)
+            let rootRatio: Double
+            if i % 100 == 0 {
+                rootRatio = .nan
+            } else if i % 100 == 1 {
+                rootRatio = .infinity
+            } else if i % 100 == 2 {
+                rootRatio = -.infinity
+            } else {
+                rootRatio = -1.0 + Double(i % 300) / 100.0
+            }
+
+            let nestedRatio = -0.5 + Double((i * 7) % 201) / 100.0
+            let tree = WorkspaceLayoutTree(
+                root: .split(
+                    axis: .horizontal,
+                    ratio: rootRatio,
+                    first: .leaf(p1),
+                    second: .split(
+                        axis: .horizontal,
+                        ratio: nestedRatio,
+                        first: .leaf(p2),
+                        second: .leaf(p3)
+                    )
+                )
+            )
+            let frames = tree.paneFrames(in: CGSize(width: width, height: height), policy: policy)
+            for (_, frame) in frames {
+                if frame.width < policy.minimumLeafWidth - 0.01 || frame.height < policy.minimumLeafHeight - 0.01 {
+                    violations += 1
+                }
+            }
+        }
+
+        print("  - Stress test suites: 3 (Horizontal, Vertical, Asymmetric Nested)")
+        print("  - Total stress iterations: 3,000")
+        print("  - Constraint violations: \(violations)")
+        if violations > 0 {
+            print("  - Status: FAILED (\(violations) violations detected)")
+            exit(1)
+        } else {
+            print("  - Status: PASSED (100% Invariant Satisfaction across all suites)")
+        }
 
         // Benchmark 3: Tree Serialization & Deserialization
         print("\n[Benchmark 3] Tree Serialization & Deserialization Overhead")

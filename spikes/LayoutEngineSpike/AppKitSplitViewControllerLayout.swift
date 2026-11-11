@@ -76,7 +76,7 @@ public struct AppKitSplitLayoutRepresentable: NSViewControllerRepresentable {
                 let vc = PaneHostViewController(paneID: paneID, contentView: parent.contentProvider(paneID))
                 return vc
 
-            case let .split(axis, ratio, first, second):
+            case let .split(axis, _, first, second):
                 let splitVC = NSSplitViewController()
                 splitVC.splitView.isVertical = (axis == .horizontal) // In AppKit, isVertical=true means vertical divider (horizontal split)
                 splitVC.splitView.dividerStyle = .thin
