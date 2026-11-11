@@ -1,7 +1,7 @@
 # YoPDF Heterogeneous Multi-Panel Research Workspace Architecture Contract
 
-**Status**: Revised Architecture Contract (Incorporating CTO Review)
-**Document Version**: 2.0.0
+**Status**: Final Architecture Contract Revision (v2.1.0, Incorporating CTO Final Review)
+**Document Version**: 2.1.0
 **Target Platform**: macOS 14.0+ (Sonoma), Apple Silicon & Intel
 **Author**: Senior macOS Architect, YoPDF Core Team
 **Date**: November 2026
@@ -47,8 +47,8 @@ To support heterogeneous panels without destabilizing YoPDF's existing rock-soli
 ```
 
 1. **Workspace Tier**: Manages windows, tabs, layout geometry (binary split tree), active pane focus, and cross-pane action routing. It knows nothing about PDFKit, WKWebView, or Markdown text engines.
-2. **Pane Tier**: A lightweight, visual viewport region inside a split. It owns viewport-specific state (scroll offset, zoom scale, active page index, search highlight) and routes user commands to its underlying session. Multiple Panes can reference the **same** Resource.
-3. **Resource / Session Tier**: Represents the authoritative runtime state and ownership of an opened resource (local PDF file, local Markdown note, local figure image, remote URL, or local Agent conversation). It owns file security scopes, data persistence, atomic staging, autosave debounce, and modification dirty flags.
+2. **Pane Tier**: A visual viewport region inside a split. It owns viewport-specific state (scroll offset, zoom scale, active page index, in-pane search state, note composer UI) and routes user commands to its underlying session. Multiple Panes can reference the **same** Resource.
+3. **Resource / Session Tier**: Represents the authoritative runtime state and ownership of an opened resource (local PDF file, local Markdown note, local figure image, remote URL, or local Agent conversation). It owns file security scopes, data persistence, atomic staging, autosave debounce, search serialization, and modification dirty flags.
 
 ---
 
@@ -56,7 +56,7 @@ To support heterogeneous panels without destabilizing YoPDF's existing rock-soli
 
 ### 2.1 Audit of the Current Implementation
 
-The current codebase contains several tightly coupled abstractions that mix document identity with viewport presentation:
+The current codebase contains tightly coupled abstractions that mix document identity with viewport presentation:
 
 1. **`PDFDocumentModel` (`macos/YoPDFCore/PDFDocumentModel.swift`)**:
    - Currently acts as both the **document data model** (owning `PDFDocument`, annotations, `DocumentSession`, autosave debouncing, and undo stacks) and the **view controller** (owning `currentPageIndex`, `zoomScale`, `effectiveScale`, `isAutoScaling`, `currentSelection`, and `selectedMarkup`).
@@ -65,17 +65,18 @@ The current codebase contains several tightly coupled abstractions that mix docu
    - Tightly binds 1 Tab ID to 1 Pane ID, 1 `PDFDocumentModel`, 1 `NoteComposerStore`, 1 `PDFSearchSession`, and 1 `ReaderNavigationState`.
    - Assumes a strictly 1:1:1 tab-to-pane-to-document relationship.
 3. **`PDFSearchSession` (`macos/YoPDFCore/PDFSearchSession.swift`)**:
-   - Manages query strings, result lists, and active match navigation. While it references `PDFDocument`, its input query and active match index are viewport-specific.
+   - Manages query strings, result lists, and active match navigation. It explicitly documents that a `PDFDocument` can have only **one active find operation at a time** (`PDFDocument.beginFindString`, `cancelFindString`).
+   - If two panes search independently on the same `PDFDocument`, their operations will collide unless serialized.
 4. **`ReaderNavigationState` (`macos/YoPDF/Reader/ReaderNavigationState.swift`)**:
    - Manages sidebar visibility (`isVisible`), selected section (`selectedSection`), and navigation memory (`ReaderNavigationMemory`). This is strictly pane-specific.
 5. **`NoteComposerStore` (`macos/YoPDFCore/NoteDraftProtection.swift`)**:
-   - Manages active note creation/editing popovers, modal presentation, and uncommitted draft protection. It binds to local view coordinates (`anchorRect: CGRect`).
+   - Manages active note creation/editing popovers, modal presentation, and uncommitted draft protection. While its `Mode` captures logical page coordinates, its `anchorRect: CGRect` is currently expressed in local view space.
 6. **`PDFViewerRepresentable` (`macos/YoPDF/Reader/PDFViewerRepresentable.swift`)**:
    - Bridges AppKit `PDFView` into SwiftUI, synchronizing scroll, zoom, selections, and popover anchors.
 
-### 2.2 Separation of Responsibilities
+### 2.2 Separation of Responsibilities & PDFKit Search Concurrency
 
-To enable multi-panel layouts (such as two panes displaying the same PDF at different pages and zoom levels), these responsibilities are decoupled:
+To enable multi-panel layouts (such as two panes displaying the same PDF at different pages and zoom levels), these responsibilities are strictly decoupled:
 
 ```
 +-----------------------------------------------------------------------------------+
@@ -86,6 +87,7 @@ To enable multi-panel layouts (such as two panes displaying the same PDF at diff
 |  - Persistence & autosave debounce coordination (autoSaveTask, DocumentStore)     |
 |  - Security-scoped file access lease (DocumentSession)                            |
 |  - External change detection (checkExternalChange())                              |
+|  - PDFSearchCoordinator (Serializes PDFKit find operations on PDFDocument)       |
 +-----------------------------------------------------------------------------------+
                                           |
                         Observed by 1..N Independent Panes
@@ -98,16 +100,37 @@ To enable multi-panel layouts (such as two panes displaying the same PDF at diff
 |  - Selected Markup in View            |   |  - Selected Markup in View            |
 |  - In-Pane Search: "methodology"      |   |  - In-Pane Search: "appendix"         |
 |  - Sidebar: Visible (Outline)         |   |  - Sidebar: Hidden                    |
-|  - Active Note Composer Popover       |   |  - Active Note Composer Popover       |
+|  - Active Note Composer (Local UI)    |   |  - Active Note Composer (Local UI)    |
 +---------------------------------------+   +---------------------------------------+
 ```
 
-### 2.3 Note Editing State and Lifecycle
+#### PDFKit Search Concurrency Architecture
+
+Because `PDFDocument` supports only one active find operation at a time, search responsibilities are split between the Pane and the Resource:
+
+| Search Responsibility | Owner | Role & Implementation |
+| :--- | :--- | :--- |
+| **Search Query (`inputQuery`, `query`)** | `PDFPaneModel` | User input string for this specific pane. |
+| **Current Result Index** | `PDFPaneModel` | Active highlight index in this pane's viewport. |
+| **Find Bar Visibility** | `PDFPaneModel` | Local search UI visibility. |
+| **Pane Search Generation** | `PDFPaneModel` | Monotonic counter incremented on query change. |
+| **Active PDFKit Find Operation** | `PDFSearchCoordinator` | Calls `beginFindString` / `cancelFindString` on `PDFDocument`. |
+| **Operation Serialization** | `PDFSearchCoordinator` | FIFO queue serializing queries across panes. |
+
+**Search Concurrency Invariants**:
+1. **Independent State**: Each pane retains its own query, match results (`results: [PDFSelection]`), and active result navigation index.
+2. **Serialized Execution**: PDFKit operations against the shared `PDFDocument` are serialized through `PDFSearchCoordinator`. Only one PDFKit find task executes at a time on a given `PDFDocument`.
+3. **No Cross-Pane Cancellation**: A new query in Pane A cancels or re-queues Pane A's operation, but does **not** cancel or corrupt Pane B's active results or pending request.
+4. **Stale Result Rejection**: Asynchronous notifications (`PDFDocumentDidFindMatch`, `PDFDocumentDidEndFind`) carry a request identity and generation counter. Notifications from superseded requests are discarded.
+5. **Resource Lifetime Invalidation**: Replacing or closing the shared PDF resource immediately cancels outstanding find operations and clears search queues.
+6. **No Speculative Concurrency**: The design does not claim concurrent PDFKit find execution; it explicitly serializes access at the resource level.
+
+### 2.3 Note Editing State and Anchor Stability Across Pane Movement
 
 `NoteComposerStore` manages in-flight note composition:
-- **Ownership**: The active `NoteComposerStore` belongs to the **visual Pane**, because the composer UI (popover or inline sheet) is positioned relative to that pane's view coordinates (`anchorRect: CGRect` via `PageAnchorResolver`).
+- **Ownership**: The active `NoteComposerStore` belongs to the **visual Pane**, because the composer UI (popover or sheet) is positioned relative to that pane's view coordinates.
 - **Uncommitted Draft Lifecycle**:
-  - While the user is typing, the draft text exists only in `NoteComposerStore.session`.
+  - While the user is typing, the draft text exists in `NoteComposerStore.session`.
   - The draft publishes its dirty state (`hasUncommittedChanges`, `revision`) to the **Workspace / Window Close Guard** (`UnsavedWork`).
   - Closing a tab or quitting the application triggers the existing prompt: *"Save this note first?"* (`ReaderPromptPolicy`).
   - If the user switches tabs or moves panes, the draft remains attached to that Pane and is preserved.
@@ -115,9 +138,47 @@ To enable multi-panel layouts (such as two panes displaying the same PDF at diff
   - When the user clicks "Save Note" (or approves saving during close), the draft is converted into a standard `/Text` `PDFAnnotation` and committed into the **Shared PDF Resource State**.
   - The shared resource records the annotation, pushes to `markupUndoStack`, marks `hasUnsavedChanges = true`, and schedules debounce autosave.
 
+#### Making Note Anchors Stable Across Movement and Resizing
+
+In the current implementation, `NoteComposerSession` stores `anchorRect: CGRect` in reader/view coordinates. When a pane is resized, moved between splits, or reparented in the layout tree, these view coordinates become invalid.
+
+To guarantee stability, the architecture strictly decouples the **Persistent Logical Anchor** from the **Transient Presentation Anchor**:
+
+```
++-----------------------------------------------------------------------------------+
+| Persistent Logical Anchor (Stored in NoteDraft / NoteSelection)                   |
+| - pageIndex: Int (0-based PDF page index)                                         |
+| - bounds: CGRect (Marker rectangle in PDF page-space coordinates)                  |
+| - targetAnnotationID: UUID? (ID of existing annotation if editing)                |
+| - excerpt: String? (Captured text snippet at anchor creation)                     |
++-----------------------------------------------------------------------------------+
+                                          |
+        Dynamically converted by PageAnchorResolver on pane resize/move
+                                          v
++-----------------------------------------------------------------------------------+
+| Transient Presentation Anchor (Derived View State)                                |
+| - anchorRect: CGRect (View coordinates in the active pane's coordinate system)    |
+| - Recalculated via pdfView.convert(bounds, from: page)                            |
++-----------------------------------------------------------------------------------+
+```
+
+**Anchor Stability Invariants**:
+1. `anchorRect` is a **derived presentation value**, never the sole source of anchor identity.
+2. When a pane is resized, split, or reparented:
+   - The uncommitted draft text, styling, and monotonic revision are preserved in `NoteComposerStore`.
+   - The pane's `PageAnchorResolver` recalculates `anchorRect` from the persistent logical anchor (`pageIndex`, `bounds`).
+   - The popover arrow seamlessly follows the note's page location in the updated layout.
+3. If the referenced page or document anchor can no longer be resolved (e.g., page deleted externally or document replaced):
+   - The draft text is **never** silently discarded.
+   - The composer switches to a detached floating presentation with a status warning, allowing the user to copy or commit the text.
+
+**Testing Strategy for Note Anchor Stability**:
+- *Unit Test*: Verify that modifying pane bounds or simulating a window resize causes `PageAnchorResolver` to recompute `anchorRect` while `NoteDraft.bounds` and `NoteDraft.pageIndex` remain unchanged.
+- *Reparenting Test*: Verify that moving a pane from a left split to a bottom split preserves an active uncommitted draft, its revision counter, and restores its popover anchor on the target page.
+
 ### 2.4 Explicit Property Migration Matrix
 
-| Existing Type / Property | Current Owner | Proposed Owner | Migration Required |
+| Existing Type / Property | Current Owner | Proposed Owner | Migration Mechanism |
 | :--- | :--- | :--- | :--- |
 | `document: PDFDocument?` | `PDFDocumentModel` | `PDFResourceSession` | Move to ResourceSession. Shared across all panes viewing this document. |
 | `fileURL: URL?` | `PDFDocumentModel` | `PDFResourceSession` | Move to ResourceSession. Canonical document location. |
@@ -130,6 +191,7 @@ To enable multi-panel layouts (such as two panes displaying the same PDF at diff
 | `store: DocumentStore` | `PDFDocumentModel` | `PDFResourceSession` | Move to ResourceSession. Coordinates atomic file I/O. |
 | `documentSession: DocumentSession?`| `PDFDocumentModel` | `PDFResourceSession` | Move to ResourceSession. Owns file security lease and versioning. |
 | `noteMarkers: [NoteMarker]` | `PDFDocumentModel` | `PDFResourceSession` | Move to ResourceSession. Derived from document annotations. |
+| `searchCoordinator` | *New* | `PDFResourceSession` | Coordinates & serializes find operations on `PDFDocument`. |
 | `currentPageIndex: Int` | `PDFDocumentModel` | `PDFPaneModel` | Move to PaneModel. Independent viewport position per pane. |
 | `pageNavigationRevision: Int` | `PDFDocumentModel` | `PDFPaneModel` | Move to PaneModel. Coordinates viewport navigation commands. |
 | `zoomScale: CGFloat` | `PDFDocumentModel` | `PDFPaneModel` | Move to PaneModel. Independent zoom scale per pane. |
@@ -138,7 +200,7 @@ To enable multi-panel layouts (such as two panes displaying the same PDF at diff
 | `currentSelection: PDFSelection?` | `PDFDocumentModel` | `PDFPaneModel` | Move to PaneModel. Local highlighted text selection. |
 | `selectedMarkup: MarkupSelection?` | `PDFDocumentModel` | `PDFPaneModel` | Move to PaneModel. Locally clicked markup annotation. |
 | `isSearchPresented: Bool` | `PDFReaderView` | `PDFPaneModel` | Move to PaneModel. In-pane find bar visibility. |
-| `searchSession: PDFSearchSession` | `WorkspaceTabSession` | `PDFPaneModel` | Move to PaneModel. Independent search queries and match index per pane. |
+| `searchState` (`inputQuery`, `results`, `currentResultIndex`) | `WorkspaceTabSession` | `PDFPaneModel` | Move to PaneModel. Independent search queries and match index per pane. |
 | `navigationState: ReaderNavigationState`| `WorkspaceTabSession` | `PDFPaneModel` | Move to PaneModel. Sidebar visibility and section per pane. |
 | `composerStore: NoteComposerStore` | `WorkspaceTabSession` | `PDFPaneModel` | Move to PaneModel. In-flight popover editor anchored to pane view. |
 | `activePaneID: UUID?` | `WorkspaceState` | `WorkspaceTab` / `Tree` | Evolve from 1-to-1 tab property to active leaf in tab's layout tree. |
@@ -149,20 +211,92 @@ Consider a researcher cross-referencing an empirical paper in two split panes:
 1. **Pane A** is viewing **Page 3** (Methodology) at 140% zoom with sidebar outline visible.
 2. **Pane B** is viewing **Page 22** (Appendix Tables) at 90% zoom with sidebar hidden.
 3. Both panes hold a reference to the **same** `PDFResourceSession`.
-4. In Pane A, the user selects a sentence and clicks "Highlight".
+4. In Pane A, the user searches for "methodology"; in Pane B, the user searches for "appendix".
+   - `PDFSearchCoordinator` receives both requests. It executes Pane A's find query first, streaming matches to Pane A's `results` list.
+   - It then immediately runs Pane B's query, streaming matches to Pane B's `results` list.
+   - Neither pane cancels the other; both viewports display their respective match highlights independently.
+5. In Pane A, the user selects a sentence and clicks "Highlight".
    - Pane A dispatches the edit to `PDFResourceSession.addMarkup(.highlight, ...)`.
    - The annotation is added to `PDFDocument.page(at: 2)`.
    - `PDFResourceSession` bumps `annotationRevision`, marks `hasUnsavedChanges = true`, and schedules a debounce autosave task.
    - Pane A redraws its visible page.
    - Pane B is currently rendering Page 22; it is not forced to redraw or jump pages. If the user later scrolls Pane B to Page 3, the newly added highlight is immediately visible because both panes reference the same underlying `PDFDocument`.
-5. When autosave fires, `PDFResourceSession` serializes the document once via `DocumentStore`, writing staged bytes atomically to disk.
-6. Neither pane experiences UI flicker or navigation resets.
+6. When autosave fires, `PDFResourceSession` serializes the document once via `DocumentStore`, writing staged bytes atomically to disk.
+7. Neither pane experiences UI flicker or navigation resets.
 
 ---
 
-## 3. Resource and Session Boundaries
+## 3. Resource and Session Boundaries: Ownership Hierarchy & Lifecycle
 
-`DocumentStore` and `DocumentSession` are robust local-file I/O primitives. However, they are **not** universal runtime sessions for every content type. The architecture establishes a clear four-tier taxonomy:
+### 3.1 Explicit Ownership Hierarchy
+
+To prevent ambiguity between models and sessions, the architecture establishes this strict hierarchy:
+
+```
+WorkspaceTab
+├── id: UUID
+├── title: String
+├── layoutTree: WorkspaceLayoutTree (Geometric binary split tree)
+├── activePaneID: PaneID
+└── paneSessions: [PaneID: PDFPaneSession] (Local pane registry)
+      │
+      ├── PDFPaneSession (Pane A)
+      │     ├── paneID: PaneID
+      │     ├── paneModel: PDFPaneModel (Viewport, page, zoom, search UI, NoteComposer)
+      │     └── resourceSession ──┐
+      │                           │ (Strong reference to shared resource)
+      └── PDFPaneSession (Pane B) │
+            ├── paneID: PaneID    │
+            ├── paneModel: PDFPaneModel
+            └── resourceSession ──┴─► PDFResourceSession
+                                        ├── PDFDocument & DocumentVersion
+                                        ├── DocumentSession & SecurityScopeLease
+                                        ├── Annotation collection & Undo stacks
+                                        ├── Dirty tracking & Autosave task
+                                        └── PDFSearchCoordinator
+```
+
+1. **`WorkspaceTab`**:
+   - Owns the `WorkspaceLayoutTree`, the tab title, the `activePaneID`, and the local `paneSessions: [PaneID: PDFPaneSession]` registry.
+2. **`PDFPaneSession`**:
+   - Owns a stable `PaneID`, its dedicated `PDFPaneModel`, and holds a strong reference to the underlying `PDFResourceSession`.
+3. **`PDFPaneModel`**:
+   - Owns all viewport and interactive state: current page, zoom scale, auto-scaling flag, local text selection, in-pane search state (`inputQuery`, results, current match index), sidebar navigation state (`ReaderNavigationState`), and active note composer (`NoteComposerStore`).
+4. **`PDFResourceSession`**:
+   - Owns the canonical `PDFDocument`, `fileURL`, `DocumentSession` (file lease), annotation collection, document-level undo/redo stacks (`markupUndoStack`, `markupRedoStack`), dirty tracking (`hasUnsavedChanges`), autosave debounce task, and `PDFSearchCoordinator`.
+
+### 3.2 Concise Pane & Resource Lifecycle
+
+1. **Creating a Second Pane for an Already-Open PDF**:
+   - User triggers "Split Right" or drops a tab into a drop zone.
+   - A new `PaneID` is generated.
+   - A new `PDFPaneModel` is created (initialized with the source pane's current page and zoom, or default fitted scale).
+   - A new `PDFPaneSession` is instantiated, holding the new `PDFPaneModel` and referencing the **existing** `PDFResourceSession`.
+   - The new `PaneID` is inserted into `layoutTree` and added to `paneSessions`.
+   - No duplicate `PDFDocument`, `DocumentSession`, or security scope is created.
+2. **Moving an Existing Pane Between Layout Positions**:
+   - User drags a pane title bar to another drop zone or reorders splits.
+   - The layout tree is mutated (`WorkspaceLayoutTree.inserting` / `removing`).
+   - The `PDFPaneSession`, its `PDFPaneModel`, its uncommitted note drafts, and its `PDFResourceSession` reference remain completely undisturbed.
+3. **Closing One of Two Panes Referencing the Same PDF**:
+   - User closes Pane A (`⇧⌘W`).
+   - Pane A is pruned from `layoutTree` and removed from `paneSessions`.
+   - Pane A's `PDFPaneModel` is deallocated.
+   - Because Pane B still references `PDFResourceSession`, the shared resource remains fully alive. Document modifications, undo history, and file leases are preserved without interruption.
+4. **Closing the Final Pane and Releasing the Resource**:
+   - User closes Pane B (the last pane observing `PDFResourceSession`).
+   - Pane B is pruned and removed from `paneSessions`.
+   - `PDFResourceSession` detects that its active pane lease count is zero.
+   - If no asynchronous background tasks (such as an in-flight autosave commit) are running, `DocumentSession.close()` is invoked, safely releasing the security-scoped resource access.
+5. **Closing a Tab Containing Multiple Panes**:
+   - User closes the tab (`⌘W`).
+   - The tab inspects `unsavedWork` across all its `paneSessions` (checking uncommitted note drafts in all `PDFPaneModel`s and dirty document state in all `PDFResourceSession`s).
+   - If unsaved changes exist, the user is prompted (`ReaderPromptPolicy`).
+   - Upon confirmation, all `PDFPaneSession`s in the tab are dismantled, and any associated `PDFResourceSession` whose active reference count drops to zero is closed cleanly.
+
+### 3.3 Four-Tier Taxonomy Across Content Types
+
+`DocumentStore` and `DocumentSession` are local-file I/O primitives, not universal sessions for all content. The architecture enforces this taxonomy:
 
 ```
 +-----------------------------------------------------------------------------------+
@@ -186,7 +320,7 @@ Consider a researcher cross-referencing an empirical paper in two split panes:
 +-----------------------------------------------------------------------------------+
 ```
 
-### 3.1 Evaluation of Resource Types
+### 3.4 Evaluation of Resource Types
 
 | Resource Type | Underlying Authority | Persistence Mechanism | Security Scope Required? | Multi-Pane Sharing Rule |
 | :--- | :--- | :--- | :--- | :--- |
@@ -196,7 +330,7 @@ Consider a researcher cross-referencing an empirical paper in two split panes:
 | **Web Browser** | `WKWebView` / WebKit | Non-persistent or URL cookie | No (Remote network/sandbox) | **Independent**: Each browser pane owns its own back/forward list. |
 | **Agent Conversation**| Agent Message Log | SQLite / Local JSON store | No (App container storage) | **Independent or Referenced**: Multiple panes can view different chats. |
 
-### 3.2 Session Scope and Inter-Window Coordination
+### 3.5 Session Scope and Inter-Window Coordination
 
 1. **Window-Scoped Session Pool**:
    - Each `WorkspaceWindowModel` owns a local `ResourceSessionPool` managing active sessions for its tabs and panes.
@@ -249,28 +383,43 @@ public struct WorkspaceLayoutTree: Equatable, Sendable, Codable {
 }
 ```
 
-### 4.2 Recursive Dimension Calculation and Constraints
+### 4.2 Recursive Dimension Calculation and Configurable Policy
 
-The layout engine enforces minimum visual dimensions recursively:
+The layout engine enforces minimum visual dimensions recursively through an instance-configurable policy object:
 
 ```swift
-public struct LayoutPolicy: Sendable {
+public struct LayoutPolicy: Equatable, Sendable {
     /// Minimum readable width for any visual leaf pane.
-    public static let minimumLeafWidth: CGFloat = 320
+    public var minimumLeafWidth: CGFloat
     /// Minimum readable height for any visual leaf pane.
-    public static let minimumLeafHeight: CGFloat = 240
+    public var minimumLeafHeight: CGFloat
     /// Physical divider thickness between split panes.
-    public static let dividerThickness: CGFloat = 1
+    public var dividerThickness: CGFloat
     /// Maximum allowable simultaneous panes per tab (configurable policy).
-    public static let defaultMaxPanes: Int = 4
+    public var maxPanes: Int
+
+    public init(
+        minimumLeafWidth: CGFloat = 320,
+        minimumLeafHeight: CGFloat = 240,
+        dividerThickness: CGFloat = 1,
+        maxPanes: Int = 4
+    ) {
+        self.minimumLeafWidth = minimumLeafWidth
+        self.minimumLeafHeight = minimumLeafHeight
+        self.dividerThickness = dividerThickness
+        self.maxPanes = maxPanes
+    }
+
+    /// Default baseline configuration.
+    public static let `default` = LayoutPolicy()
 }
 
 extension LayoutNode {
-    /// Calculates the minimum required size for this subtree in logical points.
-    public func minimumRequiredSize(policy: LayoutPolicy = .init()) -> CGSize {
+    /// Calculates the minimum required size for this subtree in logical points using the supplied policy.
+    public func minimumRequiredSize(policy: LayoutPolicy = .default) -> CGSize {
         switch self {
         case .leaf:
-            return CGSize(width: LayoutPolicy.minimumLeafWidth, height: LayoutPolicy.minimumLeafHeight)
+            return CGSize(width: policy.minimumLeafWidth, height: policy.minimumLeafHeight)
 
         case let .split(axis, _, first, second):
             let firstSize = first.minimumRequiredSize(policy: policy)
@@ -279,13 +428,13 @@ extension LayoutNode {
             switch axis {
             case .horizontal:
                 return CGSize(
-                    width: firstSize.width + LayoutPolicy.dividerThickness + secondSize.width,
+                    width: firstSize.width + policy.dividerThickness + secondSize.width,
                     height: max(firstSize.height, secondSize.height)
                 )
             case .vertical:
                 return CGSize(
                     width: max(firstSize.width, secondSize.width),
-                    height: firstSize.height + LayoutPolicy.dividerThickness + secondSize.height
+                    height: firstSize.height + policy.dividerThickness + secondSize.height
                 )
             }
         }
@@ -293,14 +442,16 @@ extension LayoutNode {
 }
 ```
 
+*Note on Initial Values*: The defaults (320pt width, 240pt height, 4 max panes) are documented as initial experimental baselines, not frozen product decisions. The `maxPanes` policy limit is a configurable guardrail, while geometric dimension checks remain the primary architectural protection against unusable viewports.
+
 ### 4.3 Dynamic Split Ratio Bounding
 
-For any split node dividing a container of dimension $D$ (width for horizontal, height for vertical) with divider thickness $\delta$:
+For any split node dividing a container of dimension $D$ (width for horizontal, height for vertical) with divider thickness $\delta = \text{policy.dividerThickness}$:
 $$\text{availableSpace} = D - \delta$$
 $$r_{\min} = \frac{\text{first.minDimension}}{\text{availableSpace}}, \quad r_{\max} = 1 - \frac{\text{second.minDimension}}{\text{availableSpace}}$$
 
 - A split ratio $r$ is valid if and only if $r_{\min} \le r \le r_{\max}$.
-- If $r_{\min} > r_{\max}$, the container is physically too small to host the split, and the operation is rejected.
+- If $r_{\min} > r_{\max}$, the container is physically too small to host the split, and the operation throws `.insufficientSpace`.
 
 ### 4.4 Tree Mutation and Error Taxonomy
 
@@ -318,13 +469,37 @@ public enum LayoutMutationError: Error, Equatable, Sendable {
 }
 ```
 
-### 4.5 Deserialization Validation and Normalization
+### 4.5 Deserialization Validation and Recovery Strategy
 
-`Codable` synthesizes field deserialization but **cannot** validate structural invariants. Therefore, every deserialized `WorkspaceLayoutTree` passes through an explicit validation and normalization pass:
-1. **Deduplication**: If duplicate `PaneID`s appear, duplicate leaves are pruned.
-2. **Orphan Pruning**: Any split node missing a child collapses immediately into its surviving sibling.
-3. **Ratio Normalization**: Ratios are clamped to their valid range based on the target window's content bounds.
-4. **Fallback Recovery**: If the deserialized tree cannot fit within the window's minimum dimensions, it collapses down to the active leaf pane rather than crashing or rendering broken 0-pixel panes.
+`Codable` synthesizes field deserialization but **cannot** validate structural invariants. A recursive Codable enum may also encounter corrupted JSON that fails decoding before any tree-normalization function can run.
+
+The architecture distinguishes three explicit failure categories and defines recovery for each:
+
+```
++-----------------------------------------------------------------------------------+
+| Category A: Successfully Decoded but Semantically Invalid                         |
+| - Duplicate PaneIDs, out-of-bounds split ratios, or orphaned split nodes.        |
+| - Handled by post-decoding validateAndNormalize(bounds:policy:):                  |
+|     1. Prunes duplicate leaves.                                                   |
+|     2. Collapses orphaned single-child split nodes into their surviving sibling.  |
+|     3. Clamps ratios dynamically to allowable [r_min, r_max] bounds.              |
++-----------------------------------------------------------------------------------+
+                                          |
++-----------------------------------------------------------------------------------+
+| Category B: Structurally Malformed Serialized Data                                |
+| - Missing required enum cases, corrupted JSON syntax, schema version mismatch.    |
+| - Handled at the persistence / decoding boundary via do/catch error trapping.     |
+| - Fails fast without attempting recursive tree operations on invalid data.        |
++-----------------------------------------------------------------------------------+
+                                          |
++-----------------------------------------------------------------------------------+
+| Category C: Unrecoverable Layout Fallback                                         |
+| - When Category B occurs, or when a decoded tree cannot fit in window bounds.     |
+| - Deterministic Fallback: Constructs a clean single-pane layout hosting the       |
+|   last known valid resource descriptor (or empty tab), non-destructively          |
+|   preserving all user files on disk.                                              |
++-----------------------------------------------------------------------------------+
+```
 
 ---
 
@@ -345,9 +520,9 @@ P0-B does **not** require implementing Markdown, Browser, or Agent panes, nor do
 ```
 +-----------------------------------------------------------------------------------+
 | Stage P0-B: Generic Layout Foundation (Hosting PDF Panes Only)                    |
-| - Introduce PaneID and WorkspaceLayoutTree in YoPDFCore                           |
-| - Update WorkspaceState: TabIdentity holds WorkspaceLayoutTree instead of paneID   |
-| - Update WorkspaceWindowModel: sessions map PaneID -> PDFPaneSession              |
+| - Introduce PaneID, LayoutNode, WorkspaceLayoutTree, LayoutPolicy in YoPDFCore     |
+| - Update WorkspaceTab: holds layoutTree & paneSessions: [PaneID: PDFPaneSession]  |
+| - Update WorkspaceState: tracks activeTabID and activePaneID                      |
 | - Implement Drop Zones & Previews on PDFViewerRepresentable                       |
 | - Active Pane command routing via activePaneID                                    |
 +-----------------------------------------------------------------------------------+
@@ -375,6 +550,8 @@ P0-B does **not** require implementing Markdown, Browser, or Agent panes, nor do
 | **`WorkspaceLayoutTree`** | **Required**. Generic binary split engine. | Unchanged. | Unchanged. |
 | **`PaneID`** | **Required**. Identifies visual pane. | Unchanged. | Unchanged. |
 | **`activePaneID`** | **Required**. Routes keyboard commands. | Unchanged. | Unchanged. |
+| **`PDFPaneSession`** | **Required**. Binds PaneModel & Resource. | Unchanged. | Unchanged. |
+| **`PDFSearchCoordinator`**| **Required**. Serializes find operations. | Unchanged. | Unchanged. |
 | **`PaneKind`** | PDF only (or simple enum). | Add `.markdown`. | Add `.image`, `.browser`, `.agent`. |
 | **`ResourceSession`** | PDF session only. | Add `MarkdownResourceSession`. | Add `BrowserSession`, `AgentSession`. |
 | **`WorkspaceContext`** | Minimal selection hook. | **ActiveContext** for citations. | Cross-pane agent tool execution. |
@@ -432,11 +609,13 @@ According to the multi-head self-attention mechanism proposed in
 [Vaswani et al. 2017, p. 5](./attention.pdf#page=5), the attention function is computed...
 ```
 
-1. **Standard Compatibility**: Any standard Markdown previewer opens the relative PDF file at Page 5 using standard PDF URL fragment semantics (`#page=N`).
-2. **YoPDF Deep-Link Enhancement**:
-   - For precise spatial highlighting inside YoPDF, YoPDF can append standard non-destructive query parameters:
+1. **Universal Portability Baseline**:
+   - The `#page=5` fragment is the portable standard fallback recognized across external PDF viewers and markdown renderers.
+   - The link remains 100% useful without YoPDF installed.
+2. **YoPDF Deep-Link Enhancement (Non-Guaranteed External Parameter)**:
+   - For precise spatial highlighting inside YoPDF, YoPDF can append a custom fragment parameter:
      `./attention.pdf#page=5&yopdf-rect=0.15,0.22,0.85,0.34`
-   - External tools ignore the query parameter and still navigate to `#page=5`.
+   - *Compatibility Clarification*: External Markdown readers and third-party PDF viewers are **not guaranteed** to ignore or parse custom query parameters inside URL fragments. Therefore, the architecture treats `yopdf-rect` as a non-essential enhancement; YoPDF's citation generator can generate pure `#page=5` by default or cleanly isolate the parameter.
    - When clicked inside YoPDF, the Workspace parses `yopdf-rect`, focuses or splits the PDF pane, and displays a temporary glowing highlight over the exact passage.
 3. **Workspace-Local Resource Resolution**:
    - Links are resolved relative to the Markdown note's directory.
@@ -446,19 +625,21 @@ According to the multi-head self-attention mechanism proposed in
 
 ## 8. PDF–Markdown Association Model (`PaperNoteAssociation`)
 
-The primary heterogeneous workflow in YoPDF is reading a PDF while maintaining an associated Markdown research note.
+The primary heterogeneous workflow in YoPDF is reading a PDF while maintaining an associated Markdown research note. This specification prepares for **Stage P0-C** (it is not part of P0-B implementation).
 
-### 8.1 Data Model
+### 8.1 Data Model & Security-Scoped Bookmark Design
 
 ```swift
 public struct PaperNoteAssociation: Identifiable, Equatable, Sendable, Codable {
     public let id: UUID
     public let pdfResourceID: ResourceID
     public let pdfURL: URL
+    public let pdfBookmarkData: Data?
     public let pdfContentHash: String
 
     public var markdownResourceID: ResourceID
     public var markdownURL: URL
+    public var markdownBookmarkData: Data?
 
     public let createdAt: Date
     public var lastModifiedAt: Date
@@ -466,39 +647,50 @@ public struct PaperNoteAssociation: Identifiable, Equatable, Sendable, Codable {
     public init(
         pdfResourceID: ResourceID,
         pdfURL: URL,
+        pdfBookmarkData: Data?,
         pdfContentHash: String,
         markdownResourceID: ResourceID,
-        markdownURL: URL
+        markdownURL: URL,
+        markdownBookmarkData: Data?
     ) {
         self.id = UUID()
         self.pdfResourceID = pdfResourceID
         self.pdfURL = pdfURL
+        self.pdfBookmarkData = pdfBookmarkData
         self.pdfContentHash = pdfContentHash
         self.markdownResourceID = markdownResourceID
         self.markdownURL = markdownURL
+        self.markdownBookmarkData = markdownBookmarkData
         self.createdAt = Date()
         self.lastModifiedAt = Date()
     }
 }
 ```
 
-### 8.2 Operational Invariants
+### 8.2 Operational Invariants & Security Lifecycle
 
 1. **The Markdown File is the Sole Source of Truth**:
    - Notes are stored as plain `.md` files on the local filesystem.
    - Notes are **never** embedded inside PDF metadata or proprietary binary annotations.
-2. **Default Naming Convention (Proposed Product Default)**:
+2. **Security-Scoped Bookmark Persistence & Refresh**:
+   - YoPDF creates and stores security-scoped bookmark data for both the PDF and Markdown file (`pdfBookmarkData`, `markdownBookmarkData`).
+   - On app restart, bookmarks are resolved via `URL(resolvingBookmarkData:options:relativeTo:bookmarkDataIsStale:)`.
+   - If a bookmark is reported as stale, YoPDF immediately re-creates and updates the stored bookmark data.
+3. **Role of SHA-256 Content Hash**:
+   - A content hash (`pdfContentHash`) is used as a **diagnostic candidate identifier** to locate files if paths change across volumes.
+   - It is **not** treated as an unconditional unique identity: two empty files or template files have identical hashes. Resource identity is strictly governed by file URLs and security bookmarks.
+4. **Default Naming Convention (Proposed Product Default)**:
    - For a document `attention.pdf`, the default associated note is named `attention.notes.md` in the same directory.
    - *(Note: Designated as a proposed product decision subject to CTO approval; see Section 14).*
-3. **External Notebook Vault Support**:
+5. **External Notebook Vault Support**:
    - Users who manage an existing Obsidian vault, Logseq graph, or research folder can configure a default "Research Notebook Directory".
    - New notes are created inside the vault and linked to the PDF via `PaperNoteAssociation`.
-4. **Collision Handling**:
+6. **Collision Handling**:
    - If `attention.notes.md` already exists on disk when the user clicks "Create Note", YoPDF **never** overwrites the file silently.
    - Instead, it prompts: *"A note file named 'attention.notes.md' already exists. Would you like to Link Existing Note, Create with New Name, or Choose File?"*
-5. **Missing File Recovery**:
+7. **Missing File Recovery**:
    - If a PDF or note is renamed or moved, YoPDF checks its persistent security bookmarks and SHA-256 content hashes to automatically restore the association. If unresolvable, an unobtrusive banner offers a "Relink Note" button.
-6. **Association Storage**:
+8. **Association Storage**:
    - Associations are persisted in application support (`~/Library/Application Support/YoPDF/associations.json`), remaining completely transparent and non-destructive to the original PDF.
 
 ---
@@ -548,7 +740,7 @@ The choice between a **Pure SwiftUI Recursive Layout** and an **AppKit `NSSplitV
 | :--- | :--- | :--- |
 | **State Synchronization** | Declarative 1:1 binding with `WorkspaceLayoutTree`. Zero sync lag. | Requires bridging declarative state into AppKit delegate callbacks. |
 | **Divider Resizing** | Custom divider drag gesture; direct ratio calculation. | Native macOS system divider behavior and cursor management out-of-the-box. |
-| **Nested Split Stability** | High predictability; purely functional geometry calculation. | Can trigger autolayout constraint recursion in deeply nested splits. |
+| **Nested Split Stability** | High predictability; purely functional geometry calculation. | Hypothesis to evaluate: Auto Layout constraint recursion in deeply nested splits. |
 | **Drop Zone Overlays** | Native SwiftUI `.overlay` with seamless translucency and animations. | Requires injecting custom AppKit overlay views over split items. |
 | **Accessibility (VoiceOver)**| Native SwiftUI accessibility element tree. | Mature native AppKit accessibility hierarchy. |
 | **Implementation Complexity** | Low-to-medium; straightforward recursion in SwiftUI. | Medium-to-high; complex `NSViewControllerRepresentable` coordinator. |
@@ -622,23 +814,25 @@ public protocol PaneCommandResponder: AnyObject {
 To guarantee that existing PDF functionality never regresses while multi-panel features are introduced, the test suite must cover:
 
 ### 12.1 Layout Tree Geometry Tests (`WorkspaceLayoutTreeTests.swift`)
-1. `testRecursiveMinimumSizeCalculation()`: Verifies that nested horizontal/vertical splits correctly sum child minimum dimensions and divider widths.
+1. `testRecursiveMinimumSizeCalculation()`: Verifies that nested horizontal/vertical splits correctly sum child minimum dimensions and divider widths using the supplied `LayoutPolicy`.
 2. `testSplitRatioBoundingPreventsZeroPixelPanes()`: Ensures ratios are clamped dynamically to prevent violating minimum dimensions.
 3. `testInsufficientSpaceErrorThrownWhenWindowTooNarrow()`: Validates that attempting to split a window below minimum dimensions returns `.insufficientSpace`.
 4. `testPruningLeafCollapsesParentSplitNode()`: Ensures removing a leaf collapses the split node directly into the surviving sibling.
 5. `testDeserializationNormalizationRepairsCorruptedTree()`: Verifies that trees with duplicate or orphaned IDs are sanitized without crashing.
 
-### 12.2 Multi-Pane Resource Sharing Tests (`ResourceSessionTests.swift`)
+### 12.2 Multi-Pane Resource Sharing & Search Tests (`ResourceSessionTests.swift`)
 1. `testDualPanesShareSinglePDFDocumentInstance()`: Opening the same URL in two panes shares the same in-memory `PDFDocument`.
 2. `testIndependentNavigationInSharedPanes()`: Navigating Page in Pane A does not alter `currentPageIndex` in Pane B.
 3. `testAnnotationAddedInPaneAVisibleInPaneB()`: Adding a highlight in Pane A updates the shared model and appears when Pane B views that page.
 4. `testSingleAutosaveDebounceAcrossSharedPanes()`: Multiple rapid edits across shared panes collapse into a single atomic write.
 5. `testSessionLeaseReleasedOnlyWhenAllPanesClose()`: Closing Pane 1 keeps the security lease alive for Pane 2; closing Pane 2 releases the lease.
+6. `testSearchCoordinatorSerializesQueriesAcrossPanes()`: Verifies that Pane A searching "methodology" and Pane B searching "appendix" execute sequentially without cancelling or intercepting each other's results.
 
 ### 12.3 Note Draft and Association Tests (`NoteAssociationTests.swift`)
 1. `testUncommittedNoteDraftBlocksTabCloseWithoutPrompt()`: Ensures in-flight drafts in any split pane trigger the "Save note first?" prompt.
-2. `testAssociatedNoteDoesNotOverwriteExistingFile()`: Verifies collision handling prompts the user rather than overwriting existing `.notes.md`.
-3. `testRelativeCommonMarkCitationResolution()`: Verifies that clicking `./paper.pdf#page=5` accurately opens and navigates the companion PDF pane.
+2. `testNoteAnchorPreservedAcrossPaneResizingAndReparenting()`: Ensures that resizing or moving a pane preserves the logical anchor (`pageIndex`, `bounds`) and recomputes `anchorRect` via `PageAnchorResolver`.
+3. `testAssociatedNoteDoesNotOverwriteExistingFile()`: Verifies collision handling prompts the user rather than overwriting existing `.notes.md`.
+4. `testRelativeCommonMarkCitationResolution()`: Verifies that clicking `./paper.pdf#page=5` accurately opens and navigates the companion PDF pane.
 
 ---
 
@@ -647,7 +841,7 @@ To guarantee that existing PDF functionality never regresses while multi-panel f
 | Decision / Area | Trade-off & Risk | Mitigation Strategy |
 | :--- | :--- | :--- |
 | **Shared Resource Session Concurrency** | Two panes modifying the same document simultaneously could cause race conditions. | All document mutations, annotation updates, and UI events are strictly pinned to `@MainActor`. `DocumentSession` protects disk I/O via serial operation locks. |
-| **Memory Footprint of Multi-Panes** | Hosting multiple high-DPI PDF views or WebViews simultaneously can elevate RAM usage. | Limit maximum panes per tab (default 4); release off-screen render caches; suspend background WebViews. |
+| **Memory Footprint of Multi-Panes** | Hosting multiple high-DPI PDF views or WebViews simultaneously can elevate RAM usage. | Limit maximum panes per tab (configurable `maxPanes`); release off-screen render caches; suspend background WebViews. |
 | **TextKit 2 Custom Attributes** | Modern TextKit 2 has occasional edge cases with complex custom paragraph spacing attributes. | Encapsulate Markdown text storage behind an abstract interface, allowing fallback to TextKit 1 if complex block decorations require it. |
 
 ---
@@ -663,22 +857,24 @@ To ensure architectural clarity, all technical decisions are categorized into ex
 | **DEC-03** | **Offline & Local-First** | Reading, notes, and persistence must work 100% offline without remote server dependencies. | **FROZEN** | AGENTS.md / Core Principle. |
 | **DEC-04** | **Note Storage Format** | Standalone portable `.md` files; no proprietary PDF metadata embedding. | **FROZEN** | Core Interoperability Rule. |
 | **DEC-05** | **User Action Boundary** | No silent background mutations from companion panes or agents; explicit user authorization required. | **FROZEN** | Core Security Rule. |
-| **DEC-06** | **Layout Engine Technology** | Pure SwiftUI recursive layout vs. AppKit `NSSplitViewController`. | **RECOMMENDED (UNVERIFIED)** | Requires focused spike in P0-B. |
-| **DEC-07** | **Markdown Engine** | Native AppKit `NSTextView` / TextKit 2 (rejecting Rust FFI). | **RECOMMENDED (UNVERIFIED)** | Requires focused PoC in P0-C. |
-| **DEC-08** | **Citation Link Format** | Relative CommonMark links (`./paper.pdf#page=N`) with optional non-destructive query params. | **RECOMMENDED (UNVERIFIED)** | Verification in P0-C. |
-| **DEC-09** | **Default Note Naming** | `<paper-name>.notes.md` sidecar convention. | **PROPOSED PRODUCT DECISION** | Requires CTO / Product Approval. |
-| **DEC-10** | **Notebook Directory Setting**| Configurable external research notebook / Obsidian vault directory. | **PROPOSED PRODUCT DECISION** | Requires CTO / Product Approval. |
-| **DEC-11** | **Default Pane Limit Policy** | Strict limit of 4 panes per tab (with geometry refusal). | **PROPOSED PRODUCT DECISION** | Requires CTO / Product Approval. |
-| **DEC-12** | **Browser Session Pooling** | Process pooling and cookie persistence policies for Web Browser pane. | **DEFERRED** | Deferred to Phase P1-A. |
-| **DEC-13** | **Agent Protocol Transport** | AgentChat / ACP integration adapter and tool schema. | **DEFERRED** | Deferred to Phase P1-B. |
+| **DEC-06** | **Search Serialization** | `PDFSearchCoordinator` serializes find operations on `PDFDocument`. | **FROZEN** | PDFKit Technical Constraint. |
+| **DEC-07** | **Logical Note Anchor** | Persistent page-space anchor (`pageIndex`, `bounds`) with derived presentation `anchorRect`. | **FROZEN** | Core Reliability Invariant. |
+| **DEC-08** | **Layout Engine Technology** | Pure SwiftUI recursive layout vs. AppKit `NSSplitViewController`. | **RECOMMENDED (UNVERIFIED)** | Requires focused spike in P0-B. |
+| **DEC-09** | **Markdown Engine** | Native AppKit `NSTextView` / TextKit 2 (rejecting Rust FFI). | **RECOMMENDED (UNVERIFIED)** | Requires focused PoC in P0-C. |
+| **DEC-10** | **Citation Link Format** | Relative CommonMark links (`./paper.pdf#page=N`) with optional non-destructive query params. | **RECOMMENDED (UNVERIFIED)** | Verification in P0-C. |
+| **DEC-11** | **Layout Policy Configuration** | Configurable `LayoutPolicy` instance (defaulting to 320x240pt, 1pt divider, 4 max panes). | **RECOMMENDED (CONFIGURABLE)** | Configurable Defaults. |
+| **DEC-12** | **Default Note Naming** | `<paper-name>.notes.md` sidecar convention. | **PROPOSED PRODUCT DECISION** | Requires CTO / Product Approval. |
+| **DEC-13** | **Notebook Directory Setting**| Configurable external research notebook / Obsidian vault directory. | **PROPOSED PRODUCT DECISION** | Requires CTO / Product Approval. |
+| **DEC-14** | **Browser Session Pooling** | Process pooling and cookie persistence policies for Web Browser pane. | **DEFERRED** | Deferred to Phase P1-A. |
+| **DEC-15** | **Agent Protocol Transport** | AgentChat / ACP integration adapter and tool schema. | **DEFERRED** | Deferred to Phase P1-B. |
 
 ---
 
 ## 15. Conclusion and Next Steps
 
-This revised contract establishes a rigorous, concrete foundation for YoPDF. By decoupling the shared PDF Resource state from individual visual Pane view states, establishing the geometry-driven layout engine, and specifying the portable PDF–Markdown association model, YoPDF ensures:
+This final revised contract establishes a rigorous, concrete foundation for YoPDF. By decoupling the shared PDF Resource state from individual visual Pane view states, introducing `PDFSearchCoordinator` to serialize search operations, stabilizing note composer anchors across pane movement, and parameterizing layout constraints, YoPDF ensures:
 - Existing PDFKit reading, annotation, and safe atomic persistence remain 100% stable and intact.
-- A second Coding Agent can implement P0-B's generic layout foundation immediately without inventing ownership boundaries.
+- A second Coding Agent can implement P0-B's generic layout foundation immediately without inventing ownership boundaries or concurrency rules.
 - Future heterogeneous panes (Markdown, Image, Browser, Agent) can be introduced incrementally without modifying the core layout engine.
 
 **Immediate Next Action**:
