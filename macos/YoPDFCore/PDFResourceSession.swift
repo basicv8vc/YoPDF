@@ -1,6 +1,15 @@
 import AppKit
+import Combine
 import Foundation
 import PDFKit
+
+/// Events emitted when the underlying PDFDocument is opened, swapped, or closed.
+@MainActor
+public enum ResourceDocumentEvent {
+    case opened(PDFDocument)
+    case swapped(PDFDocument)
+    case closed
+}
 
 /// Shared document-level runtime authority for an open PDF file.
 ///
@@ -65,6 +74,9 @@ public final class PDFResourceSession: ObservableObject, Identifiable {
     // MARK: - Search Coordinator
 
     public let searchCoordinator: PDFSearchCoordinator
+
+    /// Lifecycle stream notifying observing panes when the document is opened, swapped, or closed.
+    public let documentEvents = PassthroughSubject<ResourceDocumentEvent, Never>()
 
     // MARK: - Pane Leases
 
@@ -251,6 +263,7 @@ public final class PDFResourceSession: ObservableObject, Identifiable {
         noteMarkers = []
         loadGeneration &+= 1
         activeLeases.removeAll()
+        documentEvents.send(.closed)
     }
 
     func apply(document: PDFDocument, fileURL: URL?) {
@@ -268,6 +281,7 @@ public final class PDFResourceSession: ObservableObject, Identifiable {
         self.title = Self.resolvedTitle(for: document, fileURL: fileURL)
         self.loadGeneration &+= 1
         self.searchCoordinator.bindDocument(document)
+        self.documentEvents.send(.opened(document))
     }
 
     func swapDocument(_ newDocument: PDFDocument) {
@@ -279,6 +293,7 @@ public final class PDFResourceSession: ObservableObject, Identifiable {
         refreshNoteMarkers()
         title = Self.resolvedTitle(for: newDocument, fileURL: fileURL)
         searchCoordinator.bindDocument(newDocument)
+        documentEvents.send(.swapped(newDocument))
     }
 
     func adoptFileLocation(_ url: URL) {

@@ -118,7 +118,7 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
     /// The persistent logical anchor (`logicalPageIndex`, `logicalBounds`) is authoritative.
     /// This presentation rectangle is transient and should be recalculated via `PageAnchorResolving`
     /// whenever the pane is resized, split, or reparented.
-    public internal(set) var anchorRect: CGRect
+    @Published public internal(set) var anchorRect: CGRect
     public let pageLabel: String
     public let excerpt: String?
 
@@ -140,12 +140,27 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
         }
     }
 
+    /// Stable runtime identity of the annotation being edited or grouped, if any.
+    ///
+    /// PDFKit annotations do not possess persistent UUIDs in memory unless serialized
+    /// with YoPDF / Shua metadata. `ObjectIdentifier` provides runtime object identity.
     public var targetAnnotationID: ObjectIdentifier? {
         switch mode {
         case .create:
             return nil
         case let .edit(note), let .group(note):
             return note.id
+        }
+    }
+
+    /// Persistent UUID of the annotation when backed by Shua or YoPDF thread metadata.
+    public var targetAnnotationUUID: UUID? {
+        switch mode {
+        case .create:
+            return nil
+        case let .edit(note), let .group(note):
+            return NoteService.shuaAnchorID(of: note.annotation)
+                ?? NoteService.yoPDFThreadID(of: note.annotation)
         }
     }
 
@@ -342,7 +357,12 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
     }
 
     public func commit(to paneModel: PDFPaneModel) -> Result<NoteSelection, NoteEditError> {
-        commit(to: paneModel.resourceSession)
+        let result = commit(to: paneModel.resourceSession)
+        if case .success = result {
+            paneModel.updateSelection(nil)
+            paneModel.clearMarkupSelection()
+        }
+        return result
     }
 
     /// Writes the draft into the document.
@@ -352,7 +372,7 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
     /// keeps the text and reports the failure instead of silently redirecting it
     /// to some other note.
     public func commit(to model: PDFDocumentModel) -> Result<NoteSelection, NoteEditError> {
-        commit(to: model.resourceSession)
+        commit(to: model.paneModel)
     }
 
     public func status(in resourceSession: PDFResourceSession) -> NoteDraftStatus {
@@ -534,7 +554,10 @@ public final class NoteComposerStore: ObservableObject {
 
     @discardableResult
     public func commit(using paneModel: PDFPaneModel) -> Result<NoteSelection, NoteEditError> {
-        commit(using: paneModel.resourceSession)
+        guard let session else { return .failure(.noDocument) }
+        let result = session.commit(to: paneModel)
+        if case .success = result { end() }
+        return result
     }
 
     /// Commits the draft and closes the composer on success.
@@ -551,7 +574,7 @@ public final class NoteComposerStore: ObservableObject {
     /// was, so the caller can report the problem without losing the draft.
     @discardableResult
     public func commit(using model: PDFDocumentModel) -> Result<NoteSelection, NoteEditError> {
-        commit(using: model.resourceSession)
+        commit(using: model.paneModel)
     }
 
     public func resolvePendingDraft(
@@ -573,7 +596,17 @@ public final class NoteComposerStore: ObservableObject {
     public func resolvePendingDraft(
         using paneModel: PDFPaneModel
     ) -> Result<NoteSelection?, NoteEditError> {
-        resolvePendingDraft(using: paneModel.resourceSession)
+        guard let session else { return .success(nil) }
+        if session.hasEmptyContents {
+            switch session.mode {
+            case .create, .group:
+                end()
+                return .success(nil)
+            case .edit:
+                return .failure(.emptyContents)
+            }
+        }
+        return commit(using: paneModel).map { Optional.some($0) }
     }
 
     /// Resolves the draft an interrupted reader action is waiting on.
@@ -599,7 +632,7 @@ public final class NoteComposerStore: ObservableObject {
     public func resolvePendingDraft(
         using model: PDFDocumentModel
     ) -> Result<NoteSelection?, NoteEditError> {
-        resolvePendingDraft(using: model.resourceSession)
+        resolvePendingDraft(using: model.paneModel)
     }
 
     // MARK: - Revision

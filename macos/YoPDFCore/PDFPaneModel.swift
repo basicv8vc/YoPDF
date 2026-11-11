@@ -93,6 +93,62 @@ public final class PDFPaneModel: ObservableObject, Identifiable {
         noteComposerStore.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
+
+        resourceSession.documentEvents
+            .sink { [weak self] event in
+                self?.handleResourceDocumentEvent(event)
+            }
+            .store(in: &cancellables)
+    }
+
+    private func handleResourceDocumentEvent(_ event: ResourceDocumentEvent) {
+        switch event {
+        case let .opened(newDocument):
+            synchronizeWithNewDocument(newDocument, isSwap: false)
+        case let .swapped(newDocument):
+            synchronizeWithNewDocument(newDocument, isSwap: true)
+        case .closed:
+            handleResourceClosed()
+        }
+    }
+
+    private func synchronizeWithNewDocument(_ newDocument: PDFDocument, isSwap: Bool) {
+        // 1. Rebind search session to new document
+        searchSession.documentWasReplaced(with: newDocument)
+
+        // 2. Clear stale selections
+        currentSelection = nil
+        selectedMarkup = nil
+
+        // 3. Clamp current page index to valid range
+        let count = newDocument.pageCount
+        if count > 0 {
+            if isSwap {
+                currentPageIndex = min(currentPageIndex, count - 1)
+                // Swapping in-place keeps current pageNavigationRevision
+                // so PDFViewStateSynchronizer can restore exact destination coordinates!
+            } else {
+                if currentPageIndex >= count {
+                    currentPageIndex = 0
+                }
+                pageNavigationRevision &+= 1
+            }
+        } else {
+            currentPageIndex = 0
+            pageNavigationRevision &+= 1
+        }
+
+        // 4. Reconcile note composer: clean drafts close, dirty drafts are preserved
+        noteComposerStore.reconcile(with: resourceSession)
+    }
+
+    private func handleResourceClosed() {
+        searchSession.clear()
+        currentSelection = nil
+        selectedMarkup = nil
+        currentPageIndex = 0
+        pageNavigationRevision &+= 1
+        noteComposerStore.reconcile(with: resourceSession)
     }
 
     public var document: PDFDocument? {
@@ -353,15 +409,15 @@ public final class PDFPaneModel: ObservableObject, Identifiable {
     public func convertSelectedMarkup() -> Bool {
         guard let context = selectedMarkupContext() else { return false }
         let nextKind = context.kind.converted
-        let success = resourceSession.convertMarkup(context.annotation, on: context.pageIndex)
-        if success {
-            selectedMarkup = MarkupSelection(
-                annotation: context.annotation,
-                kind: nextKind,
-                pageIndex: context.pageIndex
-            )
+        guard let replacement = resourceSession.convertMarkup(context.annotation, on: context.pageIndex) else {
+            return false
         }
-        return success
+        selectedMarkup = MarkupSelection(
+            annotation: replacement,
+            kind: nextKind,
+            pageIndex: context.pageIndex
+        )
+        return true
     }
 
     public func undoMarkup() -> Bool {
@@ -437,8 +493,26 @@ public final class PDFPaneSession: Identifiable {
         paneModel: PDFPaneModel? = nil,
         resourceSession: PDFResourceSession
     ) {
+        if let paneModel {
+            precondition(
+                paneModel.resourceSession === resourceSession,
+                "PDFPaneSession paneModel must reference the exact same resourceSession instance."
+            )
+            precondition(
+                paneModel.id == paneID,
+                "PDFPaneSession paneModel.id must match the provided paneID."
+            )
+        }
         self.id = paneID
         self.resourceSession = resourceSession
         self.paneModel = paneModel ?? PDFPaneModel(id: paneID, resourceSession: resourceSession)
+    }
+
+    public convenience init(paneModel: PDFPaneModel) {
+        self.init(
+            paneID: paneModel.id,
+            paneModel: paneModel,
+            resourceSession: paneModel.resourceSession
+        )
     }
 }

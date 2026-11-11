@@ -227,7 +227,7 @@ extension PDFResourceSession {
     }
 
     @discardableResult
-    public func convertMarkup(_ annotation: PDFAnnotation, on pageIndex: Int) -> Bool {
+    public func convertMarkup(_ annotation: PDFAnnotation, on pageIndex: Int) -> PDFAnnotation? {
         guard let document,
               let page = document.page(at: pageIndex),
               let currentKind = MarkupKind(annotation: annotation),
@@ -237,13 +237,14 @@ extension PDFResourceSession {
                   for: annotation,
                   as: currentKind.converted
               )
-        else { return false }
+        else { return nil }
 
         let edit = MarkupEdit(changes: [
             .remove(annotation: annotation, pageIndex: pageIndex),
             .insert(annotation: replacement, pageIndex: pageIndex)
         ])
-        return performMarkupEdit(edit)
+        guard performMarkupEdit(edit) else { return nil }
+        return replacement
     }
 
     // MARK: - Undo and redo

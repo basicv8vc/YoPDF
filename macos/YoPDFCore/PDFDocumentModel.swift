@@ -232,7 +232,6 @@ public final class PDFDocumentModel: ObservableObject {
 
     public func close() {
         paneModel.close()
-        resourceSession.close()
     }
 
     public func dismissError() {
