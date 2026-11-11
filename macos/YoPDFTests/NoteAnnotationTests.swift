@@ -622,6 +622,104 @@ final class NoteAnnotationTests: XCTestCase {
         XCTAssertEqual(savedMalformed.value(forAnnotationKey: NoteService.threadOrderKey) as? String, "not-an-order")
     }
 
+    // MARK: - Thread geometry
+    //
+    // A thread draws one sticker, so every entry has to share its anchor
+    // rectangle. When the entries were stacked 23pt apart instead, the mask
+    // that hides PDFKit's native icon grew into a column over the page text:
+    // it erased the text-selection highlight underneath and swallowed clicks
+    // meant for the paragraph.
+
+    @discardableResult
+    private func addThread(
+        to model: PDFDocumentModel,
+        contents: [String]
+    ) throws -> NoteSelection {
+        var group = try addPageNote(to: model, contents: contents[0])
+        for text in contents.dropFirst() {
+            switch model.addThought(
+                to: group,
+                contents: text,
+                style: NoteStickerStyle(motif: .flower, palette: .sky)
+            ) {
+            case let .success(updated):
+                group = updated
+            case let .failure(error):
+                XCTFail("appending \(text) failed: \(error)")
+                throw error
+            }
+        }
+        return group
+    }
+
+    func testEveryThreadEntrySharesOneAnchorRectangle() throws {
+        let model = openModel(at: try makeFixture())
+        try addThread(to: model, contents: ["One", "Two", "Three", "Four"])
+
+        let members = try notes(on: 0, in: model)
+        XCTAssertEqual(members.count, 4)
+        let reference = try XCTUnwrap(members.first).bounds
+        for member in members.dropFirst() {
+            XCTAssertEqual(
+                member.bounds,
+                reference,
+                "an entry may not step its /Rect down the page"
+            )
+        }
+
+        let marker = try XCTUnwrap(model.noteMarkers.first)
+        XCTAssertEqual(marker.count, 4)
+        // The mask is the sticker plus the 2pt halo on each side, no matter
+        // how many entries the thread holds.
+        XCTAssertEqual(marker.maskBounds.width, marker.bounds.width + 4, accuracy: 1)
+        XCTAssertEqual(marker.maskBounds.height, marker.bounds.height + 4, accuracy: 1)
+    }
+
+    func testThreadClickTargetStaysInsideTheSticker() throws {
+        let model = openModel(at: try makeFixture())
+        try addThread(to: model, contents: ["One", "Two", "Three", "Four"])
+
+        let marker = try XCTUnwrap(model.noteMarkers.first)
+        let stickerTarget = marker.bounds.insetBy(dx: -3, dy: -3)
+        for rect in marker.sourceHitBounds {
+            XCTAssertTrue(
+                stickerTarget.contains(rect),
+                "a thread entry may not extend the click target past the sticker"
+            )
+        }
+
+        let page = try XCTUnwrap(model.document?.page(at: 0))
+        XCTAssertTrue(NoteService.hitTest(marker.center, on: page, in: try XCTUnwrap(model.document)))
+    }
+
+    func testStackedLegacyRectanglesArePulledBackToTheAnchorWhenRead() throws {
+        let model = openModel(at: try makeFixture())
+        try addThread(to: model, contents: ["One", "Two", "Three", "Four"])
+
+        // Recreate the layout an older build wrote: each entry another 23pt
+        // below the one before it.
+        let members = try notes(on: 0, in: model)
+        let anchorRect = try XCTUnwrap(members.first).bounds
+        for (index, member) in members.enumerated() where index > 0 {
+            member.bounds = anchorRect.offsetBy(dx: 0, dy: -23 * CGFloat(index))
+        }
+        let damaged = members.reduce(anchorRect) { $0.union($1.bounds) }
+        XCTAssertGreaterThan(damaged.height, 90, "the fixture must reproduce the stacked layout")
+
+        model.refreshNoteMarkers()
+
+        let marker = try XCTUnwrap(model.noteMarkers.first)
+        XCTAssertEqual(marker.count, 4)
+        XCTAssertEqual(marker.maskBounds.height, marker.bounds.height + 4, accuracy: 1)
+        for member in members {
+            XCTAssertEqual(
+                member.bounds,
+                anchorRect,
+                "reading the document must repair the stacked rectangles"
+            )
+        }
+    }
+
     // MARK: - Cancelling
 
     func testCapturingAnAnchorDoesNotTouchTheDocument() throws {

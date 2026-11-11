@@ -178,6 +178,8 @@ public struct NoteMarker: Identifiable, Equatable {
     public let threadEntries: [NoteThreadEntry]
     /// Original ShuaMac icon rectangles, including portions hidden by the
     /// grouped sticker overlay. These remain valid hit targets for the group.
+    /// A YoPDF thread reports its member rectangles here too; they sit under its
+    /// single sticker, so the group's click target stays sticker-sized.
     public let sourceHitBounds: [CGRect]
 
     public var paperColor: NotePaperColor { style.palette }
@@ -1566,7 +1568,11 @@ public enum NoteService {
             count: notes.count,
             showsCountBadge: true
         )
-        let annotationsBounds = notes.dropFirst().reduce(first.bounds) { $0.union($1.bounds) }
+        // One sticker represents the whole thread, so the mask only has to
+        // cover that sticker. The member rectangles are reused as the mask's
+        // footprint, which also repairs files written while they were stacked.
+        let rects = alignThreadRectsToAnchor(notes, on: page)
+        let annotationsBounds = rects.dropFirst().reduce(rects[0]) { $0.union($1) }
         let maskBounds = annotationsBounds
             .union(bounds)
             .insetBy(dx: -2, dy: -2)
@@ -1588,8 +1594,50 @@ public enum NoteService {
                     style: style(of: $0)
                 )
             },
-            sourceHitBounds: notes.map(\.bounds)
+            sourceHitBounds: rects
         )
+    }
+
+    /// Snaps a thread's `/Rect`s back onto their shared anchor.
+    ///
+    /// Only the top sticker of a thread is drawn, but older builds appended each
+    /// entry 23pt further down the page, so a four-entry thread owned a column
+    /// of invisible rectangles. The mask that hides PDFKit's native icon spanned
+    /// that whole column: it painted over the text-selection highlight beneath
+    /// and made the sticker's column look impossible to select. Because the
+    /// visible position is stored in the anchor keys, the rectangles can all
+    /// coincide with it instead.
+    ///
+    /// Notes without an anchor are left alone: for those, `/Rect` is the only
+    /// position they have, and moving it would move the sticker. The returned
+    /// rectangles are the ones the mask and the hit targets should use, whether
+    /// or not PDFKit accepted the repair.
+    @discardableResult
+    static func alignThreadRectsToAnchor(
+        _ notes: [PDFAnnotation],
+        on page: PDFPage
+    ) -> [CGRect] {
+        let crop = page.bounds(for: .cropBox)
+        guard crop.width > 1, crop.height > 1 else { return notes.map(\.bounds) }
+        return notes.map { annotation in
+            guard annotation.value(forAnnotationKey: anchorXKey) != nil,
+                  annotation.value(forAnnotationKey: anchorYKey) != nil
+            else { return annotation.bounds }
+
+            let current = annotation.bounds
+            let target = markerBounds(
+                center: markerCenter(of: annotation, on: page),
+                in: crop
+            )
+            guard abs(current.minX - target.minX) > 0.5
+                || abs(current.minY - target.minY) > 0.5
+                || abs(current.width - target.width) > 0.5
+                || abs(current.height - target.height) > 0.5
+            else { return current }
+
+            annotation.bounds = target
+            return annotation.bounds
+        }
     }
 
     private static func shareYoPDFAnchor(
@@ -1978,11 +2026,14 @@ public enum NoteService {
               group.center.x.isFinite, group.center.y.isFinite
         else { return nil }
 
-        let size: CGFloat = 24
-        let x = min(max(group.center.x - size / 2, crop.minX), crop.maxX - size)
-        let lowestMemberY = members.map(\.bounds.minY).min() ?? (group.center.y - size / 2)
-        let y = min(max(lowestMemberY - 23, crop.minY), crop.maxY - size)
-        let bounds = CGRect(x: x, y: y, width: size, height: size)
+        // Every entry of a thread is drawn as the same sticker at the shared
+        // anchor, so their `/Rect`s must coincide. Stepping each new rectangle
+        // another 23pt down the page (ShuaMac's stacked-icon layout) stretched
+        // the mask that hides PDFKit's native icon into a column over the page
+        // text, which erased the text-selection highlight underneath and stole
+        // clicks from the paragraph. The position lives in the anchor keys, not
+        // in `/Rect`, so one rectangle at the anchor serves the whole thread.
+        let bounds = markerBounds(center: group.center, in: crop)
         let draft = NoteDraft(
             pageIndex: group.pageIndex,
             bounds: bounds,
