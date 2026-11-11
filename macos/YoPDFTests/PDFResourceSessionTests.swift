@@ -1,0 +1,385 @@
+import AppKit
+import PDFKit
+import XCTest
+@testable import YoPDFCore
+
+@MainActor
+final class PDFResourceSessionTests: XCTestCase {
+
+    nonisolated(unsafe) private var temporaryFiles: [URL] = []
+
+    override func tearDown() {
+        for url in temporaryFiles {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o644],
+                ofItemAtPath: url.path
+            )
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+        }
+        temporaryFiles.removeAll()
+        super.tearDown()
+    }
+
+    // MARK: - 1 & 2: Shared Resource Session and Document
+
+    func testTwoPaneModelsShareSameResourceSessionAndDocument() throws {
+        let url = try makeTemporaryPDF(pageCount: 3, named: "shared-doc") { page in
+            "Page \(page) Content"
+        }
+        let resource = PDFResourceSession(access: SecurityScopeSpy())
+        XCTAssertTrue(resource.open(url: url))
+        let liveDocument = try XCTUnwrap(resource.document)
+
+        let paneA = PDFPaneModel(id: PaneID(), resourceSession: resource)
+        let paneB = PDFPaneModel(id: PaneID(), resourceSession: resource)
+
+        XCTAssertTrue(paneA.resourceSession === paneB.resourceSession)
+        XCTAssertTrue(paneA.document === paneB.document)
+        XCTAssertTrue(paneA.document === liveDocument)
+        XCTAssertEqual(resource.activeLeaseCount, 2)
+    }
+
+    // MARK: - 3 & 4: Independent Page Navigation and Zoom
+
+    func testIndependentPageNavigationAndZoomState() throws {
+        let url = try makeTemporaryPDF(pageCount: 5, named: "independent-nav") { page in
+            "Page \(page) Content"
+        }
+        let resource = PDFResourceSession(access: SecurityScopeSpy())
+        XCTAssertTrue(resource.open(url: url))
+
+        let paneA = PDFPaneModel(id: PaneID(), resourceSession: resource)
+        let paneB = PDFPaneModel(id: PaneID(), resourceSession: resource)
+
+        // Navigation independence
+        paneA.goToPage(2)
+        XCTAssertEqual(paneA.currentPageIndex, 2)
+        XCTAssertEqual(paneB.currentPageIndex, 0, "Pane B page should not change when Pane A navigates.")
+
+        paneB.goToPage(4)
+        XCTAssertEqual(paneB.currentPageIndex, 4)
+        XCTAssertEqual(paneA.currentPageIndex, 2, "Pane A page should remain at 2.")
+
+        // Zoom independence
+        paneA.setZoomScale(1.8)
+        XCTAssertEqual(paneA.zoomScale, 1.8)
+        XCTAssertFalse(paneA.isAutoScaling)
+        XCTAssertEqual(paneB.zoomScale, 1.0, "Pane B zoom should remain at default 1.0.")
+        XCTAssertTrue(paneB.isAutoScaling)
+
+        paneB.setZoomScale(0.75)
+        XCTAssertEqual(paneB.zoomScale, 0.75)
+        XCTAssertFalse(paneB.isAutoScaling)
+        XCTAssertEqual(paneA.zoomScale, 1.8, "Pane A zoom should remain at 1.8.")
+    }
+
+    // MARK: - 5: Annotation in Pane A Visible in Pane B
+
+    func testAnnotationCreatedInPaneAIsVisibleInPaneB() throws {
+        let url = try makeTemporaryPDF(pageCount: 2, named: "shared-annot") { _ in
+            "Sample selectable text for annotation test"
+        }
+        let resource = PDFResourceSession(access: SecurityScopeSpy())
+        XCTAssertTrue(resource.open(url: url))
+        let doc = try XCTUnwrap(resource.document)
+        let page0 = try XCTUnwrap(doc.page(at: 0))
+
+        let paneA = PDFPaneModel(id: PaneID(), resourceSession: resource)
+        let paneB = PDFPaneModel(id: PaneID(), resourceSession: resource)
+
+        let initialRevision = resource.annotationRevision
+
+        let selection = try XCTUnwrap(doc.selection(from: page0, atCharacterIndex: 0, to: page0, atCharacterIndex: 6))
+        paneA.updateSelection(selection)
+        let summary = paneA.addHighlightToSelection()
+        XCTAssertNotNil(summary)
+
+        XCTAssertEqual(page0.annotations.count, 1)
+        XCTAssertGreaterThan(resource.annotationRevision, initialRevision)
+        XCTAssertEqual(paneB.document?.page(at: 0)?.annotations.count, 1, "Pane B sees the same underlying annotation on page 0.")
+    }
+
+    // MARK: - 6: Shared Document-Level Undo/Redo
+
+    func testSharedDocumentLevelUndoRedoAcrossPanes() throws {
+        let url = try makeTemporaryPDF(pageCount: 2, named: "shared-undo") { _ in
+            "Sample text for undo redo verification"
+        }
+        let resource = PDFResourceSession(access: SecurityScopeSpy())
+        XCTAssertTrue(resource.open(url: url))
+        let doc = try XCTUnwrap(resource.document)
+        let page0 = try XCTUnwrap(doc.page(at: 0))
+
+        let paneA = PDFPaneModel(id: PaneID(), resourceSession: resource)
+        let paneB = PDFPaneModel(id: PaneID(), resourceSession: resource)
+
+        let selection = try XCTUnwrap(doc.selection(from: page0, atCharacterIndex: 0, to: page0, atCharacterIndex: 6))
+        paneA.updateSelection(selection)
+        XCTAssertNotNil(paneA.addHighlightToSelection())
+        XCTAssertEqual(page0.annotations.count, 1)
+        XCTAssertTrue(paneA.canUndoMarkup)
+        XCTAssertTrue(paneB.canUndoMarkup, "Pane B observes that undo is available on the shared document.")
+
+        // Undo from Pane B
+        XCTAssertTrue(paneB.undoMarkup())
+        XCTAssertEqual(page0.annotations.count, 0, "Undo from Pane B removed the annotation.")
+        XCTAssertTrue(paneA.canRedoMarkup, "Pane A observes that redo is available.")
+        XCTAssertTrue(paneB.canRedoMarkup)
+
+        // Redo from Pane A
+        XCTAssertTrue(paneA.redoMarkup())
+        XCTAssertEqual(page0.annotations.count, 1, "Redo from Pane A restored the annotation.")
+    }
+
+    // MARK: - 7: Multiple Edits Schedule One Resource-Level Autosave
+
+    func testMultipleEditsScheduleSingleResourceAutosaveDebounce() async throws {
+        let url = try makeTemporaryPDF(pageCount: 2, named: "single-autosave") { _ in
+            "Text to edit and trigger debounced autosave"
+        }
+        let resource = PDFResourceSession(access: SecurityScopeSpy())
+        resource.autoSaveDebounceNanoseconds = 50_000_000 // 50ms for test
+        XCTAssertTrue(resource.open(url: url))
+        let doc = try XCTUnwrap(resource.document)
+        let page0 = try XCTUnwrap(doc.page(at: 0))
+
+        let paneA = PDFPaneModel(id: PaneID(), resourceSession: resource)
+        let paneB = PDFPaneModel(id: PaneID(), resourceSession: resource)
+
+        let sel1 = try XCTUnwrap(doc.selection(from: page0, atCharacterIndex: 0, to: page0, atCharacterIndex: 4))
+        paneA.updateSelection(sel1)
+        XCTAssertNotNil(paneA.addHighlightToSelection())
+        XCTAssertEqual(resource.autoSaveStatus, .pending)
+        let firstGen = resource.autoSaveGeneration
+
+        // Immediate second edit from Pane B
+        let sel2 = try XCTUnwrap(doc.selection(from: page0, atCharacterIndex: 5, to: page0, atCharacterIndex: 10))
+        paneB.updateSelection(sel2)
+        XCTAssertNotNil(paneB.addUnderlineToSelection())
+        XCTAssertEqual(resource.autoSaveStatus, .pending)
+
+        XCTAssertGreaterThan(resource.autoSaveGeneration, firstGen, "Debounce task was rescheduled for the single shared resource.")
+
+        // Wait for debounce and write to complete
+        while resource.hasUnsavedChanges {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertFalse(resource.hasUnsavedChanges, "Both edits were committed in the single autosave.")
+        XCTAssertEqual(resource.autoSaveStatus, .saved)
+    }
+
+    // MARK: - 8: Closing Pane A Does Not Release Pane B Lease
+
+    func testClosingPaneADoesNotReleasePaneBResourceLease() throws {
+        let url = try makeTemporaryPDF(pageCount: 2, named: "lease-test") { _ in "Content" }
+        let resource = PDFResourceSession(access: SecurityScopeSpy())
+        XCTAssertTrue(resource.open(url: url))
+
+        let paneA = PDFPaneModel(id: PaneID(), resourceSession: resource)
+        let paneB = PDFPaneModel(id: PaneID(), resourceSession: resource)
+        XCTAssertEqual(resource.activeLeaseCount, 2)
+        XCTAssertNotNil(resource.documentSession)
+
+        paneA.close()
+        XCTAssertEqual(resource.activeLeaseCount, 1)
+        XCTAssertNotNil(resource.documentSession, "DocumentSession must remain open while Pane B is active.")
+        XCTAssertTrue(resource.isLoaded)
+        XCTAssertNotNil(paneB.document)
+    }
+
+    // MARK: - 9: Closing Final Pane Waits for In-Flight Background Work
+
+    private final class TestGate: @unchecked Sendable {
+        private let entered = DispatchSemaphore(value: 0)
+        private let release = DispatchSemaphore(value: 0)
+        func pause() {
+            entered.signal()
+            release.wait()
+        }
+        func waitUntilEntered() {
+            entered.wait()
+        }
+        func signalRelease() {
+            release.signal()
+        }
+    }
+
+    func testClosingFinalPaneWaitsForActiveBackgroundWork() async throws {
+        let url = try makeTemporaryPDF(pageCount: 2, named: "wait-on-close") { _ in "Content" }
+        let resource = PDFResourceSession(access: SecurityScopeSpy())
+        resource.autoSaveDebounceNanoseconds = 10_000_000
+        let gate = TestGate()
+        resource.autoSaveSerializer = { snapshot in
+            gate.pause()
+            return PDFDocumentSaveSerializer.dataRepresentationPreservingShuaGroups(in: snapshot.document)
+        }
+        XCTAssertTrue(resource.open(url: url))
+        let doc = try XCTUnwrap(resource.document)
+        let page = try XCTUnwrap(doc.page(at: 0))
+
+        let pane = PDFPaneModel(id: PaneID(), resourceSession: resource)
+        let sel = try XCTUnwrap(doc.selection(from: page, atCharacterIndex: 0, to: page, atCharacterIndex: 4))
+        pane.updateSelection(sel)
+        XCTAssertNotNil(pane.addHighlightToSelection())
+
+        // Wait until serializer is entered without blocking main actor
+        let enteredTask = Task.detached {
+            gate.waitUntilEntered()
+        }
+        _ = await enteredTask.value
+
+        XCTAssertEqual(resource.autoSaveStatus, .saving)
+
+        let serializerReleaser = Task.detached {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            gate.signalRelease()
+        }
+
+        pane.close()
+        _ = await serializerReleaser.value
+        XCTAssertEqual(resource.activeLeaseCount, 0)
+        XCTAssertNil(resource.documentSession, "After background work drains, session is safely closed.")
+    }
+
+    // MARK: - 10 & 11: Search Serialization & Pane Result Isolation
+
+    func testSearchRequestsFromTwoPanesSerializeAndIsolateResults() async throws {
+        let doc = try makeDocument(pageCount: 2) { page in
+            page == 0 ? "alpha first page" : "beta second page"
+        }
+        let coordinator = PDFSearchCoordinator(document: doc)
+
+        let paneA_ID = UUID()
+        let paneB_ID = UUID()
+
+        let sessionA = PDFSearchSession(coordinator: coordinator, debounceNanoseconds: 0, paneID: paneA_ID)
+        let sessionB = PDFSearchSession(coordinator: coordinator, debounceNanoseconds: 0, paneID: paneB_ID)
+
+        sessionA.search("alpha", in: doc)
+        sessionB.search("beta", in: doc)
+
+        let deadline = Date().addingTimeInterval(5)
+        while (sessionA.isSearching || sessionB.isSearching) && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertFalse(sessionA.isSearching)
+        XCTAssertFalse(sessionB.isSearching)
+
+        XCTAssertEqual(sessionA.results.count, 1)
+        XCTAssertEqual(sessionA.results.first?.string?.lowercased().trimmingCharacters(in: .whitespacesAndNewlines), "alpha")
+
+        XCTAssertEqual(sessionB.results.count, 1)
+        XCTAssertEqual(sessionB.results.first?.string?.lowercased().trimmingCharacters(in: .whitespacesAndNewlines), "beta")
+    }
+
+    // MARK: - 12: Failed Open & Save Safety Guarantees
+
+    func testFailedOpenPreservesExistingDocumentAndLease() throws {
+        let validURL = try makeTemporaryPDF(pageCount: 2, named: "valid-doc") { _ in "Valid" }
+        let invalidURL = URL(fileURLWithPath: "/nonexistent/path/fake.pdf")
+
+        let resource = PDFResourceSession(access: SecurityScopeSpy())
+        XCTAssertTrue(resource.open(url: validURL))
+        let originalDoc = try XCTUnwrap(resource.document)
+
+        XCTAssertFalse(resource.open(url: invalidURL))
+        XCTAssertTrue(resource.document === originalDoc, "Failed open must keep existing document instance.")
+        XCTAssertEqual(resource.fileURL, validURL)
+        XCTAssertNotNil(resource.documentSession)
+    }
+
+    func testFailedSavePreservesUnsavedChangesAndAnnotations() throws {
+        let url = try makeTemporaryPDF(pageCount: 1, named: "conflict-doc") { _ in "Original content" }
+        let resource = PDFResourceSession(access: SecurityScopeSpy())
+        XCTAssertTrue(resource.open(url: url))
+        let doc = try XCTUnwrap(resource.document)
+        let page = try XCTUnwrap(doc.page(at: 0))
+
+        let pane = PDFPaneModel(id: PaneID(), resourceSession: resource)
+        let sel = try XCTUnwrap(doc.selection(from: page, atCharacterIndex: 0, to: page, atCharacterIndex: 5))
+        pane.updateSelection(sel)
+        XCTAssertNotNil(pane.addHighlightToSelection())
+        XCTAssertTrue(resource.hasUnsavedChanges)
+
+        // Simulate external modification to force conflict
+        try "External overwrite".data(using: .utf8)?.write(to: url)
+
+        let outcome = resource.save()
+        guard case .conflict = outcome else {
+            XCTFail("Expected conflict save outcome, got \(outcome)")
+            return
+        }
+
+        XCTAssertTrue(resource.hasUnsavedChanges, "Unsaved changes must not be cleared on conflict.")
+        XCTAssertEqual(page.annotations.count, 1, "In-memory annotations must remain intact.")
+    }
+
+    // MARK: - Note Anchor Stability
+
+    func testNoteAnchorPresentationRecalculationViaResolver() throws {
+        let logicalBounds = CGRect(x: 100, y: 200, width: 32, height: 32)
+        let doc = PDFDocument()
+        let draft = NoteDraft(
+            pageIndex: 0,
+            bounds: logicalBounds,
+            excerpt: "Sample excerpt",
+            isPageLevel: false,
+            document: doc
+        )
+        let store = NoteComposerStore()
+        let initialPresentation = CGRect(x: 120, y: 250, width: 32, height: 32)
+        XCTAssertTrue(store.begin(
+            mode: .create(draft),
+            anchorRect: initialPresentation,
+            pageLabel: "1",
+            excerpt: "Sample excerpt",
+            contents: "Draft note text",
+            style: .newNote
+        ))
+
+        let session = try XCTUnwrap(store.session)
+        XCTAssertEqual(session.logicalPageIndex, 0)
+        XCTAssertEqual(session.logicalBounds, logicalBounds)
+        XCTAssertEqual(session.anchorRect, initialPresentation)
+
+        // Simulate resize / reparenting via PageAnchorResolving mock
+        final class MockAnchorResolver: PageAnchorResolving {
+            var nextRect: CGRect?
+            func containerRect(forPageBounds bounds: CGRect, pageIndex: Int) -> CGRect? {
+                nextRect
+            }
+        }
+
+        let resolver = MockAnchorResolver()
+        let updatedPresentation = CGRect(x: 160, y: 310, width: 40, height: 40)
+        resolver.nextRect = updatedPresentation
+
+        XCTAssertTrue(store.updatePresentationAnchor(using: resolver))
+        XCTAssertEqual(session.anchorRect, updatedPresentation, "Presentation anchor rect updated.")
+        XCTAssertEqual(session.logicalBounds, logicalBounds, "Authoritative page-space bounds remained untouched.")
+        XCTAssertEqual(session.logicalPageIndex, 0, "Authoritative page index remained untouched.")
+    }
+
+    // MARK: - Helpers
+
+    private func makeTemporaryPDF(
+        pageCount: Int,
+        named name: String,
+        text: @escaping (Int) -> String
+    ) throws -> URL {
+        let url = try PDFFixtureFactory.writeTemporaryPDF(pageCount: pageCount, named: name, text: text)
+        temporaryFiles.append(url)
+        return url
+    }
+
+    private func makeDocument(
+        pageCount: Int,
+        text: @escaping (Int) -> String
+    ) throws -> PDFDocument {
+        let data = try PDFFixtureFactory.makePDFData(pageCount: pageCount, text: text)
+        return try XCTUnwrap(PDFDocument(data: data))
+    }
+}

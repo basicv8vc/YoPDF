@@ -49,7 +49,7 @@ public final class PDFPaneModel: ObservableObject, Identifiable {
     private var cancellables = Set<AnyCancellable>()
 
     public init(
-        id: PaneID = UUID(),
+        id: PaneID = PaneID(),
         resourceSession: PDFResourceSession,
         searchDebounceNanoseconds: UInt64 = 200_000_000
     ) {
@@ -58,7 +58,7 @@ public final class PDFPaneModel: ObservableObject, Identifiable {
         self.searchSession = PDFSearchSession(
             coordinator: resourceSession.searchCoordinator,
             debounceNanoseconds: searchDebounceNanoseconds,
-            paneID: id
+            paneID: id.rawValue
         )
         self.noteComposerStore = NoteComposerStore()
 
@@ -104,6 +104,10 @@ public final class PDFPaneModel: ObservableObject, Identifiable {
     }
 
     public func close() {
+        currentPageIndex = 0
+        zoomScale = 1
+        effectiveScale = 1
+        isAutoScaling = true
         searchSession.clear()
         noteComposerStore.discardIfClean()
         currentSelection = nil
@@ -242,10 +246,13 @@ public final class PDFPaneModel: ObservableObject, Identifiable {
     @discardableResult
     public func selectMarkup(at point: CGPoint, on page: PDFPage) -> Bool {
         guard let document = resourceSession.document,
-              page.document === document,
-              let pageIndex = document.index(for: page),
-              pageIndex >= 0
+              page.document === document
         else {
+            selectedMarkup = nil
+            return false
+        }
+        let pageIndex = document.index(for: page)
+        guard pageIndex >= 0 else {
             selectedMarkup = nil
             return false
         }
@@ -322,7 +329,7 @@ public final class PDFPaneModel: ObservableObject, Identifiable {
     }
 
     @discardableResult
-    public func recolorSelectedMarkup(to color: NSColor, coalescing: Bool = false) -> Bool {
+    public func recolorSelectedMarkup(to color: NSColor, coalescing: Bool = true) -> Bool {
         guard let context = selectedMarkupContext() else { return false }
         return resourceSession.recolorMarkup(
             context.annotation,
@@ -344,9 +351,8 @@ public final class PDFPaneModel: ObservableObject, Identifiable {
 
     @discardableResult
     public func convertSelectedMarkup() -> Bool {
-        guard let context = selectedMarkupContext(),
-              let nextKind = context.kind.nextKind
-        else { return false }
+        guard let context = selectedMarkupContext() else { return false }
+        let nextKind = context.kind.converted
         let success = resourceSession.convertMarkup(context.annotation, on: context.pageIndex)
         if success {
             selectedMarkup = MarkupSelection(
@@ -427,7 +433,7 @@ public final class PDFPaneSession: Identifiable {
     public let resourceSession: PDFResourceSession
 
     public init(
-        paneID: PaneID = UUID(),
+        paneID: PaneID = PaneID(),
         paneModel: PDFPaneModel? = nil,
         resourceSession: PDFResourceSession
     ) {

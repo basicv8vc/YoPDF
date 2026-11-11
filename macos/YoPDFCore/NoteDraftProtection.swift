@@ -136,7 +136,7 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
         case let .create(draft):
             return draft.bounds
         case let .edit(note), let .group(note):
-            return note.marker.bounds
+            return note.bounds
         }
     }
 

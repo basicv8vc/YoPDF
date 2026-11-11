@@ -132,6 +132,12 @@ struct MarkupEdit {
     }
 }
 
+struct SelectedMarkupContext {
+    let annotation: PDFAnnotation
+    let kind: MarkupKind
+    let pageIndex: Int
+}
+
 extension PDFResourceSession {
 
     // MARK: - Adding
@@ -180,16 +186,17 @@ extension PDFResourceSession {
         _ annotation: PDFAnnotation,
         on pageIndex: Int,
         to color: NSColor,
-        coalescing: Bool = false
+        coalescing: Bool = true
     ) -> Bool {
-        guard let document,
+        guard let normalized = MarkupColorPalette.normalized(color),
+              let document,
               let page = document.page(at: pageIndex),
               MarkupPermissions.canModify(annotation, in: document, on: page),
               document.index(for: page) == pageIndex
         else { return false }
 
         let currentHex = MarkupColorPalette.hex(from: annotation.color)
-        let newHex = MarkupColorPalette.hex(from: color)
+        let newHex = MarkupColorPalette.hex(from: normalized)
         if currentHex != nil, currentHex == newHex {
             return true
         }
@@ -199,7 +206,7 @@ extension PDFResourceSession {
                 annotation: annotation,
                 pageIndex: pageIndex,
                 from: annotation.color,
-                to: color
+                to: normalized
             )
         ])
         return performMarkupEdit(edit, coalescingRecolour: coalescing)
@@ -224,10 +231,12 @@ extension PDFResourceSession {
         guard let document,
               let page = document.page(at: pageIndex),
               let currentKind = MarkupKind(annotation: annotation),
-              let targetKind = currentKind.nextKind,
               MarkupPermissions.canModify(annotation, in: document, on: page),
               document.index(for: page) == pageIndex,
-              let replacement = HighlightService.convertedMarkup(annotation, to: targetKind, in: document)
+              let replacement = try? HighlightService.replacement(
+                  for: annotation,
+                  as: currentKind.converted
+              )
         else { return false }
 
         let edit = MarkupEdit(changes: [
@@ -473,13 +482,13 @@ extension PDFDocumentModel {
     // MARK: - Recolour
 
     @discardableResult
-    public func recolorSelectedMarkup(to color: NSColor, coalescing: Bool = false) -> Bool {
+    public func recolorSelectedMarkup(to color: NSColor, coalescing: Bool = true) -> Bool {
         paneModel.recolorSelectedMarkup(to: color, coalescing: coalescing)
     }
 
     @discardableResult
     public func recolorSelectedMarkup(to color: NSColor) -> Bool {
-        paneModel.recolorSelectedMarkup(to: color, coalescing: false)
+        paneModel.recolorSelectedMarkup(to: color, coalescing: true)
     }
 
     // MARK: - Delete and convert

@@ -2,8 +2,6 @@ import AppKit
 import Foundation
 import PDFKit
 
-public typealias PaneID = UUID
-
 /// Shared document-level runtime authority for an open PDF file.
 ///
 /// Owns the canonical `PDFDocument`, `fileURL`, security-scoped `DocumentSession`,
@@ -60,7 +58,7 @@ public final class PDFResourceSession: ObservableObject, Identifiable {
     var autoSavePauseDepth: Int = 0
     var autoSaveShouldResumeAfterPause: Bool = false
     public var autoSaveDebounceNanoseconds: UInt64 = 750_000_000
-    public var autoSaveSerializer: @Sendable (PDFDocumentSaveSnapshot) -> Data? = {
+    var autoSaveSerializer: @Sendable (PDFDocumentSaveSnapshot) -> Data? = {
         PDFDocumentSaveSerializer.dataRepresentationPreservingShuaGroups(in: $0.document)
     }
 

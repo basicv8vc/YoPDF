@@ -214,12 +214,15 @@ public final class PDFDocumentModel: ObservableObject {
             }
             if let restoredPosition {
                 paneModel.goToPage(restoredPosition.pageIndex)
-                paneModel.setZoomScale(CGFloat(restoredPosition.zoomScale))
+                let restoredZoom = CGFloat(restoredPosition.zoomScale)
+                let z = restoredZoom.isFinite ? min(max(restoredZoom, Self.minimumZoomScale), Self.maximumZoomScale) : 1
+                paneModel.setZoomScale(z)
                 if restoredPosition.usesAutomaticScaling {
                     paneModel.fitToWindow()
                 }
             } else {
                 paneModel.goToPage(0)
+                paneModel.setZoomScale(1)
                 paneModel.fitToWindow()
             }
             paneModel.updateSelection(nil)

@@ -274,8 +274,17 @@ public final class PDFSearchCoordinator {
               let document = self.document
         else { return }
 
-        let next = queuedRequests.removeFirst()
-        start(request: next, in: document)
+        Task { @MainActor [weak self] in
+            guard let self,
+                  self.activeRequest == nil,
+                  !self.isDrainingCancellation,
+                  !self.queuedRequests.isEmpty,
+                  let document = self.document
+            else { return }
+
+            let next = self.queuedRequests.removeFirst()
+            self.start(request: next, in: document)
+        }
     }
 
     private func removeObservers(for active: ActiveSearchRequest) {
