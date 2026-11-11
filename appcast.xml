@@ -6,6 +6,15 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>YoPDF</title>
         <item>
+            <title>2026.11.11</title>
+            <pubDate>Wed, 11 Nov 2026 12:17:07 +0900</pubDate>
+            <link>https://github.com/basicv8vc/YoPDF/releases</link>
+            <sparkle:version>8</sparkle:version>
+            <sparkle:shortVersionString>2026.11.11</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.11/YoPDF-2026.11.11-build8-universal.dmg" length="6484862" type="application/octet-stream" sparkle:edSignature="Xa1Gw3c3HSYsKSao1LgwXdWyExzdclL0EcJmKOvNrrjepf7FFIn+lxfPEXOCnP67riXP7Czs1lyDvWCZVeHHCQ=="/>
+        </item>
+        <item>
             <title>2026.11.8</title>
             <pubDate>Sun, 08 Nov 2026 18:18:13 +0900</pubDate>
             <link>https://github.com/basicv8vc/YoPDF/releases</link>
@@ -23,18 +32,9 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
             <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.7/YoPDF-2026.11.7-build6-universal.dmg" length="6304682" type="application/octet-stream" sparkle:edSignature="o1qIRRmbT1TglXIlQ5xyU/rUhL471Y55bGR7f8TWPTKpO4hEeDcLVd4Hz5Uyo4hYSEPJ+sTBk25qIrldNL5DCA=="/>
         </item>
-        <item>
-            <title>2026.11.6</title>
-            <pubDate>Thu, 05 Nov 2026 17:20:57 +0900</pubDate>
-            <link>https://github.com/basicv8vc/YoPDF/releases</link>
-            <sparkle:version>5</sparkle:version>
-            <sparkle:shortVersionString>2026.11.6</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.6/YoPDF-2026.11.6-build5-universal.dmg" length="6258363" type="application/octet-stream" sparkle:edSignature="BAzqYl/Ss+HLmzwUSPrMtdrOelglSS1om/XcAQ2ZSfn+Q2Aa1nHa8igX7jr6jTvGyfq/oozYBD+n9jbaJVufDg=="/>
-        </item>
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: kfxyjXYc/8Bx6w7PEoaL22+2NvXgfV6saNIOcGrFAVEa/erNrFJOV2c81koUClCRoCHnXzJczRFTbyjRfw7CAQ==
-length: 2523
+edSignature: nChJM2lyHbrKEyeX13Kb38deqKDHn2QQ1SLGUcqpEW6VH9Si0xw7FS2umA5O66KhL+vn4sRm7lvYit5zmIqOBA==
+length: 2527
 -->
