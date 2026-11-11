@@ -23,50 +23,35 @@ public enum NoteEditError: Error, Equatable {
     case permissionDenied
 }
 
-/// Note creation, editing and deletion through the reader model.
+/// Note creation, editing and deletion through the reader resource session.
 ///
 /// Every mutation goes through the same `MarkupEdit` pipeline as Highlight and
 /// Underline: one edit, one Undo entry, one bump of the dirty state. The note
 /// body is always the standard `/Contents` entry, so a note written here is
 /// readable by any PDF application — the paper colour and the quoted excerpt
 /// live in optional custom keys that can be lost without losing the text.
-extension PDFDocumentModel {
+extension PDFResourceSession {
 
     // MARK: - Availability
 
     /// Whether the document accepts new annotations at all.
-    ///
-    /// `/F` flags do not apply to an annotation that does not exist yet, so this
-    /// is the document-level half of the permission check.
     public var canCreateNote: Bool {
         document?.allowsCommenting == true
-    }
-
-    /// Whether the toolbar's Add Note would capture a text selection.
-    public var canAddSelectionNote: Bool {
-        guard canCreateNote, let selection = currentSelection else { return false }
-        return !(selection.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     // MARK: - Drafts
 
     /// Captures the anchor for a note about the selected text.
-    ///
-    /// The anchor is fixed here, when the composer opens, not when Save is
-    /// pressed. That is what keeps a cross-page selection on an explicit page
-    /// and stops a later click or selection from moving the note.
-    public func selectionNoteDraft() -> NoteDraft? {
-        guard let document, canAddSelectionNote, let selection = currentSelection else {
+    public func selectionNoteDraft(from selection: PDFSelection?) -> NoteDraft? {
+        guard let document, canCreateNote, let selection,
+              !(selection.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
             return nil
         }
         return NoteService.draft(from: selection, in: document)
     }
 
     /// Captures the anchor for a page note at a click point.
-    ///
-    /// Deliberately does not consult `currentSelection`: a page note created
-    /// while text is still selected must not inherit that selection, neither its
-    /// text nor its page.
     public func pageNoteDraft(at point: CGPoint, on page: PDFPage) -> NoteDraft? {
         guard let document, document.allowsCommenting else { return nil }
         return NoteService.draft(at: point, on: page, in: document)
@@ -75,18 +60,11 @@ extension PDFDocumentModel {
     // MARK: - Reading
 
     /// The note marker under `point`, if any.
-    ///
-    /// Notes are tested before markup because a marker is small and sits on top
-    /// of the page; a click inside one is a request to open that note.
     public func noteSelection(at point: CGPoint, on page: PDFPage) -> NoteSelection? {
         guard let document, page.document === document else { return nil }
         let pageIndex = document.index(for: page)
         guard pageIndex >= 0 else { return nil }
 
-        // Sticker overlays represent one YoPDF note or one ShuaMac thought
-        // group. Resolve the marker before PDFKit's underlying annotation rects
-        // so a grouped sticker opens its representative note at the shared hit
-        // target instead of the last stacked `/Text` icon.
         if let marker = noteMarkers.reversed().first(where: {
             $0.pageIndex == pageIndex
                 && ($0.bounds.insetBy(dx: -3, dy: -3).contains(point)
@@ -100,7 +78,6 @@ extension PDFDocumentModel {
             )
         }
 
-        // Last annotation wins, matching PDFKit's paint order.
         for annotation in page.annotations.reversed() where NoteService.isTextAnnotation(annotation) {
             guard annotation.shouldDisplay,
                   !NoteService.usesStickerPresentation(annotation),
@@ -130,19 +107,12 @@ extension PDFDocumentModel {
     }
 
     /// Whether a captured anchor still describes the document on screen.
-    ///
-    /// A composer can outlive the document its anchor was taken from, and a
-    /// draft committed into a different document would land on a page the user
-    /// never pointed at.
     public func isCurrent(_ draft: NoteDraft) -> Bool {
         guard let document else { return false }
         return draft.documentIdentifier == ObjectIdentifier(document)
     }
 
     /// Whether `note` is still attached to the page it was read from.
-    ///
-    /// Re-checked before every write: an Undo, a delete from the context menu or
-    /// a document reload can detach the annotation while the composer is open.
     public func isAttached(_ note: NoteSelection) -> Bool {
         guard let document,
               let page = document.page(at: note.pageIndex),
@@ -165,12 +135,6 @@ extension PDFDocumentModel {
     }
 
     /// Moves a sticker marker and its PDF note rectangle as one undoable edit.
-    ///
-    /// Each entry remains a separate `/Text` annotation. Moving its marker
-    /// translates every member together and writes the shared normalized anchor
-    /// on each note. When Shua's embedded metadata exists, its shared
-    /// `markerPosition` is updated too, so ShuaMac reopens the group at the new
-    /// location.
     @discardableResult
     public func moveNoteMarker(_ note: NoteSelection, to proposedCenter: CGPoint) -> Bool {
         guard let document,
@@ -185,10 +149,6 @@ extension PDFDocumentModel {
               })
         else { return false }
 
-        // Shua's persisted group ID is shared by hidden and visible thoughts.
-        // Resolve against every page annotation so moving a visible marker
-        // keeps hidden members' stored anchors in sync too. YoPDF threads use
-        // their marker's resolved entries.
         let annotations: [PDFAnnotation]
         if NoteService.isShuaThought(note.annotation) {
             if let groupID = NoteService.shuaAnchorID(of: note.annotation) {
@@ -203,8 +163,7 @@ extension PDFDocumentModel {
         }
         guard !annotations.isEmpty,
               annotations.contains(where: { $0 === note.annotation }),
-              annotations.allSatisfy({
-                  annotation in
+              annotations.allSatisfy({ annotation in
                   annotation.page === page
                       && page.annotations.contains(where: { $0 === annotation })
                       && MarkupPermissions.allowsAnnotationChanges(annotation, in: document)
@@ -231,9 +190,6 @@ extension PDFDocumentModel {
             x: requestedStickerBounds.midX - currentCenter.x,
             y: requestedStickerBounds.midY - currentCenter.y
         )
-        // Clamp the complete translated group, including the visible sticker,
-        // instead of clamping only the sticker center and allowing hidden
-        // thought rectangles to leave the CropBox.
         let minimumDelta = CGPoint(
             x: crop.minX - movingBounds.minX,
             y: crop.minY - movingBounds.minY
@@ -276,17 +232,11 @@ extension PDFDocumentModel {
               performMarkupEdit(MarkupEdit(changes: changes))
         else { return false }
 
-        selectedMarkup = nil
         return true
     }
 
     // MARK: - Creating
 
-    /// Adds a standard `/Text` annotation for a captured anchor.
-    ///
-    /// The draft is revalidated against the current document before anything is
-    /// written: a composer that stayed open while another file was opened must
-    /// not drop its note on a page of the new document.
     @discardableResult
     public func addNote(
         _ draft: NoteDraft,
@@ -304,10 +254,6 @@ extension PDFDocumentModel {
               page.document === document
         else { return .failure(.pageUnavailable) }
 
-        // Add Note at an anchor that already has a usable YoPDF or Shua marker
-        // joins that thread. A malformed YoPDF identity stays readable on its
-        // own; adding at its anchor creates a separate legacy entry rather than
-        // attempting an append that the identity validator must reject.
         if let marker = noteMarkers.first(where: {
             $0.pageIndex == draft.pageIndex
                 && abs($0.center.x - draft.bounds.midX) <= 0.5
@@ -334,19 +280,12 @@ extension PDFDocumentModel {
             style: style,
             on: page
         ) else { return .failure(.emptyContents) }
-        // Every newly created YoPDF note starts a durable thread. Legacy
-        // anchor groups take the append path above and remain unmodified.
         NoteService.setYoPDFThreadIdentity(UUID(), order: 0, on: annotation)
 
         let edit = MarkupEdit(changes: [
             .insert(annotation: annotation, pageIndex: draft.pageIndex)
         ])
         guard performMarkupEdit(edit) else { return .failure(.permissionDenied) }
-
-        selectedMarkup = nil
-        // The text was captured into the draft, so the live selection is no
-        // longer needed and must not become the anchor of the next note.
-        updateSelection(nil)
 
         guard let selection = NoteService.selection(
             for: annotation,
@@ -356,10 +295,6 @@ extension PDFDocumentModel {
         return .success(selection)
     }
 
-    /// Adds one entry to a YoPDF or Shua thread, including a thread that
-    /// currently has only one visible entry. Legacy YoPDF notes remain grouped
-    /// by their shared anchor; identified threads retain their existing order
-    /// values. Shua geometry stacks are promoted with the new annotation.
     @discardableResult
     public func addThought(
         to group: NoteSelection,
@@ -434,19 +369,12 @@ extension PDFDocumentModel {
         ])
         guard performMarkupEdit(edit) else { return .failure(.permissionDenied) }
 
-        selectedMarkup = nil
-        updateSelection(nil)
         guard let updatedGroup = noteSelection(at: group.center, on: page) else {
             return .failure(.annotationUnavailable)
         }
         return .success(updatedGroup)
     }
 
-    /// Compatibility entry point for callers that only choose a paper tint.
-    ///
-    /// New UI code uses `addNote(_:contents:style:)`; this keeps the PR #6 API
-    /// working for tests and any future caller without inventing a second
-    /// persistence path.
     @discardableResult
     public func addNote(
         _ draft: NoteDraft,
@@ -460,14 +388,21 @@ extension PDFDocumentModel {
         )
     }
 
+    @discardableResult
+    public func addThought(
+        to group: NoteSelection,
+        contents: String,
+        paperColor: NotePaperColor
+    ) -> Result<NoteSelection, NoteEditError> {
+        addThought(
+            to: group,
+            contents: contents,
+            style: NoteStickerStyle(motif: .plain, palette: paperColor)
+        )
+    }
+
     // MARK: - Editing
 
-    /// Applies a body change and an appearance change as one undoable edit.
-    ///
-    /// Unchanged aspects are left out, so saving a colour-only change does not
-    /// rewrite `/Contents`, and a LockedContents note can still be restyled.
-    /// The style is read from the annotation, not from the possibly stale
-    /// selection value, so another editor's change is not silently reverted.
     @discardableResult
     public func updateNote(
         _ note: NoteSelection,
@@ -491,8 +426,6 @@ extension PDFDocumentModel {
 
         var changes: [MarkupEditChange] = []
         if oldText != text {
-            // LockedContents is checked here rather than by the caller: the
-            // composer's disabled state is a hint, this is the enforcement.
             guard MarkupPermissions.allowsContentsChanges(note.annotation) else {
                 return .failure(.permissionDenied)
             }
@@ -504,10 +437,6 @@ extension PDFDocumentModel {
             ))
         }
         if oldStyle != style {
-            // An explicit style change is the documented adoption point for a
-            // third-party note; a body-only edit leaves it native. The snapshot
-            // also records the original `/C` and which keys did not exist, so
-            // Undo removes the identity and restores the native presentation.
             changes.append(.setNoteStyle(
                 annotation: note.annotation,
                 pageIndex: note.pageIndex,
@@ -520,7 +449,6 @@ extension PDFDocumentModel {
         guard performMarkupEdit(MarkupEdit(changes: changes)) else {
             return .failure(.permissionDenied)
         }
-        selectedMarkup = nil
 
         guard let selection = NoteService.selection(
             for: note.annotation,
@@ -530,10 +458,6 @@ extension PDFDocumentModel {
         return .success(selection)
     }
 
-    /// Compatibility entry point that changes only the paper palette.
-    ///
-    /// The current motif is preserved, so calling this on a sticker note must
-    /// not turn it back into Simple Paper.
     @discardableResult
     public func updateNote(
         _ note: NoteSelection,
@@ -550,7 +474,6 @@ extension PDFDocumentModel {
 
     // MARK: - Deleting
 
-    /// Removes a note, including PDFKit's popup companion.
     @discardableResult
     public func deleteNote(_ note: NoteSelection) -> Bool {
         guard let document,
@@ -565,23 +488,177 @@ extension PDFDocumentModel {
         let edit = MarkupEdit(changes: [
             .remove(annotation: note.annotation, pageIndex: note.pageIndex)
         ])
-        guard performMarkupEdit(edit) else { return false }
-        selectedMarkup = nil
-        return true
+        return performMarkupEdit(edit)
     }
 
     // MARK: - Markers
 
-    /// Recomputes the page markers from the current document.
-    ///
-    /// Called after every annotation edit and after the document is replaced, so
-    /// the overlay never draws a marker for an annotation that no longer exists.
-    func refreshNoteMarkers() {
+    public func refreshNoteMarkers() {
         guard let document else {
             noteMarkers = []
             return
         }
         noteMarkers = NoteService.markers(in: document)
+    }
+}
+
+extension PDFDocumentModel {
+
+    // MARK: - Availability
+
+    public var canCreateNote: Bool {
+        resourceSession.canCreateNote
+    }
+
+    public var canAddSelectionNote: Bool {
+        paneModel.canAddSelectionNote
+    }
+
+    // MARK: - Drafts
+
+    public func selectionNoteDraft() -> NoteDraft? {
+        paneModel.selectionNoteDraft()
+    }
+
+    public func pageNoteDraft(at point: CGPoint, on page: PDFPage) -> NoteDraft? {
+        resourceSession.pageNoteDraft(at: point, on: page)
+    }
+
+    // MARK: - Reading
+
+    public func noteSelection(at point: CGPoint, on page: PDFPage) -> NoteSelection? {
+        resourceSession.noteSelection(at: point, on: page)
+    }
+
+    public func noteSelection(
+        forThreadEntry entry: NoteThreadEntry,
+        in group: NoteSelection
+    ) -> NoteSelection? {
+        resourceSession.noteSelection(forThreadEntry: entry, in: group)
+    }
+
+    public func isCurrent(_ draft: NoteDraft) -> Bool {
+        resourceSession.isCurrent(draft)
+    }
+
+    public func isAttached(_ note: NoteSelection) -> Bool {
+        resourceSession.isAttached(note)
+    }
+
+    public func notePermissions(for note: NoteSelection) -> NotePermissions {
+        resourceSession.notePermissions(for: note)
+    }
+
+    @discardableResult
+    public func moveNoteMarker(_ note: NoteSelection, to proposedCenter: CGPoint) -> Bool {
+        let success = resourceSession.moveNoteMarker(note, to: proposedCenter)
+        if success {
+            paneModel.clearMarkupSelection()
+        }
+        return success
+    }
+
+    // MARK: - Creating
+
+    @discardableResult
+    public func addNote(
+        _ draft: NoteDraft,
+        contents: String,
+        style: NoteStickerStyle
+    ) -> Result<NoteSelection, NoteEditError> {
+        let result = resourceSession.addNote(draft, contents: contents, style: style)
+        if case .success = result {
+            paneModel.clearMarkupSelection()
+            paneModel.updateSelection(nil)
+        }
+        return result
+    }
+
+    @discardableResult
+    public func addNote(
+        _ draft: NoteDraft,
+        contents: String,
+        paperColor: NotePaperColor
+    ) -> Result<NoteSelection, NoteEditError> {
+        let result = resourceSession.addNote(draft, contents: contents, paperColor: paperColor)
+        if case .success = result {
+            paneModel.clearMarkupSelection()
+            paneModel.updateSelection(nil)
+        }
+        return result
+    }
+
+    @discardableResult
+    public func addThought(
+        to group: NoteSelection,
+        contents: String,
+        style: NoteStickerStyle
+    ) -> Result<NoteSelection, NoteEditError> {
+        let result = resourceSession.addThought(to: group, contents: contents, style: style)
+        if case .success = result {
+            paneModel.clearMarkupSelection()
+            paneModel.updateSelection(nil)
+        }
+        return result
+    }
+
+    @discardableResult
+    public func addThought(
+        to group: NoteSelection,
+        contents: String,
+        paperColor: NotePaperColor
+    ) -> Result<NoteSelection, NoteEditError> {
+        let result = resourceSession.addThought(to: group, contents: contents, paperColor: paperColor)
+        if case .success = result {
+            paneModel.clearMarkupSelection()
+            paneModel.updateSelection(nil)
+        }
+        return result
+    }
+
+    // MARK: - Editing
+
+    @discardableResult
+    public func updateNote(
+        _ note: NoteSelection,
+        contents: String,
+        style: NoteStickerStyle
+    ) -> Result<NoteSelection, NoteEditError> {
+        let result = resourceSession.updateNote(note, contents: contents, style: style)
+        if case .success = result {
+            paneModel.clearMarkupSelection()
+        }
+        return result
+    }
+
+    @discardableResult
+    public func updateNote(
+        _ note: NoteSelection,
+        contents: String,
+        paperColor: NotePaperColor
+    ) -> Result<NoteSelection, NoteEditError> {
+        let result = resourceSession.updateNote(note, contents: contents, paperColor: paperColor)
+        if case .success = result {
+            paneModel.clearMarkupSelection()
+        }
+        return result
+    }
+
+    // MARK: - Deleting
+
+    @discardableResult
+    public func deleteNote(_ note: NoteSelection) -> Bool {
+        let success = resourceSession.deleteNote(note)
+        if success {
+            paneModel.clearMarkupSelection()
+        }
+        return success
+    }
+
+    // MARK: - Markers
+
+    public func refreshNoteMarkers() {
+        resourceSession.refreshNoteMarkers()
     }
 }
 
