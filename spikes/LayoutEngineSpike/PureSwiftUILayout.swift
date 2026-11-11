@@ -63,7 +63,7 @@ struct PureSwiftUINodeView: View {
     let onDropOnZone: ((PaneID, LayoutInsertionDirection) -> Void)?
     let contentProvider: (PaneID) -> AnyView
 
-    @State private var dragOffset: CGFloat = 0
+    @State private var dragStartFirstDim: CGFloat? = nil
     @State private var isDraggingDivider: Bool = false
 
     var body: some View {
@@ -120,12 +120,24 @@ struct PureSwiftUINodeView: View {
                             isDragging: isDraggingDivider
                         )
                         .gesture(
-                            DragGesture(minimumDistance: 1, coordinateSpace: .local)
+                            DragGesture(minimumDistance: 1)
                                 .onChanged { value in
                                     isDraggingDivider = true
+                                    let effective = max(0, availableDim)
+                                    guard effective > 0 else { return }
+
+                                    // Capture stable starting dimension at drag start to prevent cumulative drift
+                                    let startDim: CGFloat
+                                    if let initial = dragStartFirstDim {
+                                        startDim = initial
+                                    } else {
+                                        startDim = firstDim
+                                        dragStartFirstDim = firstDim
+                                    }
+
                                     let delta = value.translation.width
-                                    let newFirstDim = firstDim + delta
-                                    let proposedRatio = effectiveAvailable > 0 ? Double(newFirstDim / effectiveAvailable) : 0.5
+                                    let proposedFirstDim = startDim + delta
+                                    let proposedRatio = Double(proposedFirstDim / effective)
                                     let clampedNewRatio = LayoutNode.clampedRatio(
                                         proposedRatio,
                                         axis: .horizontal,
@@ -138,6 +150,7 @@ struct PureSwiftUINodeView: View {
                                 }
                                 .onEnded { _ in
                                     isDraggingDivider = false
+                                    dragStartFirstDim = nil
                                 }
                         )
 
@@ -176,12 +189,24 @@ struct PureSwiftUINodeView: View {
                             isDragging: isDraggingDivider
                         )
                         .gesture(
-                            DragGesture(minimumDistance: 1, coordinateSpace: .local)
+                            DragGesture(minimumDistance: 1)
                                 .onChanged { value in
                                     isDraggingDivider = true
+                                    let effective = max(0, availableDim)
+                                    guard effective > 0 else { return }
+
+                                    // Capture stable starting dimension at drag start to prevent cumulative drift
+                                    let startDim: CGFloat
+                                    if let initial = dragStartFirstDim {
+                                        startDim = initial
+                                    } else {
+                                        startDim = firstDim
+                                        dragStartFirstDim = firstDim
+                                    }
+
                                     let delta = value.translation.height
-                                    let newFirstDim = firstDim + delta
-                                    let proposedRatio = effectiveAvailable > 0 ? Double(newFirstDim / effectiveAvailable) : 0.5
+                                    let proposedFirstDim = startDim + delta
+                                    let proposedRatio = Double(proposedFirstDim / effective)
                                     let clampedNewRatio = LayoutNode.clampedRatio(
                                         proposedRatio,
                                         axis: .vertical,
@@ -194,6 +219,7 @@ struct PureSwiftUINodeView: View {
                                 }
                                 .onEnded { _ in
                                     isDraggingDivider = false
+                                    dragStartFirstDim = nil
                                 }
                         )
 
@@ -216,7 +242,7 @@ struct PureSwiftUINodeView: View {
     }
 }
 
-/// Visual divider with cursor feedback and hit-testing padding.
+/// Visual divider with cursor feedback and hit-testing padding that does not expand layout thickness.
 struct DividerView: View {
     let axis: SplitAxis
     let thickness: CGFloat
@@ -225,42 +251,49 @@ struct DividerView: View {
     @State private var isHovering: Bool = false
 
     var body: some View {
-        ZStack {
-            Rectangle()
-                .fill(isDragging ? Color.accentColor : (isHovering ? Color.secondary.opacity(0.5) : Color.gray.opacity(0.3)))
-                .frame(
-                    width: axis == .horizontal ? thickness : nil,
-                    height: axis == .vertical ? thickness : nil
-                )
-
-            // Transparent hit target padding (6 pt) for easy grabbing without visual bloat
-            Rectangle()
-                .fill(Color.clear)
-                .frame(
-                    width: axis == .horizontal ? max(6, thickness) : nil,
-                    height: axis == .vertical ? max(6, thickness) : nil
-                )
-        }
-        .contentShape(Rectangle())
-        .onHover { hovering in
-            isHovering = hovering
-            if hovering {
-                if axis == .horizontal {
-                    NSCursor.resizeLeftRight.push()
-                } else {
-                    NSCursor.resizeUpDown.push()
-                }
-            } else {
-                NSCursor.pop()
+        Rectangle()
+            .fill(isDragging ? Color.accentColor : (isHovering ? Color.secondary.opacity(0.5) : Color.gray.opacity(0.3)))
+            .frame(
+                width: axis == .horizontal ? thickness : nil,
+                height: axis == .vertical ? thickness : nil
+            )
+            .overlay {
+                // Interactive hit area overlay: extends grab target without expanding layout thickness
+                Rectangle()
+                    .fill(Color.clear)
+                    .contentShape(Rectangle())
+                    .frame(
+                        width: axis == .horizontal ? max(8, thickness) : nil,
+                        height: axis == .vertical ? max(8, thickness) : nil
+                    )
             }
-        }
-        .accessibilityElement()
-        .accessibilityLabel(axis == .horizontal ? "Vertical split divider" : "Horizontal split divider")
-        .accessibilityAddTraits(.isButton)
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                isHovering = hovering
+                if hovering {
+                    if axis == .horizontal {
+                        NSCursor.resizeLeftRight.push()
+                    } else {
+                        NSCursor.resizeUpDown.push()
+                    }
+                } else {
+                    NSCursor.pop()
+                }
+            }
+            .accessibilityElement()
+            .accessibilityLabel(axis == .horizontal ? "Vertical split divider" : "Horizontal split divider")
+            .accessibilityAddTraits(.isButton)
     }
 }
 
-/// Translucent drop zone overlay providing 4 target regions (Left, Right, Top, Bottom).
+/// Exploratory prototype demonstrating translucent 4-direction hover preview regions (Left, Right, Top, Bottom).
+///
+/// NOTE on Drop Zone Status:
+/// - This overlay is an exploratory prototype demonstrating hover visual feedback only.
+/// - It does NOT implement real drop delivery or transactional commit (which belongs to Stage P0-B-D).
+/// - Non-interference with PDFKit text selection and annotation gestures remains UNVERIFIED until full GUI integration.
+/// - In a production reader, visual-only preview layers must set `.allowsHitTesting(false)` so they do not
+///   intercept pointer events; actual drop targets require explicit platform drag-and-drop session handling.
 struct DropZoneOverlayView: View {
     let paneID: PaneID
     let onDrop: (LayoutInsertionDirection) -> Void

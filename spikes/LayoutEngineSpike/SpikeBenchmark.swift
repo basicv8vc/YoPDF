@@ -81,7 +81,7 @@ struct BenchmarkMain {
         print("  - Total time for \(iterations) frames: \(String(format: "%.4f", res.totalSeconds))s")
         print("  - Average computation per frame: \(String(format: "%.2f", res.averageMicroseconds)) µs")
         let achievableFPS = 1_000_000.0 / res.averageMicroseconds
-        print("  - Pure computation capacity: \(String(format: "%.0f", achievableFPS)) frames/sec (Theoretical max; display refresh capped at 120Hz ProMotion)")
+        print("  - Model geometry throughput: \(String(format: "%.0f", achievableFPS)) evaluations/sec (Model computation only; UI frame rate depends on view hierarchy)")
 
         // Dynamic ratio clamping test
         print("\n[Benchmark 2] Dynamic Ratio Clamping Invariant Verification")

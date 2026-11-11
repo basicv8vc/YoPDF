@@ -11,11 +11,12 @@ import SwiftUI
 import YoPDFCore
 
 /// An NSViewControllerRepresentable bridging an AppKit `NSSplitViewController` tree into SwiftUI.
-/// Evaluates:
-/// 1. Native macOS divider behavior and cursor management.
-/// 2. Synchronization impedance: bridging declarative tree updates into imperative NSSplitViewItems.
-/// 3. Complexity of 3-level nested splits and Auto Layout constraint recursion.
-/// 4. Drop Zone overlay injection onto native AppKit views.
+///
+/// NOTE: This file is an exploratory architectural spike demonstrating the high impedance
+/// of bridging an immutable binary split tree into imperative AppKit view controllers.
+/// Incomplete synchronization methods illustrate why two-way state reconciliation introduces
+/// substantial complexity and potential view-teardown risks. Per CTO directive, a full production
+/// AppKit synchronization engine was intentionally not constructed.
 public struct AppKitSplitLayoutRepresentable: NSViewControllerRepresentable {
     @Binding public var layoutTree: WorkspaceLayoutTree
     public let policy: LayoutPolicy

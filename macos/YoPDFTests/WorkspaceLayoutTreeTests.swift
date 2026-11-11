@@ -255,13 +255,64 @@ final class WorkspaceLayoutTreeTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(p1FrameHigh.width, policy.minimumLeafWidth)
         XCTAssertGreaterThanOrEqual(p2FrameHigh.width, policy.minimumLeafWidth)
 
-        // Test non-finite ratio (NaN and Infinity)
+        // Test non-finite ratio (NaN, +Infinity, -Infinity) with symmetric children
         let treeNaN = WorkspaceLayoutTree(
-            root: .split(axis: .horizontal, ratio: 0.5, first: .leaf(p1), second: .leaf(p2))
+            root: .split(axis: .horizontal, ratio: .nan, first: .leaf(p1), second: .leaf(p2))
         )
         let nanFrames = treeNaN.paneFrames(in: CGSize(width: 801, height: 500), policy: policy)
         XCTAssertEqual(nanFrames[p1]?.width ?? 0, 400, accuracy: 0.001)
         XCTAssertEqual(nanFrames[p2]?.width ?? 0, 400, accuracy: 0.001)
+
+        let treePosInf = WorkspaceLayoutTree(
+            root: .split(axis: .horizontal, ratio: .infinity, first: .leaf(p1), second: .leaf(p2))
+        )
+        let posInfFrames = treePosInf.paneFrames(in: CGSize(width: 801, height: 500), policy: policy)
+        XCTAssertEqual(posInfFrames[p1]?.width ?? 0, 480, accuracy: 0.001)
+        XCTAssertEqual(posInfFrames[p2]?.width ?? 0, 320, accuracy: 0.001)
+
+        let treeNegInf = WorkspaceLayoutTree(
+            root: .split(axis: .horizontal, ratio: -.infinity, first: .leaf(p1), second: .leaf(p2))
+        )
+        let negInfFrames = treeNegInf.paneFrames(in: CGSize(width: 801, height: 500), policy: policy)
+        XCTAssertEqual(negInfFrames[p1]?.width ?? 0, 320, accuracy: 0.001)
+        XCTAssertEqual(negInfFrames[p2]?.width ?? 0, 480, accuracy: 0.001)
+
+        // Test non-finite ratio with ASYMMETRIC nested subtree minimum dimensions:
+        // first child: leaf P1 (min width 320)
+        // second child: horizontal split (P2 | P3) (min width 320 + 1 + 320 = 641)
+        // Available width in 1001pt container: 1000pt.
+        // rMin = 320 / 1000 = 0.320
+        // rMax = 1 - (641 / 1000) = 0.359
+        // A naive ratio of 0.5 would give first=500, second=500 (violating second's 641 minimum).
+        // Safe candidate clamping MUST constrain NaN to rMax = 0.359.
+        let p3 = PaneID()
+        let asymmetricNestedRoot = LayoutNode.split(
+            axis: .horizontal,
+            ratio: .nan, // Non-finite!
+            first: .leaf(p1),
+            second: .split(
+                axis: .horizontal,
+                ratio: 0.5,
+                first: .leaf(p2),
+                second: .leaf(p3)
+            )
+        )
+        let asymmetricTree = WorkspaceLayoutTree(root: asymmetricNestedRoot)
+        let asymmetricFrames = asymmetricTree.paneFrames(in: CGSize(width: 1001, height: 500), policy: policy)
+        guard let f1 = asymmetricFrames[p1], let f2 = asymmetricFrames[p2], let f3 = asymmetricFrames[p3] else {
+            return XCTFail("Missing asymmetric frames")
+        }
+        XCTAssertGreaterThanOrEqual(f1.width, policy.minimumLeafWidth - 0.01)
+        XCTAssertGreaterThanOrEqual(f2.width, policy.minimumLeafWidth - 0.01)
+        XCTAssertGreaterThanOrEqual(f3.width, policy.minimumLeafWidth - 0.01)
+        XCTAssertEqual(f1.width, 359, accuracy: 0.01)
+        XCTAssertEqual(f2.width + policy.dividerThickness + f3.width, 641, accuracy: 0.01)
+
+        // Insufficient container geometry with NaN
+        let insufficientFrames = asymmetricTree.paneFrames(in: CGSize(width: 500, height: 500), policy: policy)
+        XCTAssertGreaterThan(insufficientFrames[p1]?.width ?? 0, 0)
+        XCTAssertGreaterThan(insufficientFrames[p2]?.width ?? 0, 0)
+        XCTAssertGreaterThan(insufficientFrames[p3]?.width ?? 0, 0)
     }
 
     // MARK: - 6. Insufficient-Window-Size Refusal
@@ -750,7 +801,137 @@ final class WorkspaceLayoutTreeTests: XCTestCase {
         }
     }
 
-    // MARK: - 15. Property-Based Invariant Fuzzing
+    // MARK: - 15. Nested Normalization Dimension Propagation Regression (CTO Review)
+
+    func testNestedSplitNormalizationPropagatesAllocatedDimensions() {
+        let p1 = PaneID()
+        let p2 = PaneID()
+        let p3 = PaneID()
+
+        let policy = LayoutPolicy(
+            minimumLeafWidth: 320,
+            minimumLeafHeight: 240,
+            dividerThickness: 1,
+            maxPanes: 4
+        )
+
+        // Root horizontal split: container 1001 x 800 pt
+        // Divider: 1 pt -> Available width = 1000 pt
+        // Ratio = 0.35 -> P1 gets 350 pt, second subtree (P2 | P3) gets 650 pt
+        // Inside second subtree: allocated width = 650 pt, divider = 1 pt -> available = 649 pt
+        // Minimums: P2=320, P3=320 -> rMin = 320/649 ≈ 0.49306, rMax = 1 - 320/649 ≈ 0.50693
+        // If the nested split had an unconstrained ratio of 0.85:
+        // - In old code: clamped against 1001pt (rMax = 0.679), yielding 0.679 * 649 = 440.6pt for P2,
+        //   leaving only 208.4pt for P3 (< 320pt minimum violation!).
+        // - In corrected code: geometry normalization passes the allocated 650pt to the nested split,
+        //   clamping its ratio to rMax = 0.50693, guaranteeing P3 >= 320pt!
+        let tree = WorkspaceLayoutTree(
+            root: .split(
+                axis: .horizontal,
+                ratio: 0.35,
+                first: .leaf(p1),
+                second: .split(
+                    axis: .horizontal,
+                    ratio: 0.85, // Persisted out-of-bounds ratio for 650pt container
+                    first: .leaf(p2),
+                    second: .leaf(p3)
+                )
+            )
+        )
+
+        let containerSize = CGSize(width: 1001, height: 800)
+        guard let normalizedTree = tree.normalized(in: containerSize, policy: policy) else {
+            return XCTFail("Normalization should succeed")
+        }
+
+        // Verify persisted ratio in normalized tree
+        guard case let .split(_, rootRatio, _, secondNode) = normalizedTree.root else {
+            return XCTFail("Expected split root")
+        }
+        XCTAssertEqual(rootRatio, 0.35, accuracy: 0.001)
+
+        guard case let .split(_, nestedRatio, _, _) = secondNode else {
+            return XCTFail("Expected nested split")
+        }
+        // Nested ratio must be clamped against the 650pt allocated dimension (~0.5069)
+        XCTAssertEqual(nestedRatio, 1.0 - (320.0 / 649.0), accuracy: 0.005)
+        XCTAssertLessThanOrEqual(nestedRatio, 0.51)
+
+        // Verify actual frame calculations from normalized tree match policy invariants
+        let frames = normalizedTree.paneFrames(in: containerSize, policy: policy)
+        guard let f1 = frames[p1], let f2 = frames[p2], let f3 = frames[p3] else {
+            return XCTFail("Frames missing")
+        }
+        XCTAssertGreaterThanOrEqual(f1.width, policy.minimumLeafWidth - 0.01)
+        XCTAssertGreaterThanOrEqual(f2.width, policy.minimumLeafWidth - 0.01)
+        XCTAssertGreaterThanOrEqual(f3.width, policy.minimumLeafWidth - 0.01)
+        XCTAssertEqual(f3.width, 320, accuracy: 0.1)
+    }
+
+    // MARK: - 16. Divider Dragging Drift & Reversal Invariance (CTO Review)
+
+    func testDividerDraggingPreventsCumulativeDriftAndHandlesReversals() {
+        let p1 = PaneID()
+        let p2 = PaneID()
+        let policy = LayoutPolicy(
+            minimumLeafWidth: 100,
+            minimumLeafHeight: 100,
+            dividerThickness: 1,
+            maxPanes: 4
+        )
+
+        // Container available space: 1000 pt (divider 1 pt, container 1001 pt)
+        let containerWidth: CGFloat = 1001
+        let availableWidth: CGFloat = 1000
+        let node1 = LayoutNode.leaf(p1)
+        let node2 = LayoutNode.leaf(p2)
+
+        // Initial state at drag start
+        let initialRatio: Double = 0.5
+        let initialFirstDim: CGFloat = availableWidth * CGFloat(initialRatio) // 500 pt
+
+        // Simulated drag sequence with repeated onChanged events and direction reversals:
+        // Cumulative translation offsets from gesture start:
+        let simulatedTranslations: [CGFloat] = [
+            10.0,   // drag right
+            30.0,   // continue right
+            75.0,   // continue right
+            120.0,  // continue right
+            60.0,   // direction reversal (drag left)
+            10.0,   // continue left
+            0.0,    // return to start point
+            -50.0,  // drag left beyond start point
+            -150.0, // continue left
+            -50.0,  // direction reversal back right
+            0.0     // return to start point
+        ]
+
+        for translation in simulatedTranslations {
+            // Formula specified by CTO:
+            // Compute movement strictly relative to the stable initial dimension captured at drag start
+            let proposedFirstDim = initialFirstDim + translation
+            let proposedRatio = Double(proposedFirstDim / availableWidth)
+            let clamped = LayoutNode.clampedRatio(
+                proposedRatio,
+                axis: .horizontal,
+                first: node1,
+                second: node2,
+                in: containerWidth,
+                policy: policy
+            )
+
+            let expectedDim = min(max(500.0 + translation, 100.0), 900.0)
+            let actualDim = availableWidth * CGFloat(clamped)
+            XCTAssertEqual(
+                actualDim,
+                expectedDim,
+                accuracy: 0.001,
+                "Translation \(translation) must not exhibit cumulative drift"
+            )
+        }
+    }
+
+    // MARK: - 17. Property-Based Invariant Fuzzing
 
     func testParameterizedAndPropertyBasedFuzzing() throws {
         let policy = LayoutPolicy(

@@ -3,7 +3,7 @@
 **Task**: P0-B-A Workspace Layout Core & Layout Engine Spike
 **Author**: Senior macOS Architect / Swift Engineer
 **Date**: November 2026
-**Status**: Completed Spike Evaluation
+**Status**: Completed Spike Evaluation (DEC-08 Status: PROVISIONAL)
 **Reference Specification**: `Docs/architecture/HETEROGENEOUS-MULTI-PANEL-ARCHITECTURE.md` (DEC-08)
 
 ---
@@ -16,79 +16,84 @@
 | **Xcode Version** | Xcode 27.2 (Build version 27B52) |
 | **Swift Toolchain** | Apple Swift version 6.4.2 (swiftlang-6.4.2.1.9 clang-2100.4.1.1) |
 | **Host Architecture** | Apple Silicon (`arm64`) |
-| **Window Geometry Tested** | 640 × 480 pt (minimum threshold) to 2560 × 1440 pt (stress expansion) |
+| **Window Geometry Tested** | 641 × 481 pt (minimum 2-pane threshold: $320 \times 2 + 1 = 641\text{ pt}$ width, $240 \times 2 + 1 = 481\text{ pt}$ height) to 2560 × 1440 pt |
 | **Baseline `LayoutPolicy`** | `minimumLeafWidth: 320 pt`, `minimumLeafHeight: 240 pt`, `dividerThickness: 1 pt`, `maxPanes: 4` |
 
 ---
 
 ## 2. Executive Summary & DEC-08 Recommendation
 
-### Architectural Decision DEC-08 Recommendation: **Pure SwiftUI Recursive Layout**
+### Architectural Decision DEC-08 Status: **PROVISIONAL — Pure SwiftUI Recursive Layout (Preferred Candidate)**
 
-We evaluated two architectural candidates using identical geometry and equivalent pane models:
+We evaluated two architectural candidates using identical geometry definitions:
 1. **Candidate A**: Pure SwiftUI Recursive Layout Engine driven directly by `WorkspaceLayoutTree`.
 2. **Candidate B**: AppKit `NSSplitViewController` wrapped by SwiftUI via `NSViewControllerRepresentable`.
 
 ### Core Recommendation:
-**Adopt Candidate A (Pure SwiftUI Recursive Layout)** for YoPDF's heterogeneous multi-panel workspace.
+**Adopt Candidate A (Pure SwiftUI Recursive Layout) as the preferred implementation candidate**, with final validation reserved for Stage P0-B multi-pane GUI integration.
 
-### Key Rationale:
-- **Zero Synchronization Impedance**: `WorkspaceLayoutTree` serves as the single source of truth. Tree mutations (`insert`, `remove`, `normalize`) flow directly into view updates without state desynchronization, eliminating two-way feedback loops.
-- **Superior Drop Zone Overlay Feasibility**: SwiftUI declarative `.overlay` with `.allowsHitTesting(false)` enables drop zone highlighting without intercepting native PDFKit interactions or breaking layer hierarchies.
-- **Elimination of Nested Auto Layout Failures**: Pure functional geometry calculations avoid AppKit Auto Layout constraint recursion warnings and crashes in 3-level deep nested splits during rapid resizing.
-- **Microsecond Layout Performance**: Empirical benchmarking measured recursive 3-level frame calculations at **4.62 µs per frame** (< 0.06% of an 8.33 ms 120Hz ProMotion frame budget).
+### Architectural Rationale & Hypotheses:
+- **Zero Synchronization Impedance (Architectural Invariant)**: `WorkspaceLayoutTree` is the single source of truth. Tree mutations flow unidirectionally into view evaluation (`LayoutTree -> View`). In contrast, Candidate B requires complex two-way synchronization between declarative state and imperative `NSSplitViewDelegate` events.
+- **Drop Zone Overlay Feasibility**: SwiftUI declarative `.overlay` layer with `.allowsHitTesting(false)` enables visual preview highlights without interfering with pointer events. Candidate B requires managing overlay `NSView` hierarchies above platform scroll views.
+- **Mathematical Layout Performance**: Pure functional geometry calculations require **4.62 µs per frame** at the model layer on Apple Silicon.
 
 ---
 
-## 3. Detailed Structured Evaluation (7 Criteria)
+## 3. Structured Trade-Off Comparison (7 Criteria)
 
-| # | Evaluation Factor | Pure SwiftUI Recursive Tree | AppKit `NSSplitViewController` Representable | Empirical Verdict |
+> [!NOTE]
+> This comparison distinguishes measured model calculations from architectural analyses. A completed head-to-head GUI benchmark was not run, as Candidate B's synchronization was intentionally left unimplemented per CTO scope boundaries.
+
+| # | Evaluation Factor | Pure SwiftUI Recursive Tree | AppKit `NSSplitViewController` Representable | Status / Verdict |
 | :--- | :--- | :--- | :--- | :--- |
-| **1** | **Divider Dragging Responsiveness** | Custom divider view with `DragGesture` updates `ratio` live. Dynamically clamped in $O(1)$ arithmetic without layout thrashing. | Native macOS window server divider tracking loop. Smooth tracking out-of-the-box, but bridging delta into tree requires async dispatch. | **SwiftUI**: Highly Responsive (4.62 µs/frame).<br>**AppKit**: Smooth tracking, but high sync latency. |
-| **2** | **3-Level Nested Split Stability** | Pure functional mapping (`LayoutNode -> View`). Zero Auto Layout constraints involved. Zero constraint recursion warnings. | Cascading child `NSSplitViewController`s trigger nested Auto Layout passes. Frequent `Unable to simultaneously satisfy constraints` warnings in Console during rapid resize. | **SwiftUI**: Completely Stable.<br>**AppKit**: Fragile in deep hierarchies. |
-| **3** | **Rapid Window Resizing** | Container geometry passed directly via `GeometryReader`. 10,000 rapid frame resizes evaluated without memory leak or frame drops. | `splitView(_:resizeSubviewsWithOldSize:)` collapses panes unevenly unless complex `holdingPriority` rules are tuned per subview. | **SwiftUI**: Deterministic.<br>**AppKit**: Edge-case collapse. |
-| **4** | **Minimum Dimension Enforcement** | Enforced mathematically at model layer via `clampedRatio` ($r_{\min} \le r \le r_{\max}$). Zero-pixel panes are mathematically impossible. | Enforced via `NSSplitViewItem.minimumThickness`. However, parent split items do NOT automatically aggregate child minimums without custom recursion. | **SwiftUI**: Verified (0 violations / 1,000 stress runs).<br>**AppKit**: Requires manual upward propagation. |
-| **5** | **Drop Zone Overlay Feasibility** | Trivial `.overlay` layer with `.allowsHitTesting(false)`. Smooth accent highlight animations without disturbing PDF view event handling. | Complex. Requires injecting overlay `NSView`s on top of `PDFView` subviews, causing CoreAnimation layer-ordering and clipping conflicts. | **SwiftUI**: Seamless.<br>**AppKit**: High complexity / layer friction. |
-| **6** | **VoiceOver Accessibility** | Standard SwiftUI accessibility tree (`.accessibilityElement(children: .contain)`). Dividers exposed with `.isButton` trait. | Native AppKit split accessibility (`NSAccessibilitySplitGroupRole`, `NSAccessibilitySplitterRole`). | **SwiftUI**: Clear structure.<br>**AppKit**: Slightly richer default rotor actions.<br>*(Full interactive VoiceOver session marked UNVERIFIED)* |
-| **7** | **Tree Synchronization Complexity** | **Zero impedance**. One-directional data flow (`Tree -> SwiftUI View`). Pane session models preserved via stable `id(paneID)`. | **Extreme Complexity**. Requires diffing tree against live `NSViewController` graph on every mutation. Risk of tearing down `PDFView` and losing scroll/zoom state. | **SwiftUI**: Decisive Advantage. |
+| **1** | **Divider Dragging Responsiveness** | Custom divider view with `DragGesture` computes displacement relative to a stable drag-start dimension. Clamped live via `LayoutNode.clampedRatio`. | Uses native AppKit window server divider tracking loop. | **Measured**: Model clamping executes in < 5 µs.<br>**GUI Rendering**: UNVERIFIED (provisional). |
+| **2** | **3-Level Nested Split Stability** | Pure functional mapping (`LayoutNode -> View`) with direct frame allocation. No constraint solver involved. | Relies on nested `NSSplitViewController` hierarchies. Each level introduces an internal Auto Layout constraint system. | **Architectural Analysis**: SwiftUI avoids nested constraint solver state. |
+| **3** | **Rapid Window Resizing** | Container dimensions passed down through `GeometryReader`. Functional geometry calculation scales deterministically. | Uses `splitView(_:resizeSubviewsWithOldSize:)`. Maintaining proportional subview ratios across nested splits requires custom delegate arithmetic. | **Architectural Analysis**: Functional calculation is mathematically deterministic. |
+| **4** | **Minimum Dimension Enforcement** | Enforced mathematically in `LayoutNode.clampedRatio` ($r_{\min} \le r \le r_{\max}$). Frame width/height cannot drop below policy minimums while space permits. | Enforced via `NSSplitViewItem.minimumThickness`. In nested splits, parent split items do not automatically aggregate child minimums without custom recursive propagation. | **Empirically Verified**: 0 violations across 1,000 stress iterations in model tests. |
+| **5** | **Drop Zone Overlay Feasibility** | Visual preview overlay rendered with `.allowsHitTesting(false)`. Interactive drop targets handle events explicitly without disturbing underlying content. | Requires injecting floating or subview `NSView` layers over AppKit subviews, introducing CoreAnimation layer-ordering complexity. | **Prototype Feasibility Confirmed**: SwiftUI approach is substantially simpler. |
+| **6** | **VoiceOver Accessibility** | Programmatic SwiftUI accessibility tree (`.accessibilityElement(children: .contain)`). Dividers exposed with `.isButton` accessibility traits. | Mature native AppKit accessibility hierarchy (`NSAccessibilitySplitGroupRole`, `NSAccessibilitySplitterRole`). | **Programmatic Elements Confirmed**.<br>**Interactive VoiceOver Session**: UNVERIFIED. |
+| **7** | **Tree Synchronization Complexity** | **Zero impedance**. Unidirectional data flow. Visual pane models preserve identity via `id(paneID)`. | **High Impedance**. Bridging declarative tree into stateful `NSSplitViewController` requires diffing child controllers, risking teardown of active `PDFView`s. | **Architectural Analysis**: Decisive advantage for Pure SwiftUI. |
 
 ---
 
-## 4. Empirical Benchmark Measurements
+## 4. Empirical Benchmark Measurements (Model Layer)
 
-Executed on Apple Silicon (macOS 26.7.2, arm64) using `spikes/LayoutEngineSpike/SpikeBenchmark.swift`:
+Executed on Apple Silicon (macOS 26.7.2, arm64) using `spikes/LayoutEngineSpike/SpikeBenchmark.swift`.
 
-### Benchmark 1: Recursive Geometry Throughput
-- **Geometry Tree**: 3-level nested split (4 panes: `P1 | (P2 / (P4 | P3))`).
-- **Iterations**: 10,000 rapid container size resizes (varying from 800×600 to 2000×1400).
+> [!IMPORTANT]
+> These benchmarks measure **Layout Core mathematical geometry computation throughput**, NOT full SwiftUI or AppKit GUI view rendering passes. They do not constitute a completed GUI benchmark between the two frameworks.
+
+### Benchmark 1: Recursive Geometry Computation Throughput
+- **Geometry Tree**: 3-level nested binary split tree (4 panes: `P1 | (P2 / (P4 | P3))`).
+- **Iterations**: 10,000 rapid container size resizes (varying from 800×600 to 2000×1400 pt).
 - **Total Execution Time**: 0.0462 seconds.
 - **Average Frame Computation**: **4.62 microseconds (µs)**.
-- **Theoretical Max Throughput**: 216,459 frames/sec.
-- **Analysis**: An 8.33 ms frame budget at 120Hz allows ~8,333 µs. Computing layout frames consumes **0.055%** of the frame budget, guaranteeing that layout calculation will never cause frame drops or scrolling stutter.
+- **Analysis**: The mathematical geometry model consumes ~4.62 µs per evaluation on Apple Silicon. This confirms that layout calculations add negligible overhead to the run loop. Actual UI rendering performance (including Quartz Compositor and `PDFView` page tiling) will be measured during Stage P0-B GUI integration.
 
 ### Benchmark 2: Dynamic Ratio Clamping Invariant Verification
 - **Iterations**: 1,000 randomized split container dimensions and out-of-bounds ratios (`[-1.0 ... +2.0]`).
-- **Degenerate Panes (< minimumLeafWidth/Height)**: **0 violations**.
+- **Violations of `minimumLeafWidth` / `minimumLeafHeight`**: **0 violations**.
 - **Status**: 100% Invariant Satisfaction.
 
 ### Benchmark 3: Tree Serialization & Decoding Overhead
 - **Payload Size**: 460 bytes (JSON).
 - **Average Decode Latency**: **36.21 microseconds (µs)** across 1,000 round-trips.
-- **Status**: Fast fail-safe deserialization confirms suitability for window restoration on launch.
+- **Status**: Confirms that deserializing window layout state on launch is fast and lightweight.
 
 ---
 
 ## 5. Verification Boundaries & Known Limitations
 
 In compliance with repository policy:
-- **VoiceOver Interactive Validation**: Synthesizer announcements and full rotor navigation with VoiceOver enabled in a running GUI process were not executed in this headless CI/sandbox toolchain and are explicitly marked **UNVERIFIED**. The programmatic accessibility hierarchy (`.accessibilityElement`, `.accessibilityLabel`) is confirmed.
-- **120Hz Hardware ProMotion Display Verification**: The pure computational capacity (4.62 µs/frame) theoretically supports > 200,000 FPS. However, actual on-screen 120Hz VSync frame delivery depends on the Quartz Compositor and `PDFView` page tiling in the production app. Real-world ProMotion smoothness will be measured during P0-B UI integration.
-- **Isolated Prototype**: Candidate code is contained entirely within `spikes/LayoutEngineSpike/` and is strictly isolated from production application targets.
+- **VoiceOver Interactive Validation**: Programmatic accessibility structures are defined, but interactive rotor navigation and spoken announcements with VoiceOver enabled in a running GUI process are marked **UNVERIFIED** (cannot be tested in a headless CI/sandbox toolchain).
+- **120Hz Display Performance**: While mathematical calculation takes 4.62 µs/frame, on-screen 120Hz VSync delivery depends on the production view hierarchy and `PDFView` rendering pipeline. Real-world display smoothness remains to be validated during GUI integration.
+- **Drop Zone Interaction**: The prototype demonstrates hover visual feedback only. Real drop target registration, drag session coordination, and non-interference with PDFKit text selection/annotation gestures belong to Stage P0-B-D and remain **UNVERIFIED** until full integration.
+- **DEC-08 Status**: Marked **PROVISIONAL**. Pure SwiftUI is the preferred candidate, with final confirmation deferred to production reader integration.
 
 ---
 
 ## 6. Implementation Action Plan for Stage P0-B
 
-1. **Step 1 (Approved)**: Adopt `WorkspaceLayoutTree` as the core layout engine model in `YoPDFCore` (completed in this task).
-2. **Step 2 (Next)**: Wire `PureSwiftUIRootLayoutView` from `spikes/LayoutEngineSpike/PureSwiftUILayout.swift` into `WorkspaceTab` and `WorkspaceView` to render multi-pane layouts.
-3. **Step 3 (Next)**: Connect container Drop Zone hit-testing to `layoutTree.inserting(..., adjacentTo: target, direction: zone, availableSize: size)` for drag-and-drop pane creation.
+1. **Step 1 (Approved)**: Adopt `WorkspaceLayoutTree` as the core layout engine model in `YoPDFCore` (completed in PR #48).
+2. **Step 2 (P0-B-B)**: Wire `PureSwiftUIRootLayoutView` from `spikes/LayoutEngineSpike/PureSwiftUILayout.swift` into `WorkspaceTab` to render multi-pane layouts.
+3. **Step 3 (P0-B-D)**: Implement transactional drag-and-drop delivery and drop zone hit-testing for pane creation and session movement.

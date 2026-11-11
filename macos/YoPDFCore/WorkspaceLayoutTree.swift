@@ -289,7 +289,11 @@ extension LayoutNode {
     }
 
     /// Clamps a proposed split ratio to respect minimum dimensions for both children.
-    /// If `containerDimension` is insufficient to satisfy both minimums, returns the proportional minimum ratio.
+    ///
+    /// - Normalizes non-finite ratios (NaN, positive/negative infinity) to a safe default candidate,
+    ///   then constrains that candidate against the allowable `[r_min, r_max]` range.
+    /// - If the container dimension is insufficient to satisfy both child minimums,
+    ///   apportions space proportionally based on child minimum requirements.
     public static func clampedRatio(
         _ proposedRatio: Double,
         axis: SplitAxis,
@@ -298,7 +302,17 @@ extension LayoutNode {
         in containerDimension: CGFloat,
         policy: LayoutPolicy = .default
     ) -> Double {
-        guard proposedRatio.isFinite else { return 0.5 }
+        let candidate: Double
+        if proposedRatio.isFinite {
+            candidate = proposedRatio
+        } else if proposedRatio == .infinity {
+            candidate = 1.0
+        } else if proposedRatio == -.infinity {
+            candidate = 0.0
+        } else {
+            // NaN
+            candidate = 0.5
+        }
 
         if let validRange = allowableRatioRange(
             axis: axis,
@@ -307,7 +321,7 @@ extension LayoutNode {
             in: containerDimension,
             policy: policy
         ) {
-            return min(max(proposedRatio, validRange.lowerBound), validRange.upperBound)
+            return min(max(candidate, validRange.lowerBound), validRange.upperBound)
         }
 
         // Fallback when container dimension is below the sum of minimum dimensions:
@@ -326,7 +340,7 @@ extension LayoutNode {
         if total > 0 {
             return Double(firstMin / total)
         }
-        return min(max(proposedRatio, 0.0), 1.0)
+        return min(max(candidate, 0.0), 1.0)
     }
 
     /// Calculates the layout frames for each leaf pane hosted in this subtree within the given rectangle.
@@ -578,16 +592,15 @@ extension LayoutNode {
         }
     }
 
-    /// Recursively normalizes the subtree:
+    /// Performs purely structural normalization:
     /// - Drops unbacked leaves not found in `validPaneIDs`.
     /// - Drops duplicate leaf IDs.
     /// - Drops leaves exceeding `policy.maxPanes`.
-    /// - Collapses empty or single-child split nodes.
-    /// - Clamps invalid or non-finite split ratios.
-    func normalized(
+    /// - Collapses empty splits (`nil, nil -> nil`).
+    /// - Collapses single-child splits (`surviving, nil -> surviving`, `nil, surviving -> surviving`).
+    func structurallyNormalized(
         validPaneIDs: Set<PaneID>?,
         seenPaneIDs: inout Set<PaneID>,
-        containerSize: CGSize?,
         policy: LayoutPolicy
     ) -> LayoutNode? {
         switch self {
@@ -605,16 +618,14 @@ extension LayoutNode {
             return .leaf(id)
 
         case let .split(axis, ratio, first, second):
-            let normFirst = first.normalized(
+            let normFirst = first.structurallyNormalized(
                 validPaneIDs: validPaneIDs,
                 seenPaneIDs: &seenPaneIDs,
-                containerSize: containerSize,
                 policy: policy
             )
-            let normSecond = second.normalized(
+            let normSecond = second.structurallyNormalized(
                 validPaneIDs: validPaneIDs,
                 seenPaneIDs: &seenPaneIDs,
-                containerSize: containerSize,
                 policy: policy
             )
 
@@ -626,27 +637,89 @@ extension LayoutNode {
             case (nil, let surviving?):
                 return surviving
             case (let f?, let s?):
-                let clamped: Double
-                if let containerSize {
-                    let dimension = (axis == .horizontal ? containerSize.width : containerSize.height)
-                    clamped = LayoutNode.clampedRatio(
-                        ratio,
-                        axis: axis,
-                        first: f,
-                        second: s,
-                        in: dimension,
-                        policy: policy
-                    )
-                } else {
-                    if !ratio.isFinite {
-                        clamped = 0.5
-                    } else {
-                        clamped = min(max(ratio, 0.05), 0.95)
-                    }
-                }
-                return .split(axis: axis, ratio: clamped, first: f, second: s)
+                return .split(axis: axis, ratio: ratio, first: f, second: s)
             }
         }
+    }
+
+    /// Performs geometry normalization on a structurally valid subtree:
+    /// - When `containerSize` is provided: computes the actual allocated dimensions for each child,
+    ///   clamps the split ratio against its allocated container dimension, and propagates
+    ///   the resulting sub-container sizes recursively to nested splits.
+    /// - When `containerSize` is `nil`: normalizes non-finite ratios to safe candidates and clamps to `[0.05, 0.95]`.
+    func geometryNormalized(
+        in containerSize: CGSize?,
+        policy: LayoutPolicy
+    ) -> LayoutNode {
+        switch self {
+        case .leaf:
+            return self
+
+        case let .split(axis, ratio, first, second):
+            guard let containerSize else {
+                let clamped: Double
+                if !ratio.isFinite {
+                    clamped = 0.5
+                } else {
+                    clamped = min(max(ratio, 0.05), 0.95)
+                }
+                return .split(
+                    axis: axis,
+                    ratio: clamped,
+                    first: first.geometryNormalized(in: nil, policy: policy),
+                    second: second.geometryNormalized(in: nil, policy: policy)
+                )
+            }
+
+            let totalDim = (axis == .horizontal ? containerSize.width : containerSize.height)
+            let clamped = LayoutNode.clampedRatio(
+                ratio,
+                axis: axis,
+                first: first,
+                second: second,
+                in: totalDim,
+                policy: policy
+            )
+
+            let availableSpace = max(0, totalDim - policy.dividerThickness)
+            let firstDim = availableSpace * CGFloat(clamped)
+            let secondDim = availableSpace - firstDim
+
+            let firstSize: CGSize
+            let secondSize: CGSize
+            switch axis {
+            case .horizontal:
+                firstSize = CGSize(width: firstDim, height: containerSize.height)
+                secondSize = CGSize(width: secondDim, height: containerSize.height)
+            case .vertical:
+                firstSize = CGSize(width: containerSize.width, height: firstDim)
+                secondSize = CGSize(width: containerSize.width, height: secondDim)
+            }
+
+            let normFirst = first.geometryNormalized(in: firstSize, policy: policy)
+            let normSecond = second.geometryNormalized(in: secondSize, policy: policy)
+
+            return .split(axis: axis, ratio: clamped, first: normFirst, second: normSecond)
+        }
+    }
+
+    /// Recursively normalizes the subtree:
+    /// 1. Structural normalization: prunes invalid and duplicate leaves, collapses empty/single-child splits.
+    /// 2. Geometry normalization: propagates actual allocated child dimensions and clamps ratios accordingly.
+    func normalized(
+        validPaneIDs: Set<PaneID>?,
+        seenPaneIDs: inout Set<PaneID>,
+        containerSize: CGSize?,
+        policy: LayoutPolicy
+    ) -> LayoutNode? {
+        guard let structural = structurallyNormalized(
+            validPaneIDs: validPaneIDs,
+            seenPaneIDs: &seenPaneIDs,
+            policy: policy
+        ) else {
+            return nil
+        }
+        return structural.geometryNormalized(in: containerSize, policy: policy)
     }
 }
 
