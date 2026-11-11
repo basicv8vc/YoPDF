@@ -11,19 +11,6 @@ import CoreGraphics
 
 @main
 struct BenchmarkMain {
-    @inline(__always)
-    static func measureTime(iterations: Int, block: () -> Void) -> (totalSeconds: Double, averageMicroseconds: Double) {
-        let start = DispatchTime.now()
-        for _ in 0..<iterations {
-            block()
-        }
-        let end = DispatchTime.now()
-        let nano = Double(end.uptimeNanoseconds - start.uptimeNanoseconds)
-        let totalSec = nano / 1_000_000_000.0
-        let avgMicros = (nano / Double(iterations)) / 1_000.0
-        return (totalSec, avgMicros)
-    }
-
     static func main() {
         print("=================================================================")
         print(" YoPDF Layout Engine Spike - Empirical Benchmark & Evaluation")
@@ -66,22 +53,46 @@ struct BenchmarkMain {
             )
         )
 
+        // Generate deterministic indexed input sizes
         var sizes: [CGSize] = []
+        sizes.reserveCapacity(iterations)
         for i in 0..<iterations {
             let w = 800.0 + Double(i % 1200)
             let h = 600.0 + Double(i % 800)
             sizes.append(CGSize(width: w, height: h))
         }
 
-        let res = measureTime(iterations: iterations) {
-            let s = sizes.randomElement()!
-            _ = threeLevelTree.paneFrames(in: s, policy: policy)
+        // Warm-up phase (1,000 iterations, not timed)
+        var warmUpChecksum: Double = 0.0
+        for i in 0..<1_000 {
+            let s = sizes[i % sizes.count]
+            let frames = threeLevelTree.paneFrames(in: s, policy: policy)
+            for frame in frames.values {
+                warmUpChecksum += Double(frame.width)
+            }
         }
+        _ = warmUpChecksum
 
-        print("  - Total time for \(iterations) frames: \(String(format: "%.4f", res.totalSeconds))s")
-        print("  - Average computation per frame: \(String(format: "%.2f", res.averageMicroseconds)) µs")
-        let achievableFPS = 1_000_000.0 / res.averageMicroseconds
-        print("  - Model geometry throughput: \(String(format: "%.0f", achievableFPS)) evaluations/sec (Model computation only; UI frame rate depends on view hierarchy)")
+        // Timed measurement loop: deterministic indexed access, zero random generation
+        var geometryChecksum: Double = 0.0
+        let start = DispatchTime.now()
+        for i in 0..<iterations {
+            let s = sizes[i]
+            let frames = threeLevelTree.paneFrames(in: s, policy: policy)
+            for frame in frames.values {
+                geometryChecksum += Double(frame.minX + frame.minY + frame.width + frame.height)
+            }
+        }
+        let end = DispatchTime.now()
+        let nano = Double(end.uptimeNanoseconds - start.uptimeNanoseconds)
+        let totalSeconds = nano / 1_000_000_000.0
+        let averageMicroseconds = (nano / Double(iterations)) / 1_000.0
+
+        print("  - Total time for \(iterations) frames: \(String(format: "%.4f", totalSeconds))s")
+        print("  - Average computation per frame: \(String(format: "%.2f", averageMicroseconds)) µs")
+        let achievableEvals = 1_000_000.0 / averageMicroseconds
+        print("  - Model geometry throughput: \(String(format: "%.0f", achievableEvals)) evaluations/sec (Model computation only; UI frame rate depends on view hierarchy)")
+        print("  - Accumulated geometry checksum: \(String(format: "%.2f", geometryChecksum)) (verifies observable consumption)")
 
         // Dynamic ratio clamping test
         print("\n[Benchmark 2] Dynamic Ratio Clamping Invariant Verification")
@@ -108,15 +119,37 @@ struct BenchmarkMain {
         print("  - Violations of minimumLeafWidth/Height: \(violations)")
         print("  - Status: PASSED (100% Invariant Satisfaction)")
 
+        // Benchmark 3: Tree Serialization & Deserialization
         print("\n[Benchmark 3] Tree Serialization & Deserialization Overhead")
         let encoder = JSONEncoder()
         let decoder = JSONDecoder()
         let data = try! encoder.encode(threeLevelTree)
-        let roundTripRes = measureTime(iterations: 1_000) {
-            _ = try! decoder.decode(WorkspaceLayoutTree.self, from: data)
+        let decodeIterations = 1_000
+
+        // Warm-up phase (100 iterations, not timed)
+        var warmUpDecodeChecksum = 0
+        for _ in 0..<100 {
+            let tree = try! decoder.decode(WorkspaceLayoutTree.self, from: data)
+            warmUpDecodeChecksum += tree.paneCount
         }
+        _ = warmUpDecodeChecksum
+
+        // Timed measurement loop
+        var decodeChecksum = 0
+        let decodeStart = DispatchTime.now()
+        for _ in 0..<decodeIterations {
+            let tree = try! decoder.decode(WorkspaceLayoutTree.self, from: data)
+            decodeChecksum += tree.paneCount + tree.leafIDs.count
+        }
+        let decodeEnd = DispatchTime.now()
+        let decodeNano = Double(decodeEnd.uptimeNanoseconds - decodeStart.uptimeNanoseconds)
+        let decodeTotalSeconds = decodeNano / 1_000_000_000.0
+        let decodeAverageMicroseconds = (decodeNano / Double(decodeIterations)) / 1_000.0
+
         print("  - JSON payload size: \(data.count) bytes")
-        print("  - Average decode latency: \(String(format: "%.2f", roundTripRes.averageMicroseconds)) µs")
+        print("  - Total time for \(decodeIterations) decodes: \(String(format: "%.4f", decodeTotalSeconds))s")
+        print("  - Average decode latency: \(String(format: "%.2f", decodeAverageMicroseconds)) µs")
+        print("  - Accumulated decode checksum: \(decodeChecksum) (verifies observable consumption)")
 
         print("\n=================================================================")
         print(" Benchmark Completed Successfully.")

@@ -870,6 +870,14 @@ final class WorkspaceLayoutTreeTests: XCTestCase {
 
     // MARK: - 16. Divider Dragging Drift & Reversal Invariance (CTO Review)
 
+    /// Verifies the mathematical drag displacement formula used by divider dragging handlers.
+    ///
+    /// NOTE on Test Coverage Scope:
+    /// - This test validates the displacement and ratio calculation arithmetic (`startDim + translation`)
+    ///   against cumulative drift across repeated updates and direction reversals.
+    /// - It tests model-level arithmetic and does NOT execute an AppKit/SwiftUI event loop or native `DragGesture`.
+    /// - Actual interactive GUI behavior (touch/mouse tracking, pointer capture, and 120Hz display refresh)
+    ///   remains explicitly UNVERIFIED pending production multi-pane UI integration in Stage P0-B.
     func testDividerDraggingPreventsCumulativeDriftAndHandlesReversals() {
         let p1 = PaneID()
         let p2 = PaneID()
