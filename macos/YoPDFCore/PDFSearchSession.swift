@@ -21,6 +21,8 @@ public final class PDFSearchSession: ObservableObject {
     @Published public private(set) var resultsRevision = 0
 
     public private(set) var document: PDFDocument?
+    public let paneID: UUID
+    private weak var coordinator: PDFSearchCoordinator?
 
     private struct Request {
         let generation: Int
@@ -57,10 +59,23 @@ public final class PDFSearchSession: ObservableObject {
     private var activeOperation: ActiveOperation?
     private var pendingNavigationOffset = 0
 
-    /// - Parameter debounceNanoseconds: Delay before starting a query. The app
-    ///   uses 200ms; tests can supply zero for faster deterministic fixtures.
-    public init(debounceNanoseconds: UInt64 = 200_000_000) {
+    /// - Parameters:
+    ///   - coordinator: Optional coordinator for serialized multi-pane searches.
+    ///   - debounceNanoseconds: Delay before starting a query. The app
+    ///     uses 200ms; tests can supply zero for faster deterministic fixtures.
+    ///   - paneID: Stable identity of the pane this search belongs to.
+    public init(
+        coordinator: PDFSearchCoordinator? = nil,
+        debounceNanoseconds: UInt64 = 200_000_000,
+        paneID: UUID = UUID()
+    ) {
+        self.coordinator = coordinator
         self.debounceNanoseconds = debounceNanoseconds
+        self.paneID = paneID
+    }
+
+    public func attachCoordinator(_ coordinator: PDFSearchCoordinator?) {
+        self.coordinator = coordinator
     }
 
     public var currentSelection: PDFSelection? {
@@ -176,6 +191,35 @@ public final class PDFSearchSession: ObservableObject {
         else { return }
 
         pendingRequest = nil
+
+        if let coordinator {
+            let requestGeneration = request.generation
+            let requestDocument = request.document
+            let query = request.query
+            coordinator.requestSearch(
+                paneID: paneID,
+                query: query,
+                onMatch: { _ in },
+                onComplete: { [weak self] matches in
+                    guard let self,
+                          self.generation == requestGeneration,
+                          self.document === requestDocument
+                    else { return }
+                    self.results = matches
+                    self.currentResultIndex = matches.isEmpty ? nil : 0
+                    if !matches.isEmpty, self.pendingNavigationOffset != 0 {
+                        let count = matches.count
+                        let offset = ((self.pendingNavigationOffset % count) + count) % count
+                        self.currentResultIndex = ((self.currentResultIndex ?? 0) + offset) % count
+                    }
+                    self.pendingNavigationOffset = 0
+                    self.resultsRevision &+= 1
+                    self.isSearching = false
+                }
+            )
+            return
+        }
+
         activeOperation = ActiveOperation(
             generation: request.generation,
             document: request.document
@@ -256,6 +300,9 @@ public final class PDFSearchSession: ObservableObject {
     }
 
     private func cancelActiveOperation() {
+        if let coordinator {
+            coordinator.cancelSearch(for: paneID)
+        }
         guard let activeOperation, activeOperation.document.isFinding else { return }
         activeOperation.document.cancelFindString()
     }

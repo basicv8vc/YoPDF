@@ -43,6 +43,12 @@ public struct UnsavedWork: Equatable, Sendable {
 
 // MARK: - Draft status
 
+/// Protocol for resolving a page-space rectangle to container/view coordinates.
+@MainActor
+public protocol PageAnchorResolving: AnyObject {
+    func containerRect(forPageBounds bounds: CGRect, pageIndex: Int) -> CGRect?
+}
+
 /// Whether the note a composer is working on still exists.
 ///
 /// Read from the document on every render rather than cached: another
@@ -108,9 +114,45 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
     public let id = UUID()
     public let mode: Mode
     /// Where the popover's arrow points, in the reader's top-left space.
-    public let anchorRect: CGRect
+    ///
+    /// The persistent logical anchor (`logicalPageIndex`, `logicalBounds`) is authoritative.
+    /// This presentation rectangle is transient and should be recalculated via `PageAnchorResolving`
+    /// whenever the pane is resized, split, or reparented.
+    public internal(set) var anchorRect: CGRect
     public let pageLabel: String
     public let excerpt: String?
+
+    public var logicalPageIndex: Int {
+        switch mode {
+        case let .create(draft):
+            return draft.pageIndex
+        case let .edit(note), let .group(note):
+            return note.pageIndex
+        }
+    }
+
+    public var logicalBounds: CGRect {
+        switch mode {
+        case let .create(draft):
+            return draft.bounds
+        case let .edit(note), let .group(note):
+            return note.marker.bounds
+        }
+    }
+
+    /// Transitional presentation anchor update.
+    public func updatePresentationAnchorRect(_ newRect: CGRect) {
+        self.anchorRect = newRect
+    }
+
+    @discardableResult
+    public func updatePresentationAnchor(using resolver: PageAnchorResolving) -> Bool {
+        guard let rect = resolver.containerRect(forPageBounds: logicalBounds, pageIndex: logicalPageIndex) else {
+            return false
+        }
+        self.anchorRect = rect
+        return true
+    }
     /// What the draft looked like when the composer opened. `hasUncommittedChanges`
     /// is measured against these, not against the document.
     public private(set) var initialContents: String
@@ -278,6 +320,22 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
 
     // MARK: - Committing
 
+    /// Writes the draft into the document through a resource session.
+    public func commit(to resourceSession: PDFResourceSession) -> Result<NoteSelection, NoteEditError> {
+        switch mode {
+        case let .create(draft):
+            return resourceSession.addNote(draft, contents: contents, style: style)
+        case let .edit(note):
+            return resourceSession.updateNote(note, contents: contents, style: style)
+        case let .group(note):
+            return resourceSession.addThought(to: note, contents: contents, style: style)
+        }
+    }
+
+    public func commit(to paneModel: PDFPaneModel) -> Result<NoteSelection, NoteEditError> {
+        commit(to: paneModel.resourceSession)
+    }
+
     /// Writes the draft into the document.
     ///
     /// Nothing is written when the target has gone away — the annotation object
@@ -285,28 +343,29 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
     /// keeps the text and reports the failure instead of silently redirecting it
     /// to some other note.
     public func commit(to model: PDFDocumentModel) -> Result<NoteSelection, NoteEditError> {
+        commit(to: model.resourceSession)
+    }
+
+    public func status(in resourceSession: PDFResourceSession) -> NoteDraftStatus {
         switch mode {
         case let .create(draft):
-            return model.addNote(draft, contents: contents, style: style)
+            guard resourceSession.isCurrent(draft) else { return .documentReplaced }
+            return resourceSession.canCreateNote ? .ready : .commentingDisabled
         case let .edit(note):
-            return model.updateNote(note, contents: contents, style: style)
+            return resourceSession.isAttached(note) ? .ready : .noteRemoved
         case let .group(note):
-            return model.addThought(to: note, contents: contents, style: style)
+            guard resourceSession.isAttached(note) else { return .noteRemoved }
+            return resourceSession.canCreateNote ? .ready : .commentingDisabled
         }
+    }
+
+    public func status(in paneModel: PDFPaneModel) -> NoteDraftStatus {
+        status(in: paneModel.resourceSession)
     }
 
     /// Whether Save can do anything right now.
     public func status(in model: PDFDocumentModel) -> NoteDraftStatus {
-        switch mode {
-        case let .create(draft):
-            guard model.isCurrent(draft) else { return .documentReplaced }
-            return model.canCreateNote ? .ready : .commentingDisabled
-        case let .edit(note):
-            return model.isAttached(note) ? .ready : .noteRemoved
-        case let .group(note):
-            guard model.isAttached(note) else { return .noteRemoved }
-            return model.canCreateNote ? .ready : .commentingDisabled
-        }
+        status(in: model.resourceSession)
     }
 
     private static func normalized(_ text: String) -> String {
@@ -423,20 +482,51 @@ public final class NoteComposerStore: ObservableObject {
         end()
     }
 
+    public func updatePresentationAnchorRect(_ newRect: CGRect) {
+        session?.updatePresentationAnchorRect(newRect)
+    }
+
+    @discardableResult
+    public func updatePresentationAnchor(using resolver: PageAnchorResolving) -> Bool {
+        session?.updatePresentationAnchor(using: resolver) ?? false
+    }
+
+    /// Closes a composer whose note no longer exists — unless it holds text.
+    public func reconcile(with resourceSession: PDFResourceSession) {
+        guard let session,
+              !session.hasUncommittedChanges,
+              !session.status(in: resourceSession).isReady
+        else { return }
+        end()
+    }
+
+    public func reconcile(with paneModel: PDFPaneModel) {
+        reconcile(with: paneModel.resourceSession)
+    }
+
     /// Closes a composer whose note no longer exists — unless it holds text.
     ///
     /// This is the whole rule for "another annotation edit happened": a dirty
     /// draft is never closed behind the user's back, it is left open so the
     /// composer can explain that the note is gone and offer the text back.
     public func reconcile(with model: PDFDocumentModel) {
-        guard let session,
-              !session.hasUncommittedChanges,
-              !session.status(in: model).isReady
-        else { return }
-        end()
+        reconcile(with: model.resourceSession)
     }
 
     // MARK: - Committing
+
+    @discardableResult
+    public func commit(using resourceSession: PDFResourceSession) -> Result<NoteSelection, NoteEditError> {
+        guard let session else { return .failure(.noDocument) }
+        let result = session.commit(to: resourceSession)
+        if case .success = result { end() }
+        return result
+    }
+
+    @discardableResult
+    public func commit(using paneModel: PDFPaneModel) -> Result<NoteSelection, NoteEditError> {
+        commit(using: paneModel.resourceSession)
+    }
 
     /// Commits the draft and closes the composer on success.
     ///
@@ -452,10 +542,29 @@ public final class NoteComposerStore: ObservableObject {
     /// was, so the caller can report the problem without losing the draft.
     @discardableResult
     public func commit(using model: PDFDocumentModel) -> Result<NoteSelection, NoteEditError> {
-        guard let session else { return .failure(.noDocument) }
-        let result = session.commit(to: model)
-        if case .success = result { end() }
-        return result
+        commit(using: model.resourceSession)
+    }
+
+    public func resolvePendingDraft(
+        using resourceSession: PDFResourceSession
+    ) -> Result<NoteSelection?, NoteEditError> {
+        guard let session else { return .success(nil) }
+        if session.hasEmptyContents {
+            switch session.mode {
+            case .create, .group:
+                end()
+                return .success(nil)
+            case .edit:
+                return .failure(.emptyContents)
+            }
+        }
+        return commit(using: resourceSession).map { Optional.some($0) }
+    }
+
+    public func resolvePendingDraft(
+        using paneModel: PDFPaneModel
+    ) -> Result<NoteSelection?, NoteEditError> {
+        resolvePendingDraft(using: paneModel.resourceSession)
     }
 
     /// Resolves the draft an interrupted reader action is waiting on.
@@ -481,17 +590,7 @@ public final class NoteComposerStore: ObservableObject {
     public func resolvePendingDraft(
         using model: PDFDocumentModel
     ) -> Result<NoteSelection?, NoteEditError> {
-        guard let session else { return .success(nil) }
-        if session.hasEmptyContents {
-            switch session.mode {
-            case .create, .group:
-                end()
-                return .success(nil)
-            case .edit:
-                return .failure(.emptyContents)
-            }
-        }
-        return commit(using: model).map { Optional.some($0) }
+        resolvePendingDraft(using: model.resourceSession)
     }
 
     // MARK: - Revision
