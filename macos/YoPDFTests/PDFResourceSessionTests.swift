@@ -275,6 +275,140 @@ final class PDFResourceSessionTests: XCTestCase {
         XCTAssertEqual(sessionB.results.first?.string?.lowercased().trimmingCharacters(in: .whitespacesAndNewlines), "beta")
     }
 
+    func testSearchCancellationDrainsAndExecutesQueuedSearchFromAnotherPane() async throws {
+        let doc = try makeDocument(pageCount: 20) { page in
+            page == 19 ? "targetterm at end" : String(repeating: "filler ", count: 200)
+        }
+        let coordinator = PDFSearchCoordinator(document: doc)
+        let paneA_ID = UUID()
+        let paneB_ID = UUID()
+
+        var matchesA: [PDFSelection] = []
+        var completeACalled = false
+        var completeBCalled = false
+        var matchesB: [PDFSelection] = []
+
+        // Pane A starts a slow search across 20 pages
+        coordinator.requestSearch(
+            paneID: paneA_ID,
+            query: "filler",
+            onMatch: { matchesA.append($0) },
+            onComplete: { _ in completeACalled = true }
+        )
+        XCTAssertTrue(coordinator.isFinding)
+        XCTAssertEqual(coordinator.activePaneID, paneA_ID)
+
+        // Pane B queues a search for "targetterm"
+        coordinator.requestSearch(
+            paneID: paneB_ID,
+            query: "targetterm",
+            onMatch: { matchesB.append($0) },
+            onComplete: {
+                matchesB = $0
+                completeBCalled = true
+            }
+        )
+        XCTAssertEqual(coordinator.queuedCount, 1)
+
+        // Cancel Pane A's search while active
+        coordinator.cancelSearch(for: paneA_ID)
+
+        // Wait for cancellation to drain and Pane B to finish
+        let deadline = Date().addingTimeInterval(5)
+        while coordinator.isFinding && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertFalse(coordinator.isFinding)
+        XCTAssertFalse(completeACalled, "Cancelled request must not call onComplete.")
+        XCTAssertTrue(completeBCalled, "Queued request must be executed after cancellation drains.")
+        XCTAssertEqual(matchesB.count, 1)
+        XCTAssertEqual(matchesB.first?.string?.trimmingCharacters(in: .whitespacesAndNewlines), "targetterm")
+    }
+
+    func testLateNotificationFromCancelledOperationIsDropped() throws {
+        let doc = try makeDocument(pageCount: 2) { _ in "Text" }
+        let coordinator = PDFSearchCoordinator(document: doc)
+        let paneID = UUID()
+
+        var receivedMatches: [PDFSelection] = []
+        var completeCalled = false
+
+        let reqID = coordinator.requestSearch(
+            paneID: paneID,
+            query: "Text",
+            onMatch: { receivedMatches.append($0) },
+            onComplete: { _ in completeCalled = true }
+        )
+        XCTAssertNotNil(reqID)
+
+        // Cancel the search immediately
+        coordinator.cancelSearch(for: paneID)
+
+        // Simulate late PDFKit notification arriving after cancellation
+        let page = try XCTUnwrap(doc.page(at: 0))
+        let fakeSelection = try XCTUnwrap(doc.selection(from: page, atCharacterIndex: 0, to: page, atCharacterIndex: 2))
+
+        NotificationCenter.default.post(
+            name: .PDFDocumentDidFindMatch,
+            object: doc,
+            userInfo: [PDFDocumentFoundSelectionKey: fakeSelection]
+        )
+
+        XCTAssertTrue(receivedMatches.isEmpty, "Late match notification after cancellation must be dropped.")
+        XCTAssertFalse(completeCalled, "Cancelled search must not receive onComplete.")
+    }
+
+    func testMultiPaneLeaseLifecycleTransitions() throws {
+        let url = try makeTemporaryPDF(pageCount: 2, named: "multi-lease") { _ in "Content" }
+        let resource = PDFResourceSession(access: SecurityScopeSpy())
+        XCTAssertTrue(resource.open(url: url))
+        XCTAssertNotNil(resource.documentSession)
+
+        let pane1 = PDFPaneModel(id: PaneID(), resourceSession: resource)
+        let pane2 = PDFPaneModel(id: PaneID(), resourceSession: resource)
+        let pane3 = PDFPaneModel(id: PaneID(), resourceSession: resource)
+        XCTAssertEqual(resource.activeLeaseCount, 3)
+
+        pane1.close()
+        XCTAssertEqual(resource.activeLeaseCount, 2)
+        XCTAssertNotNil(resource.documentSession, "Resource must remain active while 2 panes remain.")
+
+        pane2.close()
+        XCTAssertEqual(resource.activeLeaseCount, 1)
+        XCTAssertNotNil(resource.documentSession, "Resource must remain active while 1 pane remains.")
+
+        let pane4 = PDFPaneModel(id: PaneID(), resourceSession: resource)
+        XCTAssertEqual(resource.activeLeaseCount, 2)
+        XCTAssertNotNil(resource.documentSession)
+
+        pane3.close()
+        XCTAssertEqual(resource.activeLeaseCount, 1)
+        XCTAssertNotNil(resource.documentSession)
+
+        pane4.close()
+        XCTAssertEqual(resource.activeLeaseCount, 0)
+        XCTAssertNil(resource.documentSession, "Resource must close when last pane is closed.")
+    }
+
+    func testResourceCloseInvalidatesSearchCoordinator() throws {
+        let url = try makeTemporaryPDF(pageCount: 10, named: "close-search") { _ in "Searchable text" }
+        let resource = PDFResourceSession(access: SecurityScopeSpy())
+        XCTAssertTrue(resource.open(url: url))
+
+        let paneID = UUID()
+        resource.searchCoordinator.requestSearch(
+            paneID: paneID,
+            query: "Searchable",
+            onComplete: { _ in }
+        )
+        XCTAssertTrue(resource.searchCoordinator.isFinding)
+
+        resource.close()
+        XCTAssertFalse(resource.searchCoordinator.isFinding, "Closing resource must cancel all search coordinator operations.")
+        XCTAssertEqual(resource.searchCoordinator.queuedCount, 0)
+    }
+
     // MARK: - 12: Failed Open & Save Safety Guarantees
 
     func testFailedOpenPreservesExistingDocumentAndLease() throws {

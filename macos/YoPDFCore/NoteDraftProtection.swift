@@ -140,6 +140,15 @@ public final class NoteComposerSession: ObservableObject, Identifiable {
         }
     }
 
+    public var targetAnnotationID: ObjectIdentifier? {
+        switch mode {
+        case .create:
+            return nil
+        case let .edit(note), let .group(note):
+            return note.id
+        }
+    }
+
     /// Transitional presentation anchor update.
     public func updatePresentationAnchorRect(_ newRect: CGRect) {
         self.anchorRect = newRect
