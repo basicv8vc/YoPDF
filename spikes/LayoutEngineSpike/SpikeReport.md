@@ -35,7 +35,7 @@ We evaluated two architectural candidates using identical geometry definitions:
 ### Architectural Rationale & Hypotheses:
 - **Zero Synchronization Impedance (Architectural Invariant)**: `WorkspaceLayoutTree` is the single source of truth. Tree mutations flow unidirectionally into view evaluation (`LayoutTree -> View`). In contrast, Candidate B requires complex two-way synchronization between declarative state and imperative `NSSplitViewDelegate` events.
 - **Drop Zone Overlay Feasibility**: SwiftUI declarative `.overlay` layer with `.allowsHitTesting(false)` enables visual preview highlights without interfering with pointer events. Candidate B requires managing overlay `NSView` hierarchies above platform scroll views.
-- **Mathematical Layout Performance**: Pure functional geometry calculations require **5.02 µs per frame** at the model layer on Apple Silicon.
+- **Mathematical Layout Performance**: Pure functional geometry calculations require **4.19 µs per frame** at the model layer on Apple Silicon.
 
 ---
 
@@ -46,7 +46,7 @@ We evaluated two architectural candidates using identical geometry definitions:
 
 | # | Evaluation Factor | Pure SwiftUI Recursive Tree | AppKit `NSSplitViewController` Representable | Status / Verdict |
 | :--- | :--- | :--- | :--- | :--- |
-| **1** | **Divider Dragging Responsiveness** | Custom divider view with `DragGesture` computes displacement relative to a stable drag-start dimension. Clamped live via `LayoutNode.clampedRatio`. | Uses native AppKit window server divider tracking loop. | **Measured**: Model clamping executes in 5.02 µs/frame.<br>**Drag Arithmetic**: Verified in unit tests.<br>**Interactive GUI DragGesture**: UNVERIFIED (provisional). |
+| **1** | **Divider Dragging Responsiveness** | Custom divider view with `DragGesture` computes displacement relative to a stable drag-start dimension. Clamped live via `LayoutNode.clampedRatio`. | Uses native AppKit window server divider tracking loop. | **Measured**: Model clamping executes in 4.19 µs/frame.<br>**Drag Arithmetic**: Verified in unit tests.<br>**Interactive GUI DragGesture**: UNVERIFIED (provisional). |
 | **2** | **3-Level Nested Split Stability** | Pure functional mapping (`LayoutNode -> View`) with direct frame allocation. No constraint solver involved. | Relies on nested `NSSplitViewController` hierarchies. Each level introduces an internal Auto Layout constraint system. | **Architectural Analysis**: SwiftUI avoids nested constraint solver state. |
 | **3** | **Rapid Window Resizing** | Container dimensions passed down through `GeometryReader`. Functional geometry calculation scales deterministically. | Uses `splitView(_:resizeSubviewsWithOldSize:)`. Maintaining proportional subview ratios across nested splits requires custom delegate arithmetic. | **Architectural Analysis**: Functional calculation is mathematically deterministic. |
 | **4** | **Minimum Dimension Enforcement** | Enforced mathematically in `LayoutNode.clampedRatio` ($r_{\min} \le r \le r_{\max}$). Frame width/height cannot drop below policy minimums while space permits. | Enforced via `NSSplitViewItem.minimumThickness`. In nested splits, parent split items do not automatically aggregate child minimums without custom recursive propagation. | **Empirically Verified**: 0 violations across 3,000 stress iterations in model benchmarks (Horizontal, Vertical, Asymmetric). |
@@ -86,18 +86,22 @@ Executed on Apple Silicon (macOS 26.7.2, arm64) using `spikes/LayoutEngineSpike/
 - **Warm-up**: 1,000 unmeasured warmup evaluations before timing.
 - **Iterations**: 10,000 deterministic indexed container size resizes (varying from 800×600 to 2000×1400 pt, zero random number generation in timed loop).
 - **Result Consumption**: Computed frames accumulated into an observable checksum printed outside the loop.
-- **Total Execution Time**: **0.0502 seconds**.
-- **Average Frame Computation**: **5.02 microseconds (µs)**.
-- **Throughput**: 199,075 evaluations/sec.
+- **Total Execution Time**: **0.0419 seconds**.
+- **Average Frame Computation**: **4.19 microseconds (µs)**.
+- **Throughput**: 238,746 evaluations/sec.
 - **Accumulated Geometry Checksum**: `78986272.82` (verifies complete observable consumption).
-- **Analysis**: The mathematical geometry model consumes ~5.02 µs per evaluation on Apple Silicon. This confirms that layout calculations add negligible overhead to the run loop. Actual UI rendering performance (including Quartz Compositor and `PDFView` page tiling) will be measured during Stage P0-B GUI integration.
+- **Analysis**: The mathematical geometry model consumes ~4.19 µs per evaluation on Apple Silicon. This confirms that layout calculations add negligible overhead to the run loop. Actual UI rendering performance (including Quartz Compositor and `PDFView` page tiling) will be measured during Stage P0-B GUI integration.
 
 ### Benchmark 2: Dynamic Ratio Clamping Invariant Verification
 - **Test Suites (3 deterministic suites, 3,000 total iterations)**:
-  1. **Suite 2A (Horizontal Split)**: 1,000 iterations, widths 641...2000 pt, requested ratios `[-1.0 ... +2.0]`, plus `.nan`, `+.infinity`, `-.infinity`.
-  2. **Suite 2B (Vertical Split)**: 1,000 iterations, heights 481...1800 pt, requested ratios `[-1.0 ... +2.0]`, plus `.nan`, `+.infinity`, `-.infinity`.
-  3. **Suite 2C (Asymmetric Nested Split `P1 | (P2 | P3)`)**: 1,000 iterations, widths 962...2500 pt, heights 500...1000 pt, root ratios `[-1.0 ... +2.0]` (including non-finite), nested ratios `[-0.5 ... +1.5]`.
-- **Fail-Safe Mechanism**: The benchmark actively asserts `width >= policy.minimumLeafWidth - 0.01` and `height >= policy.minimumLeafHeight - 0.01` for every resulting pane frame. If any violation occurs, the benchmark prints an error and calls `exit(1)`.
+  1. **Suite 2A (Horizontal Split)**: 1,000 iterations, widths 641...2000 pt, requested ratios `[-1.0 ... +2.0]`, plus `.nan`, `+.infinity`, `-.infinity`. Expected pane count: 2.
+  2. **Suite 2B (Vertical Split)**: 1,000 iterations, heights 481...1800 pt, requested ratios `[-1.0 ... +2.0]`, plus `.nan`, `+.infinity`, `-.infinity`. Expected pane count: 2.
+  3. **Suite 2C (Asymmetric Nested Split `P1 | (P2 | P3)`)**: 1,000 iterations, widths 962...2500 pt, heights 500...1000 pt, root ratios `[-1.0 ... +2.0]` (including non-finite), nested ratios `[-0.5 ... +1.5]`. Expected pane count: 3.
+- **Fail-Safe Mechanism**: The benchmark actively asserts for every frame:
+  - `isFinite(origin.x)`, `isFinite(origin.y)`, `isFinite(size.width)`, `isFinite(size.height)`.
+  - `width >= policy.minimumLeafWidth - 0.01` and `height >= policy.minimumLeafHeight - 0.01`.
+  - `frames.count == expectedPaneCount` (2A = 2, 2B = 2, 2C = 3).
+  - Any violation increments `violations` and terminates with `exit(1)`.
 - **Observed Violations**: **0 violations across all 3,000 iterations**.
 - **Status**: **PASSED (100% Invariant Satisfaction, process exited with code 0)**.
 
@@ -105,8 +109,8 @@ Executed on Apple Silicon (macOS 26.7.2, arm64) using `spikes/LayoutEngineSpike/
 - **Payload Size**: 460 bytes (JSON).
 - **Warm-up**: 100 unmeasured warmup decodes.
 - **Iterations**: 1,000 decodes with decoded results observably consumed via `paneCount` and `leafIDs.count`.
-- **Total Execution Time**: **0.0195 seconds**.
-- **Average Decode Latency**: **19.50 microseconds (µs)** across 1,000 iterations.
+- **Total Execution Time**: **0.0216 seconds**.
+- **Average Decode Latency**: **21.61 microseconds (µs)** across 1,000 iterations.
 - **Accumulated Decode Checksum**: `8000` (verifies complete observable consumption).
 - **Status**: Confirms that deserializing window layout state on launch is fast and lightweight.
 
@@ -116,7 +120,7 @@ Executed on Apple Silicon (macOS 26.7.2, arm64) using `spikes/LayoutEngineSpike/
 
 In compliance with repository policy:
 - **VoiceOver Interactive Validation**: Programmatic accessibility structures are defined, but interactive rotor navigation and spoken announcements with VoiceOver enabled in a running GUI process are marked **UNVERIFIED** (cannot be tested in a headless CI/sandbox toolchain).
-- **120Hz Display Performance**: While mathematical calculation takes 5.02 µs/frame, on-screen 120Hz VSync delivery depends on the production view hierarchy and `PDFView` rendering pipeline. Real-world display smoothness remains to be validated during GUI integration.
+- **120Hz Display Performance**: While mathematical calculation takes 4.19 µs/frame, on-screen 120Hz VSync delivery depends on the production view hierarchy and `PDFView` rendering pipeline. Real-world display smoothness remains to be validated during GUI integration.
 - **Divider Dragging in GUI**: Drag displacement arithmetic is mathematically verified against drift and reversals in unit tests; real-time interaction with SwiftUI `DragGesture` events in an active macOS window remains **UNVERIFIED** pending full integration.
 - **Drop Zone Interaction**: The prototype demonstrates hover visual feedback only. Real drop target registration, drag session coordination, and non-interference with PDFKit text selection/annotation gestures belong to Stage P0-B-D and remain **UNVERIFIED** until full integration.
 - **DEC-08 Status**: Marked **PROVISIONAL**. Pure SwiftUI is the preferred candidate, with final confirmation deferred to production reader integration.

@@ -98,7 +98,22 @@ struct BenchmarkMain {
         print("\n[Benchmark 2] Dynamic Ratio Clamping Invariant Verification")
         var violations = 0
 
-        // Suite 2A: Horizontal Split Stress Test (1,000 deterministic iterations)
+        @inline(__always)
+        func validateFrame(_ frame: CGRect, policy: LayoutPolicy) -> Bool {
+            guard frame.origin.x.isFinite,
+                  frame.origin.y.isFinite,
+                  frame.size.width.isFinite,
+                  frame.size.height.isFinite else {
+                return false
+            }
+            guard frame.width >= policy.minimumLeafWidth - 0.01,
+                  frame.height >= policy.minimumLeafHeight - 0.01 else {
+                return false
+            }
+            return true
+        }
+
+        // Suite 2A: Horizontal Split Stress Test (1,000 deterministic iterations, expected count: 2)
         for i in 0..<1_000 {
             let width = 641.0 + Double(i % 1359)
             let height = 500.0 + Double(i % 500)
@@ -122,14 +137,17 @@ struct BenchmarkMain {
                 )
             )
             let frames = tree.paneFrames(in: CGSize(width: width, height: height), policy: policy)
+            if frames.count != 2 {
+                violations += 1
+            }
             for (_, frame) in frames {
-                if frame.width < policy.minimumLeafWidth - 0.01 || frame.height < policy.minimumLeafHeight - 0.01 {
+                if !validateFrame(frame, policy: policy) {
                     violations += 1
                 }
             }
         }
 
-        // Suite 2B: Vertical Split Stress Test (1,000 deterministic iterations)
+        // Suite 2B: Vertical Split Stress Test (1,000 deterministic iterations, expected count: 2)
         for i in 0..<1_000 {
             let width = 600.0 + Double(i % 600)
             let height = 481.0 + Double(i % 1319)
@@ -153,14 +171,17 @@ struct BenchmarkMain {
                 )
             )
             let frames = tree.paneFrames(in: CGSize(width: width, height: height), policy: policy)
+            if frames.count != 2 {
+                violations += 1
+            }
             for (_, frame) in frames {
-                if frame.width < policy.minimumLeafWidth - 0.01 || frame.height < policy.minimumLeafHeight - 0.01 {
+                if !validateFrame(frame, policy: policy) {
                     violations += 1
                 }
             }
         }
 
-        // Suite 2C: Asymmetric Nested Split Stress Test (1,000 deterministic iterations)
+        // Suite 2C: Asymmetric Nested Split Stress Test (1,000 deterministic iterations, expected count: 3)
         // first: P1 (min width 320, min height 240)
         // second: (P2 | P3) (min width 320 + 1 + 320 = 641, min height 240)
         // Total minimum width: 320 + 1 + 641 = 962 pt
@@ -193,15 +214,19 @@ struct BenchmarkMain {
                 )
             )
             let frames = tree.paneFrames(in: CGSize(width: width, height: height), policy: policy)
+            if frames.count != 3 {
+                violations += 1
+            }
             for (_, frame) in frames {
-                if frame.width < policy.minimumLeafWidth - 0.01 || frame.height < policy.minimumLeafHeight - 0.01 {
+                if !validateFrame(frame, policy: policy) {
                     violations += 1
                 }
             }
         }
 
-        print("  - Stress test suites: 3 (Horizontal, Vertical, Asymmetric Nested)")
+        print("  - Stress test suites: 3 (Horizontal [2 panes], Vertical [2 panes], Asymmetric Nested [3 panes])")
         print("  - Total stress iterations: 3,000")
+        print("  - Invariants checked per frame: isFinite(x,y,w,h), minWidth, minHeight, paneCount")
         print("  - Constraint violations: \(violations)")
         if violations > 0 {
             print("  - Status: FAILED (\(violations) violations detected)")
