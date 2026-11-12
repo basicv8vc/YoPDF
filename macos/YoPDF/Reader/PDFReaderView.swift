@@ -304,14 +304,44 @@ private struct WorkspaceTabStrip: View {
 struct PDFReaderView: View {
 
     @ObservedObject var workspace: WorkspaceWindowModel
-    @ObservedObject var model: PDFDocumentModel
-    @ObservedObject var composerStore: NoteComposerStore
-    @ObservedObject var searchSession: PDFSearchSession
-    @ObservedObject var navigationState: ReaderNavigationState
     @ObservedObject var updateController: SparkleUpdateController
     @ObservedObject var recentDocuments: RecentDocumentsStore
     @ObservedObject var fileOpenRequests: FileOpenRequestQueue
     let canReceiveFinderOpenRequest: Bool
+
+    init(
+        workspace: WorkspaceWindowModel,
+        model: PDFDocumentModel? = nil,
+        composerStore: NoteComposerStore? = nil,
+        searchSession: PDFSearchSession? = nil,
+        navigationState: ReaderNavigationState? = nil,
+        updateController: SparkleUpdateController,
+        recentDocuments: RecentDocumentsStore,
+        fileOpenRequests: FileOpenRequestQueue,
+        canReceiveFinderOpenRequest: Bool
+    ) {
+        self.workspace = workspace
+        self.updateController = updateController
+        self.recentDocuments = recentDocuments
+        self.fileOpenRequests = fileOpenRequests
+        self.canReceiveFinderOpenRequest = canReceiveFinderOpenRequest
+    }
+
+    private var tab: WorkspaceTabSession {
+        workspace.activeTab
+    }
+    private var model: PDFDocumentModel {
+        tab.model
+    }
+    private var composerStore: NoteComposerStore {
+        tab.composerStore
+    }
+    private var searchSession: PDFSearchSession {
+        tab.searchSession
+    }
+    private var navigationState: ReaderNavigationState {
+        tab.navigationState
+    }
 
     @State private var isImporterPresented = false
     @State private var pendingRecentRelink: RecentDocument?
@@ -327,8 +357,28 @@ struct PDFReaderView: View {
     @State private var closeGuard = WindowCloseGuard()
     /// True while the next page click places a page note.
     @State private var isPlacingNote = false
-    /// Converts page rectangles into popover anchors through the live PDFView.
-    @State private var anchorResolver = PageAnchorResolver()
+    /// Per-pane anchor resolvers converting page rectangles into popover anchors through live PDFViews.
+    @State private var anchorResolvers: [PaneID: PageAnchorResolver] = [:]
+    /// Current size of the content layout area.
+    @State private var currentContentSize: CGSize?
+
+    private var anchorResolver: PageAnchorResolver {
+        anchorResolver(for: tab.activePaneID)
+    }
+
+    private func anchorResolver(for paneID: PaneID) -> PageAnchorResolver {
+        if let existing = anchorResolvers[paneID] {
+            return existing
+        }
+        let resolver = PageAnchorResolver()
+        anchorResolvers[paneID] = resolver
+        return resolver
+    }
+
+    private func activatePane(_ paneID: PaneID) {
+        guard tab.activePaneID != paneID else { return }
+        workspace.activate(paneID: paneID)
+    }
 
     #if DEBUG
     /// Test-only launch hook for deterministic screenshot and GUI runs. It is
@@ -344,6 +394,7 @@ struct PDFReaderView: View {
         case save
         case saveAs
         case closeTab(UUID)
+        case closePane(PaneID)
         case closeWindow
         case quit
         /// Replacing the open composer with another note.
@@ -362,6 +413,7 @@ struct PDFReaderView: View {
             case .save: return .save
             case .saveAs: return .saveAs
             case .closeTab: return .closeTab
+            case .closePane: return .closeTab
             case .closeWindow: return .closeWindow
             case .quit: return .quit
             case .compose: return .compose
@@ -425,7 +477,7 @@ struct PDFReaderView: View {
                     return "“\(url.lastPathComponent)” cannot be opened while this document has unsaved changes."
                 case let .relink(url, _):
                     return "“\(url.lastPathComponent)” cannot be opened while this document has unsaved changes."
-                case .closeTab, .closeWindow, .quit:
+                case .closeTab, .closePane, .closeWindow, .quit:
                     return "This document has changes that are not in the file yet."
                 case .save, .saveAs, .compose:
                     return "This document has changes that are not in the file yet."
@@ -452,7 +504,7 @@ struct PDFReaderView: View {
                 return base + " “\(url.lastPathComponent)” cannot be opened until you save or discard it."
             case let .relink(url, _):
                 return base + " “\(url.lastPathComponent)” cannot be opened until you save or discard it."
-            case .closeTab, .closeWindow, .quit:
+            case .closeTab, .closePane, .closeWindow, .quit:
                 return base + " Saving it puts the note in the document; the file itself still has to be saved."
             case .compose:
                 return base + " Save it or discard it before opening another note."
@@ -531,7 +583,7 @@ struct PDFReaderView: View {
 
     private var closeGuardReader: some View {
         let readerID = closeGuard.readerID
-        return focusedReader.background(
+        return splitFocusedReader.background(
             WindowCloseGuardInstaller(
                 guardObject: closeGuard,
                 unsavedWork: { unsavedWork },
@@ -568,6 +620,28 @@ struct PDFReaderView: View {
                 }
             )
         )
+    }
+
+    private var splitRightAction: (@MainActor () -> Void)? {
+        guard canSplitActivePane(direction: .right) else { return nil }
+        return { splitActivePane(direction: .right) }
+    }
+
+    private var splitDownAction: (@MainActor () -> Void)? {
+        guard canSplitActivePane(direction: .bottom) else { return nil }
+        return { splitActivePane(direction: .bottom) }
+    }
+
+    private var closePaneAction: (@MainActor () -> Void)? {
+        guard canCloseActivePane() else { return nil }
+        return { requestCloseActivePane() }
+    }
+
+    private var splitFocusedReader: some View {
+        focusedReader
+            .focusedSceneValue(\.splitRight, splitRightAction)
+            .focusedSceneValue(\.splitDown, splitDownAction)
+            .focusedSceneValue(\.closePane, closePaneAction)
     }
 
     private var focusedReader: some View {
@@ -1043,6 +1117,38 @@ struct PDFReaderView: View {
             .accessibilityLabel("Save")
             .help("Save changes (⌘S)")
 
+            Divider().frame(height: 18)
+
+            Button {
+                splitActivePane(direction: .right)
+            } label: {
+                Image(systemName: "rectangle.split.2x1")
+            }
+            .disabled(!canSplitActivePane(direction: .right))
+            .help(splitButtonHelp(direction: .right))
+            .accessibilityLabel("Split Right")
+            .accessibilityIdentifier("pdf-split-right-button")
+
+            Button {
+                splitActivePane(direction: .bottom)
+            } label: {
+                Image(systemName: "rectangle.split.1x2")
+            }
+            .disabled(!canSplitActivePane(direction: .bottom))
+            .help(splitButtonHelp(direction: .bottom))
+            .accessibilityLabel("Split Down")
+            .accessibilityIdentifier("pdf-split-down-button")
+
+            Button {
+                requestCloseActivePane()
+            } label: {
+                Image(systemName: "rectangle.badge.xmark")
+            }
+            .disabled(!canCloseActivePane())
+            .help(canCloseActivePane() ? "Close active pane" : "Cannot close the only pane")
+            .accessibilityLabel("Close Pane")
+            .accessibilityIdentifier("pdf-close-pane-button")
+
             Spacer(minLength: 8)
 
             // A popover is dismissed by any click outside it. The draft survives
@@ -1268,7 +1374,6 @@ struct PDFReaderView: View {
     @ViewBuilder
     private var content: some View {
         if model.isLoaded {
-            let searchBelongsToDisplayedDocument = searchSession.document === model.document
             HStack(spacing: 0) {
                 if isSidebarVisible {
                     ReaderSidebar(
@@ -1282,87 +1387,7 @@ struct PDFReaderView: View {
                     Divider()
                 }
 
-                PDFViewerRepresentable(
-                    document: model.document,
-                    currentPageIndex: Binding(
-                        get: { model.currentPageIndex },
-                        set: { model.updateCurrentPageIndex($0) }
-                    ),
-                    selection: Binding(
-                        get: { model.currentSelection },
-                        set: { model.updateSelection($0) }
-                    ),
-                    autoScales: model.isAutoScaling,
-                    zoomScale: model.zoomScale,
-                    zoomCommandRevision: model.zoomCommandRevision,
-                    pageNavigationRevision: model.pageNavigationRevision,
-                    navigationDestination: pendingNavigationDestination,
-                    navigationRevision: navigationRevision,
-                    onScaleChange: { model.updateEffectiveScale($0) },
-                    onSettledViewState: { document, pageIndex, scale, pageRevision, zoomRevision in
-                        model.updateViewState(
-                            document: document,
-                            pageIndex: pageIndex,
-                            scale: scale,
-                            pageNavigationRevision: pageRevision,
-                            zoomCommandRevision: zoomRevision
-                        )
-                    },
-                    onManualMagnification: { model.setAutoScaling(false) },
-                    selectedMarkup: model.selectedMarkup,
-                    noteMarkers: model.noteMarkers,
-                    isPlacingNote: isPlacingNote,
-                    annotationRevision: model.annotationRevision,
-                    changedAnnotationPageIndices: model.changedAnnotationPageIndices,
-                    onMarkupClick: { point, page in
-                        model.selectMarkup(at: point, on: page)
-                    },
-                    onNoteHit: { point, page in
-                        model.noteSelection(at: point, on: page)
-                    },
-                    onNoteActivated: { note, anchor in
-                        requestNoteComposer(note, anchor: anchor)
-                    },
-                    onNoteMoved: { note, center in
-                        _ = model.moveNoteMarker(note, to: center)
-                    },
-                    onPlaceNote: { point, page, anchor in
-                        placePageNote(at: point, on: page, anchor: anchor)
-                    },
-                    onCancelPlacement: { isPlacingNote = false },
-                    searchSelections: searchBelongsToDisplayedDocument ? searchSession.results : [],
-                    activeSearchSelection: searchBelongsToDisplayedDocument
-                        ? searchSession.currentSelection
-                        : nil,
-                    searchResultsRevision: searchSession.resultsRevision,
-                    makeMenuItems: { context in
-                        pageMenuItems(for: context)
-                    },
-                    anchorResolver: anchorResolver
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .id(model.loadGeneration)
-                .popover(
-                    isPresented: $composerStore.isPresented,
-                    attachmentAnchor: .rect(.rect(composerStore.session?.anchorRect ?? Self.fallbackAnchor)),
-                    arrowEdge: .top
-                ) {
-                    if let session = composerStore.session {
-                        NoteComposerView(session: session, model: model) {
-                            composerStore.end()
-                        } onEditGroupEntry: { group, entry in
-                            guard let note = model.noteSelection(forThreadEntry: entry, in: group) else {
-                                return
-                            }
-                            let anchor = anchorResolver.containerRect(
-                                forPageBounds: group.bounds,
-                                pageIndex: group.pageIndex
-                            ) ?? Self.fallbackAnchor
-                            requestCompose(.note(note, anchor))
-                        }
-                        .id(session.id)
-                    }
-                }
+                workspaceLayout
             }
             // A composer describes one anchor in one document, so a new document
             // or a changed annotation set can invalidate it. It is never closed
@@ -1404,6 +1429,147 @@ struct PDFReaderView: View {
                 } message: {
                     Text(currentOpenError?.errorDescription ?? "Unknown error.")
                 }
+        }
+    }
+
+    private var workspaceLayout: some View {
+        GeometryReader { geometry in
+            WorkspaceRootLayoutView(
+                layoutTree: Binding(
+                    get: { tab.layoutTree },
+                    set: { tab.layoutTree = $0 }
+                ),
+                policy: .default
+            ) { paneID in
+                paneView(for: paneID)
+            }
+            .onAppear {
+                Task { @MainActor in
+                    currentContentSize = geometry.size
+                }
+            }
+            .onChange(of: geometry.size) { _, newSize in
+                Task { @MainActor in
+                    currentContentSize = newSize
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    @ViewBuilder
+    private func paneView(for paneID: PaneID) -> some View {
+        if let paneSession = tab.paneSessions[paneID] {
+            let paneModel = paneSession.paneModel
+            let resourceSession = paneSession.resourceSession
+            let isPaneActive = (tab.activePaneID == paneID)
+            let searchBelongsToDisplayedDocument = paneModel.searchSession.document === resourceSession.document
+            let paneDocModel = tab.model(for: paneSession)
+            let resolver = anchorResolver(for: paneID)
+
+            ZStack(alignment: .topTrailing) {
+                PDFViewerRepresentable(
+                    document: resourceSession.document,
+                    currentPageIndex: Binding(
+                        get: { paneModel.currentPageIndex },
+                        set: { paneModel.updateCurrentPageIndex($0) }
+                    ),
+                    selection: Binding(
+                        get: { paneModel.currentSelection },
+                        set: { paneModel.updateSelection($0) }
+                    ),
+                    autoScales: paneModel.isAutoScaling,
+                    zoomScale: paneModel.zoomScale,
+                    zoomCommandRevision: paneModel.zoomCommandRevision,
+                    pageNavigationRevision: paneModel.pageNavigationRevision,
+                    navigationDestination: isPaneActive ? pendingNavigationDestination : nil,
+                    navigationRevision: navigationRevision,
+                    onScaleChange: { paneModel.updateEffectiveScale($0) },
+                    onSettledViewState: { document, pageIndex, scale, pageRevision, zoomRevision in
+                        paneModel.updateViewState(
+                            document: document,
+                            pageIndex: pageIndex,
+                            scale: scale,
+                            pageNavigationRevision: pageRevision,
+                            zoomCommandRevision: zoomRevision
+                        )
+                    },
+                    onManualMagnification: { paneModel.setAutoScaling(false) },
+                    selectedMarkup: paneModel.selectedMarkup,
+                    noteMarkers: resourceSession.noteMarkers,
+                    isPlacingNote: isPaneActive && isPlacingNote,
+                    annotationRevision: resourceSession.annotationRevision,
+                    changedAnnotationPageIndices: resourceSession.changedAnnotationPageIndices,
+                    onMarkupClick: { point, page in
+                        paneModel.selectMarkup(at: point, on: page)
+                    },
+                    onNoteHit: { point, page in
+                        paneModel.noteSelection(at: point, on: page)
+                    },
+                    onNoteActivated: { note, anchor in
+                        requestNoteComposer(note, anchor: anchor, in: paneID)
+                    },
+                    onNoteMoved: { note, center in
+                        _ = resourceSession.moveNoteMarker(note, to: center)
+                    },
+                    onPlaceNote: { point, page, anchor in
+                        placePageNote(at: point, on: page, anchor: anchor, in: paneID)
+                    },
+                    onCancelPlacement: {
+                        if isPaneActive { isPlacingNote = false }
+                    },
+                    searchSelections: searchBelongsToDisplayedDocument ? paneModel.searchSession.results : [],
+                    activeSearchSelection: searchBelongsToDisplayedDocument
+                        ? paneModel.searchSession.currentSelection
+                        : nil,
+                    searchResultsRevision: paneModel.searchSession.resultsRevision,
+                    makeMenuItems: { context in
+                        pageMenuItems(for: context, in: paneID)
+                    },
+                    anchorResolver: resolver,
+                    onActivatePane: {
+                        activatePane(paneID)
+                    }
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .id(resourceSession.loadGeneration)
+                .popover(
+                    isPresented: Binding(
+                        get: { paneModel.noteComposerStore.isPresented },
+                        set: { paneModel.noteComposerStore.isPresented = $0 }
+                    ),
+                    attachmentAnchor: .rect(.rect(paneModel.noteComposerStore.session?.anchorRect ?? Self.fallbackAnchor)),
+                    arrowEdge: .top
+                ) {
+                    if let session = paneModel.noteComposerStore.session {
+                        NoteComposerView(session: session, model: paneDocModel) {
+                            paneModel.noteComposerStore.end()
+                        } onEditGroupEntry: { group, entry in
+                            guard let note = paneDocModel.noteSelection(forThreadEntry: entry, in: group) else {
+                                return
+                            }
+                            let anchor = resolver.containerRect(
+                                forPageBounds: group.bounds,
+                                pageIndex: group.pageIndex
+                            ) ?? Self.fallbackAnchor
+                            requestCompose(.note(note, anchor), in: paneID)
+                        }
+                        .id(session.id)
+                    }
+                }
+
+                if tab.layoutTree.paneCount > 1 {
+                    Rectangle()
+                        .strokeBorder(isPaneActive ? Color.accentColor.opacity(0.65) : Color.clear, lineWidth: 2)
+                        .allowsHitTesting(false)
+                }
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                activatePane(paneID)
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Pane \(paneID.description)\(isPaneActive ? ", active" : "")")
         }
     }
 
@@ -1549,6 +1715,9 @@ struct PDFReaderView: View {
     private func promptKind(for action: PendingAction) -> ReaderPrompt {
         if case let .closeTab(tabID) = action {
             return workspace.closeTabPrompt(tabID: tabID) ?? .none
+        }
+        if case let .closePane(paneID) = action {
+            return workspace.closePanePrompt(tabID: workspace.activeTabID, paneID: paneID) ?? .none
         }
         return ReaderPromptPolicy.prompt(
             for: action.readerAction,
@@ -1708,21 +1877,16 @@ struct PDFReaderView: View {
     }
 
     /// Captures a page note at a click point.
-    ///
-    /// The draft comes from the model, which never looks at the text selection:
-    /// a page note created while text is still selected must not inherit it.
-    private func placePageNote(at point: CGPoint, on page: PDFPage, anchor: CGRect) {
+    private func placePageNote(at point: CGPoint, on page: PDFPage, anchor: CGRect, in paneID: PaneID? = nil) {
+        if let paneID { activatePane(paneID) }
         guard let draft = model.pageNoteDraft(at: point, on: page) else { return }
         isPlacingNote = false
-        requestCompose(.draft(draft, anchor))
+        requestCompose(.draft(draft, anchor), in: paneID)
     }
 
     /// Opens a composer, unless doing so would replace a draft that has text.
-    ///
-    /// Clicking another marker while a composer is open dismisses the popover
-    /// first, so this is a real path to losing typed text — the same one a save
-    /// takes, and it gets the same question.
-    private func requestCompose(_ target: PendingAction.ComposerTarget) {
+    private func requestCompose(_ target: PendingAction.ComposerTarget, in paneID: PaneID? = nil) {
+        if let paneID { activatePane(paneID) }
         if promptKind(for: .compose(target)) == .draft {
             prompt = .draftChanges(.compose(target))
             return
@@ -1733,12 +1897,135 @@ struct PDFReaderView: View {
     /// A YoPDF note or Shua thought opens the thread composer even when it is
     /// currently the only member. Mouse activation and the context menu share
     /// this route so one marker cannot expose two editing experiences.
-    private func requestNoteComposer(_ note: NoteSelection, anchor: CGRect) {
+    private func requestNoteComposer(_ note: NoteSelection, anchor: CGRect, in paneID: PaneID? = nil) {
+        if let paneID { activatePane(paneID) }
         isPlacingNote = false
         let target: PendingAction.ComposerTarget = (note.isShuaThought || note.isYoPDFNote)
             ? .group(note, anchor)
             : .note(note, anchor)
-        requestCompose(target)
+        requestCompose(target, in: paneID)
+    }
+
+    // MARK: - Multi-Pane Split Actions
+
+    private func canSplitActivePane(direction: LayoutInsertionDirection) -> Bool {
+        guard model.isLoaded else { return false }
+        return workspace.canSplit(
+            direction: direction,
+            policy: .default,
+            availableSize: currentContentSize
+        )
+    }
+
+    private func splitButtonHelp(direction: LayoutInsertionDirection) -> String {
+        if !model.isLoaded {
+            return "Open a PDF to split view"
+        }
+        let policy = LayoutPolicy.default
+        if tab.layoutTree.paneCount >= policy.maxPanes {
+            return "Maximum limit of \(policy.maxPanes) panes reached"
+        }
+        if !canSplitActivePane(direction: direction) {
+            return "Pane is too small to split further"
+        }
+        return direction == .right ? "Split Right" : "Split Down"
+    }
+
+    private func canCloseActivePane() -> Bool {
+        tab.layoutTree.paneCount > 1
+    }
+
+    private func splitActivePane(direction: LayoutInsertionDirection, targetPage: PDFPage? = nil) {
+        guard canSplitActivePane(direction: direction) else {
+            showCannotSplitFeedback(direction: direction)
+            return
+        }
+        do {
+            let newPaneID = try workspace.splitActivePane(
+                direction: direction,
+                policy: .default,
+                availableSize: currentContentSize
+            )
+            if let targetPage,
+               let doc = model.document {
+                let pageIndex = doc.index(for: targetPage)
+                if pageIndex != NSNotFound,
+                   let newPane = tab.paneSessions[newPaneID] {
+                    newPane.paneModel.goToPage(pageIndex)
+                }
+            }
+        } catch {
+            showSplitErrorFeedback(error)
+        }
+    }
+
+    private func openInSplit(paneID: PaneID, direction: LayoutInsertionDirection, targetPage: PDFPage?) {
+        guard tab.canSplit(paneID: paneID, direction: direction, policy: .default, availableSize: currentContentSize) else {
+            showCannotSplitFeedback(direction: direction)
+            return
+        }
+        do {
+            let newPaneID = try workspace.splitPane(
+                paneID: paneID,
+                direction: direction,
+                policy: .default,
+                availableSize: currentContentSize
+            )
+            if let targetPage,
+               let doc = model.document {
+                let pageIndex = doc.index(for: targetPage)
+                if pageIndex != NSNotFound,
+                   let newPane = tab.paneSessions[newPaneID] {
+                    newPane.paneModel.goToPage(pageIndex)
+                }
+            }
+        } catch {
+            showSplitErrorFeedback(error)
+        }
+    }
+
+    private func requestCloseActivePane() {
+        requestClosePane(tab.activePaneID)
+    }
+
+    private func requestClosePane(_ paneID: PaneID) {
+        guard tab.layoutTree.paneCount > 1 else { return }
+        guard let paneSession = tab.paneSessions[paneID] else { return }
+
+        if paneSession.paneModel.noteComposerStore.hasUncommittedChanges {
+            prompt = .draftChanges(.closePane(paneID))
+            return
+        }
+
+        try? workspace.closePane(paneID: paneID)
+    }
+
+    private func showCannotSplitFeedback(direction: LayoutInsertionDirection) {
+        let policy = LayoutPolicy.default
+        if tab.layoutTree.paneCount >= policy.maxPanes {
+            prompt = .saveProblem(
+                title: "Cannot Split View",
+                message: "Maximum limit of \(policy.maxPanes) panes per tab reached.",
+                offersSaveAs: false,
+                tabID: tab.id
+            )
+        } else {
+            prompt = .saveProblem(
+                title: "Cannot Split View",
+                message: "The pane is too small to split further. Minimum pane size is \(Int(policy.minimumLeafWidth))×\(Int(policy.minimumLeafHeight)) pt.",
+                offersSaveAs: false,
+                tabID: tab.id
+            )
+        }
+    }
+
+    private func showSplitErrorFeedback(_ error: Error) {
+        prompt = .saveProblem(
+            title: "Cannot Split View",
+            message: "Unable to split layout: \(error.localizedDescription)",
+            offersSaveAs: false,
+            tabID: tab.id
+        )
     }
 
     private func startComposer(_ target: PendingAction.ComposerTarget) {
@@ -1776,11 +2063,10 @@ struct PDFReaderView: View {
     // MARK: - Annotation menu
 
     /// Right-click actions for the click that opened the menu.
-    ///
-    /// Note items come first because a marker is a small target on top of the
-    /// page; the markup items keep their existing order and behaviour.
-    private func pageMenuItems(for context: PageMenuContext) -> [NSMenuItem] {
+    private func pageMenuItems(for context: PageMenuContext, in paneID: PaneID? = nil) -> [NSMenuItem] {
         var items: [NSMenuItem] = []
+        let targetPaneID = paneID ?? tab.activePaneID
+        let activePaneModel = tab.paneSessions[targetPaneID]?.paneModel ?? model.paneModel
 
         if let note = context.note {
             let anchor = context.anchorRect
@@ -1788,7 +2074,7 @@ struct PDFReaderView: View {
                 ? "Open Note Thread"
                 : "Edit Note"
             items.append(MarkupActionMenuItem(title: title) { [note] in
-                requestNoteComposer(note, anchor: anchor)
+                requestNoteComposer(note, anchor: anchor, in: targetPaneID)
             })
             if model.notePermissions(for: note).canDelete {
                 items.append(MarkupActionMenuItem(title: "Delete Note") { [note] in
@@ -1800,25 +2086,51 @@ struct PDFReaderView: View {
             let page = context.page
             let anchor = context.anchorRect
             items.append(MarkupActionMenuItem(title: "Add Note Here") {
-                placePageNote(at: point, on: page, anchor: anchor)
+                placePageNote(at: point, on: page, anchor: anchor, in: targetPaneID)
             })
         }
 
-        let markup = markupMenuItems()
+        let markup = markupMenuItems(for: activePaneModel)
         if !items.isEmpty, !markup.isEmpty {
             items.append(.separator())
         }
         items.append(contentsOf: markup)
+
+        var splitItems: [NSMenuItem] = []
+        let canRight = tab.canSplit(paneID: targetPaneID, direction: .right, policy: .default, availableSize: currentContentSize)
+        let canDown = tab.canSplit(paneID: targetPaneID, direction: .bottom, policy: .default, availableSize: currentContentSize)
+        let canClose = (tab.layoutTree.paneCount > 1)
+
+        if canRight {
+            splitItems.append(MarkupActionMenuItem(title: "Open in Split Right") {
+                openInSplit(paneID: targetPaneID, direction: .right, targetPage: context.page)
+            })
+        }
+        if canDown {
+            splitItems.append(MarkupActionMenuItem(title: "Open in Split Down") {
+                openInSplit(paneID: targetPaneID, direction: .bottom, targetPage: context.page)
+            })
+        }
+        if canClose {
+            splitItems.append(MarkupActionMenuItem(title: "Close Pane") {
+                requestClosePane(targetPaneID)
+            })
+        }
+
+        if !splitItems.isEmpty {
+            if !items.isEmpty {
+                items.append(.separator())
+            }
+            items.append(contentsOf: splitItems)
+        }
+
         return items
     }
 
     /// Right-click actions for the selected markup.
-    ///
-    /// Built from the same model methods as the toolbar so there is no second
-    /// editing path. The standard PDFView menu is kept and extended, not
-    /// replaced: zoom, display mode and navigation still belong to PDFKit.
-    private func markupMenuItems() -> [NSMenuItem] {
-        guard let selected = model.selectedMarkup else { return [] }
+    private func markupMenuItems(for paneModel: PDFPaneModel? = nil) -> [NSMenuItem] {
+        let activeMarkup = paneModel?.selectedMarkup ?? model.selectedMarkup
+        guard let selected = activeMarkup else { return [] }
         let canModify = model.canModifySelectedMarkup
         var items: [NSMenuItem] = []
 
@@ -1980,6 +2292,19 @@ struct PDFReaderView: View {
         let result: String?
         if action == .quit {
             result = saveWorkspaceDrafts()
+        } else if case let .closePane(paneID) = action {
+            if let paneSession = tab.paneSessions[paneID],
+               paneSession.paneModel.noteComposerStore.hasUncommittedChanges {
+                let docModel = tab.model(for: paneSession)
+                switch paneSession.paneModel.noteComposerStore.resolvePendingDraft(using: docModel) {
+                case .success:
+                    result = nil
+                case let .failure(error):
+                    result = error.errorDescription ?? "The note was not saved."
+                }
+            } else {
+                result = nil
+            }
         } else if let target = session(for: action) {
             result = saveDraft(in: target)
         } else {
@@ -2032,7 +2357,11 @@ struct PDFReaderView: View {
             of: closeGuard
         ) {
         case .endedNow:
-            session(for: action)?.composerStore.end()
+            if case let .closePane(paneID) = action {
+                tab.paneSessions[paneID]?.paneModel.noteComposerStore.end()
+            } else {
+                session(for: action)?.composerStore.end()
+            }
             proceed(afterDraft: action)
         case let .deferredUntilQuitCommit(need):
             showQuitPrompt(for: need)
@@ -2113,6 +2442,8 @@ struct PDFReaderView: View {
         case let .closeTab(tabID):
             _ = workspace.discardDocumentChanges(tabID: tabID)
             _ = workspace.closeTab(tabID: tabID)
+        case let .closePane(paneID):
+            try? workspace.closePane(paneID: paneID)
         case .closeWindow:
             // The window is closing now, so the edits really are being discarded.
             workspace.discardAllDrafts()
@@ -2146,6 +2477,8 @@ struct PDFReaderView: View {
             presentSaveAsPanel()
         case let .closeTab(tabID):
             _ = workspace.closeTab(tabID: tabID)
+        case let .closePane(paneID):
+            try? workspace.closePane(paneID: paneID)
         case .closeWindow:
             closeGuard.closeNow()
         case .quit:

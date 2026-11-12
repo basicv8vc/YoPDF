@@ -61,6 +61,7 @@ struct PDFViewerRepresentable: NSViewRepresentable {
     let makeMenuItems: (PageMenuContext) -> [NSMenuItem]
     /// Lets the SwiftUI layer turn a page rectangle into an anchor rectangle.
     let anchorResolver: PageAnchorResolver
+    var onActivatePane: (() -> Void)? = nil
 
     func makeNSView(context: Context) -> MarkupPDFView {
         let view = MarkupPDFView(frame: .zero)
@@ -78,6 +79,7 @@ struct PDFViewerRepresentable: NSViewRepresentable {
         view.selectedMarkup = selectedMarkup
         view.noteMarkers = noteMarkers
         view.isPlacingNote = isPlacingNote
+        view.onActivatePane = onActivatePane
         context.coordinator.attach(to: view)
         context.coordinator.updateHandlers(on: view, parent: self)
         anchorResolver.pdfView = view
@@ -87,6 +89,7 @@ struct PDFViewerRepresentable: NSViewRepresentable {
     func updateNSView(_ view: MarkupPDFView, context: Context) {
         context.coordinator.parent = self
         context.coordinator.updateHandlers(on: view, parent: self)
+        view.onActivatePane = onActivatePane
         anchorResolver.pdfView = view
 
         let documentChanged = view.document !== document
@@ -357,6 +360,7 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
     var onNoteMoved: ((NoteSelection, CGPoint) -> Void)?
     var onPlaceNote: ((CGPoint, PDFPage, CGRect) -> Void)?
     var onCancelPlacement: (() -> Void)?
+    var onActivatePane: (() -> Void)?
     let magnificationController = PDFViewMagnificationController()
     var makeMenuItems: ((PageMenuContext) -> [NSMenuItem])?
 
@@ -432,6 +436,7 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
     }
 
     override func mouseDown(with event: NSEvent) {
+        onActivatePane?()
         let location = convert(event.locationInWindow, from: nil)
 
         if isPlacingNote, let page = page(for: location, nearest: false) {
@@ -596,7 +601,13 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
         super.cancelOperation(sender)
     }
 
+    override func rightMouseDown(with event: NSEvent) {
+        onActivatePane?()
+        super.rightMouseDown(with: event)
+    }
+
     override func menu(for event: NSEvent) -> NSMenu? {
+        onActivatePane?()
         let base = super.menu(for: event)
         let point = convert(event.locationInWindow, from: nil)
         guard let page = page(for: point, nearest: false) else { return base }
