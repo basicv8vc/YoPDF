@@ -25,8 +25,12 @@ Do not assume local or private planning documents are available in a public chec
 
 ### Windows
 
+- Minimum supported OS: Windows 10 22H2, Build 19045, x64/AMD64. Windows 11 x64 (Build 22000+) is recommended, not the minimum.
+- Windows 10 and Windows 11 must deliver the same product UI and feature behavior, and are validated as separate acceptance tracks.
+- Do not introduce Windows 11-only APIs without a verified Windows 10 compatibility path.
 - WinUI 3 + C#/.NET is the intended UI stack.
 - PDFium is the leading PDF backend candidate, subject to validation.
+- The MyGo / PdfCraft PoC architecture remains a candidate pending its own approval; changing the minimum OS requirement does not approve it.
 - No Windows implementation is present in this repository yet; treat Windows statements as plans, not existing behavior.
 - Keep document semantics and PDF operations independent of WinUI where practical.
 - Validate native DLL architecture and deployment requirements before claiming success.
