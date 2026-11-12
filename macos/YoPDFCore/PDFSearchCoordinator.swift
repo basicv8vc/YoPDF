@@ -64,6 +64,7 @@ public final class PDFSearchCoordinator {
     private var activeRequest: ActiveSearchRequest?
     private var queuedRequests: [QueuedSearchRequest] = []
     private var isDrainingCancellation: Bool = false
+    private var isDispatchScheduled: Bool = false
     private var nextRequestNumber: Int = 1
 
     public init(document: PDFDocument? = nil) {
@@ -138,9 +139,10 @@ public final class PDFSearchCoordinator {
             return requestID
         }
 
-        if activeRequest != nil || isDrainingCancellation {
-            // Another pane is active or an old cancel is still draining.
+        if activeRequest != nil || isDrainingCancellation || isDispatchScheduled || !queuedRequests.isEmpty {
+            // Another pane is active, cancellation is draining, dispatch is scheduled, or earlier requests are waiting.
             enqueueOrCoalesce(queued)
+            startNextIfPossible()
             return requestID
         }
 
@@ -170,6 +172,7 @@ public final class PDFSearchCoordinator {
     /// Immediately terminates all searches and clears the queue (e.g. on close or document swap).
     public func cancelAll() {
         queuedRequests.removeAll()
+        isDispatchScheduled = false
 
         if let active = activeRequest {
             active.isCancelled = true
@@ -270,13 +273,16 @@ public final class PDFSearchCoordinator {
     private func startNextIfPossible() {
         guard activeRequest == nil,
               !isDrainingCancellation,
+              !isDispatchScheduled,
               !queuedRequests.isEmpty,
               let document = self.document
         else { return }
 
+        isDispatchScheduled = true
         Task { @MainActor [weak self] in
-            guard let self,
-                  self.activeRequest == nil,
+            guard let self else { return }
+            self.isDispatchScheduled = false
+            guard self.activeRequest == nil,
                   !self.isDrainingCancellation,
                   !self.queuedRequests.isEmpty,
                   let document = self.document

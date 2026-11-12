@@ -99,6 +99,29 @@ public final class PDFPaneModel: ObservableObject, Identifiable {
                 self?.handleResourceDocumentEvent(event)
             }
             .store(in: &cancellables)
+
+        resourceSession.$annotationRevision
+            .dropFirst()
+            .sink { [weak self] _ in
+                self?.validateSelectedMarkup()
+            }
+            .store(in: &cancellables)
+    }
+
+    public func ensureLease() {
+        resourceSession.acquireLease(for: id)
+    }
+
+    public func validateSelectedMarkup() {
+        guard let selected = selectedMarkup else { return }
+        guard let doc = resourceSession.document,
+              let page = doc.page(at: selected.pageIndex),
+              doc.index(for: page) == selected.pageIndex,
+              page.annotations.contains(where: { $0 === selected.annotation })
+        else {
+            selectedMarkup = nil
+            return
+        }
     }
 
     private func handleResourceDocumentEvent(_ event: ResourceDocumentEvent) {
@@ -113,6 +136,9 @@ public final class PDFPaneModel: ObservableObject, Identifiable {
     }
 
     private func synchronizeWithNewDocument(_ newDocument: PDFDocument, isSwap: Bool) {
+        // Ensure lease is active for this pane on the resource
+        ensureLease()
+
         // 1. Rebind search session to new document
         searchSession.documentWasReplaced(with: newDocument)
 
@@ -421,11 +447,19 @@ public final class PDFPaneModel: ObservableObject, Identifiable {
     }
 
     public func undoMarkup() -> Bool {
-        resourceSession.undoMarkup()
+        let success = resourceSession.undoMarkup()
+        if success {
+            validateSelectedMarkup()
+        }
+        return success
     }
 
     public func redoMarkup() -> Bool {
-        resourceSession.redoMarkup()
+        let success = resourceSession.redoMarkup()
+        if success {
+            validateSelectedMarkup()
+        }
+        return success
     }
 
     public var canUndoMarkup: Bool {

@@ -672,6 +672,153 @@ final class PDFResourceSessionTests: XCTestCase {
         XCTAssertTrue(session2.resourceSession === resourceA)
     }
 
+    // MARK: - Final Review Tests: FIFO Ordering, Lease Balance, Selection Consistency
+
+    func testSearchCoordinatorPreventsQueueJumpingDuringAsyncDispatch() async throws {
+        let doc = try makeDocument(pageCount: 10) { page in
+            page == 9 ? "beta gamma" : String(repeating: "word ", count: 200)
+        }
+        let coordinator = PDFSearchCoordinator(document: doc)
+        let paneA = UUID()
+        let paneB = UUID()
+        let paneC = UUID()
+
+        var executionOrder: [String] = []
+
+        // Start search A on a multi-page document
+        coordinator.requestSearch(
+            paneID: paneA,
+            query: "word",
+            onComplete: { _ in executionOrder.append("alpha") }
+        )
+        XCTAssertTrue(coordinator.isFinding)
+
+        // Enqueue search B
+        coordinator.requestSearch(
+            paneID: paneB,
+            query: "beta",
+            onComplete: { _ in executionOrder.append("beta") }
+        )
+        XCTAssertEqual(coordinator.queuedCount, 1)
+
+        // Cancel A while active so it drains cancellation
+        coordinator.cancelSearch(for: paneA)
+
+        // Immediately submit search C from pane C
+        coordinator.requestSearch(
+            paneID: paneC,
+            query: "gamma",
+            onComplete: { _ in executionOrder.append("gamma") }
+        )
+
+        // Wait for all searches to finish
+        let deadline = Date().addingTimeInterval(5)
+        while coordinator.isFinding && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(executionOrder, ["beta", "gamma"], "Search B must execute before Search C. C must not jump the queue.")
+    }
+
+    func testCloseReopenCloseBalancesSecurityScope() throws {
+        let spy = SecurityScopeSpy()
+        let url1 = try makeTemporaryPDF(pageCount: 1, named: "scope1") { _ in "File 1" }
+        let url2 = try makeTemporaryPDF(pageCount: 1, named: "scope2") { _ in "File 2" }
+
+        let model = PDFDocumentModel(access: spy)
+
+        // Open 1
+        XCTAssertTrue(model.open(url: url1))
+        XCTAssertEqual(spy.starts.count, 1)
+        XCTAssertEqual(spy.stops.count, 0)
+        XCTAssertEqual(model.resourceSession.activeLeaseCount, 1)
+
+        // Close 1
+        model.close()
+        XCTAssertEqual(spy.starts.count, 1)
+        XCTAssertEqual(spy.stops.count, 1, "First close must release security scope.")
+        XCTAssertEqual(model.resourceSession.activeLeaseCount, 0)
+
+        // Reopen 2
+        XCTAssertTrue(model.open(url: url2))
+        XCTAssertEqual(spy.starts.count, 2)
+        XCTAssertEqual(spy.stops.count, 1)
+        XCTAssertEqual(model.resourceSession.activeLeaseCount, 1, "Reopened model must restore a valid pane lease.")
+
+        // Close 2
+        model.close()
+        XCTAssertEqual(spy.starts.count, 2)
+        XCTAssertEqual(spy.stops.count, 2, "Every security-scope acquisition must have exactly one matching release.")
+        XCTAssertEqual(model.resourceSession.activeLeaseCount, 0)
+    }
+
+    func testUndoRedoSelectionConsistencyOnConvert() throws {
+        let url = try makeTemporaryPDF(pageCount: 1, named: "undo-sel-consistency") { _ in "Selectable text" }
+        let resource = PDFResourceSession(access: SecurityScopeSpy())
+        XCTAssertTrue(resource.open(url: url))
+        let doc = try XCTUnwrap(resource.document)
+        let page = try XCTUnwrap(doc.page(at: 0))
+
+        let pane = PDFPaneModel(id: PaneID(), resourceSession: resource)
+        let sel = try XCTUnwrap(doc.selection(from: page, atCharacterIndex: 0, to: page, atCharacterIndex: 6))
+        pane.updateSelection(sel)
+        XCTAssertNotNil(pane.addHighlightToSelection())
+
+        let annot = try XCTUnwrap(page.annotations.first)
+        XCTAssertTrue(pane.selectMarkup(at: CGPoint(x: annot.bounds.midX, y: annot.bounds.midY), on: page))
+        XCTAssertEqual(pane.selectedMarkup?.kind, .highlight)
+
+        // Convert -> Underline
+        XCTAssertTrue(pane.convertSelectedMarkup())
+        XCTAssertEqual(pane.selectedMarkup?.kind, .underline)
+
+        // Convert -> Undo
+        XCTAssertTrue(pane.undoMarkup())
+        XCTAssertNil(pane.selectedMarkup, "Undoing convert removed the underline annotation; selectedMarkup must not hold stale reference.")
+
+        // Convert -> Redo
+        XCTAssertTrue(pane.redoMarkup())
+        XCTAssertNil(pane.selectedMarkup, "Redoing convert must not leave stale annotation selection.")
+    }
+
+    func testSiblingPaneSelectionInvalidatedWhenAnnotationRemovedByAnotherPane() throws {
+        let url = try makeTemporaryPDF(pageCount: 1, named: "sibling-sel-invalid") { _ in "Selectable text" }
+        let resource = PDFResourceSession(access: SecurityScopeSpy())
+        XCTAssertTrue(resource.open(url: url))
+        let doc = try XCTUnwrap(resource.document)
+        let page = try XCTUnwrap(doc.page(at: 0))
+
+        let paneA = PDFPaneModel(id: PaneID(), resourceSession: resource)
+        let paneB = PDFPaneModel(id: PaneID(), resourceSession: resource)
+
+        let sel = try XCTUnwrap(doc.selection(from: page, atCharacterIndex: 0, to: page, atCharacterIndex: 6))
+        paneA.updateSelection(sel)
+        XCTAssertNotNil(paneA.addHighlightToSelection())
+
+        let annot = try XCTUnwrap(page.annotations.first)
+        let point = CGPoint(x: annot.bounds.midX, y: annot.bounds.midY)
+
+        XCTAssertTrue(paneA.selectMarkup(at: point, on: page))
+        XCTAssertTrue(paneB.selectMarkup(at: point, on: page))
+        XCTAssertNotNil(paneA.selectedMarkup)
+        XCTAssertNotNil(paneB.selectedMarkup)
+
+        // Pane B deletes the annotation
+        XCTAssertTrue(paneB.deleteSelectedMarkup())
+        XCTAssertNil(paneB.selectedMarkup)
+        XCTAssertNil(paneA.selectedMarkup, "Pane A's selected markup must be automatically invalidated when removed by Pane B.")
+    }
+
+    func testPDFDocumentModelConstructorEnforcesSameResourceSessionPrecondition() {
+        let resource = PDFResourceSession(access: SecurityScopeSpy())
+        let pane = PDFPaneModel(id: PaneID(), resourceSession: resource)
+
+        // Valid matching constructor
+        let model = PDFDocumentModel(resourceSession: resource, paneModel: pane)
+        XCTAssertTrue(model.resourceSession === resource)
+        XCTAssertTrue(model.paneModel === pane)
+    }
+
     // MARK: - Helpers
 
     private func makeTemporaryPDF(

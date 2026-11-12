@@ -169,6 +169,12 @@ public final class PDFDocumentModel: ObservableObject {
     }
 
     public init(resourceSession: PDFResourceSession, paneModel: PDFPaneModel? = nil) {
+        if let paneModel {
+            precondition(
+                paneModel.resourceSession === resourceSession,
+                "PDFDocumentModel paneModel must reference the exact same resourceSession instance."
+            )
+        }
         self.resourceSession = resourceSession
         self.paneModel = paneModel ?? PDFPaneModel(resourceSession: resourceSession)
         setupForwarding()
@@ -203,6 +209,7 @@ public final class PDFDocumentModel: ObservableObject {
             relinking: recentDocument
         )
         if success {
+            paneModel.ensureLease()
             paneModel.clearSearch()
             paneModel.noteComposerStore.discardIfClean()
             let restoredPosition: RecentReadingPosition?
