@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 import PDFKit
 
@@ -6,6 +7,10 @@ import PDFKit
 ///
 /// Deliberately free of UI and of any network, account, or agent concern:
 /// the model can be exercised in unit tests without a window or a running app.
+///
+/// Refactored in P0-B as a compatibility façade composing a shared `PDFResourceSession`
+/// (runtime authority for the document, file lease, and undo history) and a `PDFPaneModel`
+/// (pane-local viewport, zoom, selection, and search state).
 @MainActor
 public final class PDFDocumentModel: ObservableObject {
 
@@ -28,131 +33,123 @@ public final class PDFDocumentModel: ObservableObject {
 
     private static let zoomStep: CGFloat = 1.25
 
-    @Published public private(set) var document: PDFDocument?
-    @Published public private(set) var fileURL: URL?
-    @Published public private(set) var title: String = ""
-    @Published public private(set) var pageCount: Int = 0
-    @Published public private(set) var currentPageIndex: Int = 0
+    public let resourceSession: PDFResourceSession
+    public let paneModel: PDFPaneModel
+
+    private var cancellables = Set<AnyCancellable>()
+
+    // MARK: - Published Properties Forwarded to Sessions
+
+    public var document: PDFDocument? { resourceSession.document }
+    public var fileURL: URL? { resourceSession.fileURL }
+    public var title: String { resourceSession.title }
+    public var pageCount: Int { resourceSession.pageCount }
+    public var currentPageIndex: Int { paneModel.currentPageIndex }
     /// Changes only for explicit page commands, never for PDFView feedback.
-    @Published public private(set) var pageNavigationRevision = 0
+    public var pageNavigationRevision: Int { paneModel.pageNavigationRevision }
     /// The zoom the user asked for. Only meaningful while `isAutoScaling` is false.
-    @Published public private(set) var zoomScale: CGFloat = 1
+    public var zoomScale: CGFloat { paneModel.zoomScale }
     /// What the view is actually showing. Mirrored from PDFView so that the
     /// first manual zoom starts from the fitted scale instead of jumping to 100%.
-    @Published public private(set) var effectiveScale: CGFloat = 1
-    @Published public private(set) var isAutoScaling: Bool = true
+    public var effectiveScale: CGFloat { paneModel.effectiveScale }
+    public var isAutoScaling: Bool { paneModel.isAutoScaling }
     /// Changes only when the user explicitly requests a zoom or fit command.
-    /// The PDFView bridge uses this to distinguish commands from scale values
-    /// mirrored back while PDFKit is handling a native trackpad gesture.
-    @Published public private(set) var zoomCommandRevision = 0
-    @Published public private(set) var lastError: LoadError?
+    public var zoomCommandRevision: Int { paneModel.zoomCommandRevision }
+    public var lastError: LoadError? { resourceSession.lastError }
     /// Bumped on every successful open so the view can re-apply layout.
-    @Published public private(set) var loadGeneration: Int = 0
+    public var loadGeneration: Int { resourceSession.loadGeneration }
 
-    /// True while the in-memory document holds changes the file does not.
-    ///
-    /// Only annotation edits set this in P2a. It exists so that closing,
-    /// switching documents or quitting cannot silently drop them; it is not a
-    /// general document-modification flag yet.
-    @Published public private(set) var hasUnsavedChanges: Bool = false
-    /// State of the most recent automatic save for the current document.
-    @Published public internal(set) var autoSaveStatus: AutoSaveStatus = .idle
-    /// Bumped when an automatic save needs to be surfaced to the reader UI.
-    @Published public internal(set) var autoSaveFailureRevision = 0
-    /// The most recent automatic-save result, when one has completed.
-    public internal(set) var lastAutoSaveOutcome: SaveOutcome?
-    /// Monotonic revision of the in-memory edits.
-    ///
-    /// Bumped whenever edits are made, saved, discarded, or replaced by another
-    /// document. A quit approval records the revision it was given for, so a
-    /// later edit cannot inherit an earlier "Don't Save".
-    public private(set) var editRevision: Int = 0
-    /// The reader's current text selection, mirrored from `PDFView`.
-    ///
-    /// Owned by the model so that the Highlight button, the menu command and
-    /// the annotation call all read the same value.
-    @Published public private(set) var currentSelection: PDFSelection?
-    /// The markup annotation the user last clicked, if any.
-    ///
-    /// The selection is only a UI concept. Every mutation revalidates that the
-    /// annotation is still attached to the current document, so a menu opened
-    /// before a document switch cannot edit the old PDF.
-    @Published public internal(set) var selectedMarkup: MarkupSelection?
-    /// Bumped whenever annotations are added, removed, recoloured or replaced.
-    /// The PDF view uses it to tell PDFKit to redraw the affected pages.
-    @Published public internal(set) var annotationRevision = 0
-    /// Pages affected by the latest `annotationRevision`, sorted.
-    public internal(set) var changedAnnotationPageIndices: [Int] = []
-    /// The note markers the page overlays draw.
-    ///
-    /// Derived from the document rather than stored separately: a marker exists
-    /// exactly when a visible standard `/Text` annotation exists. Recomputed
-    /// after every annotation edit and after the document is replaced, so a
-    /// marker cannot outlive its annotation.
-    @Published public internal(set) var noteMarkers: [NoteMarker] = []
-    /// Whether the current document has an undoable markup edit.
-    @Published public internal(set) var canUndoMarkup = false
-    @Published public internal(set) var canRedoMarkup = false
-
-    /// PDFKit memory-maps the file, so a security-scoped URL must stay open for
-    /// as long as the document is displayed. The session is the single owner of
-    /// that access; the model never starts or stops a scope itself, which is
-    /// what keeps the two layers from releasing each other's grants.
-    ///
-    /// A candidate session is replaced only after its document has been fully
-    /// loaded, so a failed open leaves the previous document and its access
-    /// intact.
-    ///
-    /// Internal rather than private so the editing extension can reuse the
-    /// store when a Save As leaves a file on disk without a session.
-    let store: DocumentStore
-
-    /// App-level local history shared by reader windows. Tests and callers that
-    /// do not need persistence can leave this nil.
-    private let recentDocuments: RecentDocumentsStore?
-
-    /// The persisted colour defaults, shared by every reader window.
-    ///
-    /// Owned by the model so the toolbar and the annotations created from it
-    /// read one value, and so tests can point it at an isolated `UserDefaults`
-    /// suite. The default is the app-wide instance: a colour chosen in one
-    /// window has to repaint the swatch in the others, and only a shared
-    /// observable object can do that.
-    public let markupPreferences: MarkupColorPreferences
-
-    /// Model-owned undo history.
-    ///
-    /// Not `UndoManager`: a cross-page mark is one action here, and the history
-    /// can be cleared at exactly the moments the document is replaced. The model
-    /// also owns edit semantics, so a menu action and a context-menu action use
-    /// the same path.
-    var markupUndoStack: [MarkupEdit] = []
-    var markupRedoStack: [MarkupEdit] = []
-
-    /// A single cancellable debounce task covers every annotation mutation.
-    var autoSaveTask: Task<Void, Never>?
-    var autoSaveGeneration = 0
-    /// The current snapshot writer, which may outlive its debounce task after a
-    /// later edit reschedules the next automatic checkpoint.
-    var autoSaveWorkTask: Task<SaveOutcome, Never>?
-    var autoSaveWorkGeneration: Int?
-    var autoSaveWorkCompletion: AutoSaveWorkCompletion?
-    /// Nested modal workflows can pause a pending debounce and resume it once
-    /// the panel is dismissed. In-flight writes are allowed to finish.
-    var autoSavePauseDepth = 0
-    var autoSaveShouldResumeAfterPause = false
-    /// The production delay is 750 ms. Tests shorten it to cover debounce
-    /// scheduling without paying the user-facing interval for each scenario.
-    var autoSaveDebounceNanoseconds: UInt64 = 750_000_000
-    /// Injectable so the test suite can hold snapshot serialization while
-    /// checking that the main actor remains responsive.
-    var autoSaveSerializer: @Sendable (PDFDocumentSaveSnapshot) -> Data? = {
-        PDFDocumentSaveSerializer.dataRepresentationPreservingShuaGroups(in: $0.document)
+    public var hasUnsavedChanges: Bool { resourceSession.hasUnsavedChanges }
+    public var autoSaveStatus: AutoSaveStatus {
+        get { resourceSession.autoSaveStatus }
+        set { resourceSession.autoSaveStatus = newValue }
+    }
+    public var autoSaveFailureRevision: Int {
+        get { resourceSession.autoSaveFailureRevision }
+        set { resourceSession.autoSaveFailureRevision = newValue }
+    }
+    public var lastAutoSaveOutcome: SaveOutcome? {
+        get { resourceSession.lastAutoSaveOutcome }
+        set { resourceSession.lastAutoSaveOutcome = newValue }
+    }
+    public var editRevision: Int { resourceSession.editRevision }
+    public var currentSelection: PDFSelection? { paneModel.currentSelection }
+    public var selectedMarkup: MarkupSelection? {
+        get { paneModel.selectedMarkup }
+        set { paneModel.selectedMarkup = newValue }
+    }
+    public var annotationRevision: Int {
+        get { resourceSession.annotationRevision }
+        set { resourceSession.annotationRevision = newValue }
+    }
+    public var changedAnnotationPageIndices: [Int] {
+        get { resourceSession.changedAnnotationPageIndices }
+        set { resourceSession.changedAnnotationPageIndices = newValue }
+    }
+    public var noteMarkers: [NoteMarker] {
+        get { resourceSession.noteMarkers }
+        set { resourceSession.noteMarkers = newValue }
+    }
+    public var canUndoMarkup: Bool {
+        get { resourceSession.canUndoMarkup }
+        set { resourceSession.canUndoMarkup = newValue }
+    }
+    public var canRedoMarkup: Bool {
+        get { resourceSession.canRedoMarkup }
+        set { resourceSession.canRedoMarkup = newValue }
     }
 
-    /// The open file session, or nil when nothing is loaded. Exposed so later
-    /// phases can save through the same session that owns the access.
-    public private(set) var documentSession: DocumentSession?
+    var store: DocumentStore { resourceSession.store }
+    private var recentDocuments: RecentDocumentsStore? { resourceSession.recentDocuments }
+    public var markupPreferences: MarkupColorPreferences { resourceSession.markupPreferences }
+
+    var markupUndoStack: [MarkupEdit] {
+        get { resourceSession.markupUndoStack }
+        set { resourceSession.markupUndoStack = newValue }
+    }
+    var markupRedoStack: [MarkupEdit] {
+        get { resourceSession.markupRedoStack }
+        set { resourceSession.markupRedoStack = newValue }
+    }
+
+    var autoSaveTask: Task<Void, Never>? {
+        get { resourceSession.autoSaveTask }
+        set { resourceSession.autoSaveTask = newValue }
+    }
+    var autoSaveGeneration: Int {
+        get { resourceSession.autoSaveGeneration }
+        set { resourceSession.autoSaveGeneration = newValue }
+    }
+    var autoSaveWorkTask: Task<SaveOutcome, Never>? {
+        get { resourceSession.autoSaveWorkTask }
+        set { resourceSession.autoSaveWorkTask = newValue }
+    }
+    var autoSaveWorkGeneration: Int? {
+        get { resourceSession.autoSaveWorkGeneration }
+        set { resourceSession.autoSaveWorkGeneration = newValue }
+    }
+    var autoSaveWorkCompletion: AutoSaveWorkCompletion? {
+        get { resourceSession.autoSaveWorkCompletion }
+        set { resourceSession.autoSaveWorkCompletion = newValue }
+    }
+    var autoSavePauseDepth: Int {
+        get { resourceSession.autoSavePauseDepth }
+        set { resourceSession.autoSavePauseDepth = newValue }
+    }
+    var autoSaveShouldResumeAfterPause: Bool {
+        get { resourceSession.autoSaveShouldResumeAfterPause }
+        set { resourceSession.autoSaveShouldResumeAfterPause = newValue }
+    }
+    var autoSaveDebounceNanoseconds: UInt64 {
+        get { resourceSession.autoSaveDebounceNanoseconds }
+        set { resourceSession.autoSaveDebounceNanoseconds = newValue }
+    }
+    var autoSaveSerializer: @Sendable (PDFDocumentSaveSnapshot) -> Data? {
+        get { resourceSession.autoSaveSerializer }
+        set { resourceSession.autoSaveSerializer = newValue }
+    }
+
+    public var documentSession: DocumentSession? { resourceSession.documentSession }
 
     public init(
         access: any SecurityScopeAccessing = SystemSecurityScopeAccess(),
@@ -160,255 +157,96 @@ public final class PDFDocumentModel: ObservableObject {
         markupPreferences: MarkupColorPreferences = .shared,
         recentDocuments: RecentDocumentsStore? = nil
     ) {
-        self.store = DocumentStore(access: access, io: io)
-        self.markupPreferences = markupPreferences
-        self.recentDocuments = recentDocuments
+        let resource = PDFResourceSession(
+            access: access,
+            io: io,
+            markupPreferences: markupPreferences,
+            recentDocuments: recentDocuments
+        )
+        self.resourceSession = resource
+        self.paneModel = PDFPaneModel(resourceSession: resource)
+        setupForwarding()
     }
 
-    public var isLoaded: Bool { document != nil }
+    public init(resourceSession: PDFResourceSession, paneModel: PDFPaneModel? = nil) {
+        if let paneModel {
+            precondition(
+                paneModel.resourceSession === resourceSession,
+                "PDFDocumentModel paneModel must reference the exact same resourceSession instance."
+            )
+        }
+        self.resourceSession = resourceSession
+        self.paneModel = paneModel ?? PDFPaneModel(resourceSession: resourceSession)
+        setupForwarding()
+    }
+
+    private func setupForwarding() {
+        resourceSession.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+
+        paneModel.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+    }
+
+    public var isLoaded: Bool { resourceSession.isLoaded }
 
     /// 1-based page number for display; 0 when nothing is open.
-    public var displayPageNumber: Int { pageCount == 0 ? 0 : currentPageIndex + 1 }
+    public var displayPageNumber: Int { paneModel.displayPageNumber }
 
     // MARK: - Opening
 
-    /// Opens a local PDF with a two-phase switch:
-    ///
-    /// 1. acquire access for the candidate URL,
-    /// 2. validate and load the document while that access is held,
-    /// 3. only on success replace the current document and release the previous
-    ///    access.
-    ///
-    /// A failed open therefore leaves the loaded document *and* its security
-    /// scope untouched. Returns `false` and records `lastError` on failure.
-    ///
-    /// A document with unsaved edits is refused with `.unsavedChanges` instead
-    /// of being replaced: dropping the edits is a decision the user makes, not
-    /// a side effect of opening a file. The caller saves or discards first.
-    ///
-    /// `discardingUnsavedChanges` is that decision, but it is **not** taken on
-    /// trust: the edits are only abandoned as part of the commit in phase 3, so
-    /// an open that fails still leaves the previous document, its annotations
-    /// and its dirty state exactly as they were. Discarding before the new
-    /// document is known to be readable would clear the flag on a document that
-    /// is still on screen, and the next close would drop its edits without
-    /// asking.
-    ///
-    /// When `relinking` is supplied, the saved recent entry is updated only
-    /// after the selected PDF and its security-scoped session have both opened
-    /// successfully. A failed candidate leaves that entry intact.
     @discardableResult
     public func open(
         url: URL,
         discardingUnsavedChanges: Bool = false,
         relinking recentDocument: RecentDocument? = nil
     ) -> Bool {
-        guard discardingUnsavedChanges || !hasUnsavedChanges else {
-            lastError = .unsavedChanges
-            return false
-        }
-        guard url.isFileURL else {
-            lastError = .notAFileURL
-            return false
-        }
-        guard url.pathExtension.lowercased() == "pdf" else {
-            lastError = .unsupportedType(url.pathExtension)
-            return false
-        }
-
-        let restoredPosition: RecentReadingPosition?
-        if let recentDocument {
-            restoredPosition = recentDocuments?.readingPosition(for: recentDocument)
-                ?? recentDocument.readingPosition
-        } else {
-            restoredPosition = recentDocuments?.readingPosition(for: url)
-        }
-
-        let reopeningCurrentFile = fileURL?.standardizedFileURL == url.standardizedFileURL
-        if reopeningCurrentFile {
-            pauseAutoSave()
-        }
-        defer {
-            if reopeningCurrentFile {
-                resumeAutoSave()
-            }
-        }
-
-        // Phase 1: acquire access and record the initial version. The store
-        // acquires the scope before touching the file: a security-scoped URL
-        // must be opened before any access, including an existence check,
-        // because in a sandboxed build `fileExists` on an unopened URL can
-        // fail even when the file is there.
-        var candidate: DocumentSession
-        do {
-            candidate = try store.open(url)
-        } catch let error as DocumentStoreError {
-            lastError = Self.loadError(from: error)
-            return false
-        } catch {
-            lastError = .unreadable
-            return false
-        }
-
-        // Phase 2: validate while the candidate access is still active.
-        guard var opened = PDFDocument(url: url) else {
-            candidate.close()
-            lastError = .unreadable
-            return false
-        }
-        guard opened.pageCount > 0 else {
-            candidate.close()
-            lastError = .emptyDocument
-            return false
-        }
-
-        // Phase 3: commit. Stop a pending checkpoint before discarding the
-        // previous document, then release its scope only after any already
-        // running file operation has ended.
-        let hadAutoSaveInProgress =
-            (autoSaveStatus == .pending || autoSaveStatus == .saving) && autoSaveTask != nil
-        let scheduledAutoSaveGeneration = autoSaveGeneration
-        let activeWorkMatchesSchedule = autoSaveWorkGeneration == scheduledAutoSaveGeneration
-        let writeWasCancelledBeforeStart = cancelPendingAutoSave(
-            cancelInFlightWork: discardingUnsavedChanges
+        let success = resourceSession.open(
+            url: url,
+            discardingUnsavedChanges: discardingUnsavedChanges,
+            relinking: recentDocument
         )
-        let automaticWriteWasStarted = autoSaveWorkCompletion?.didStartWrite ?? false
-        let completedAutoSaveOutcome = waitForAutoSaveWork()
-
-        // If the old worker committed while the candidate was being loaded,
-        // that candidate and its session captured the previous file version.
-        // Reopen both after the worker has stopped so the installed document
-        // and session always describe the same bytes.
-        if reopeningCurrentFile, automaticWriteWasStarted {
-            candidate.close()
-            do {
-                candidate = try store.open(url)
-            } catch let error as DocumentStoreError {
-                lastError = Self.loadError(from: error)
-                return false
-            } catch {
-                lastError = .unreadable
-                return false
+        if success {
+            paneModel.ensureLease()
+            paneModel.clearSearch()
+            paneModel.noteComposerStore.discardIfClean()
+            let restoredPosition: RecentReadingPosition?
+            if let recentDocument {
+                restoredPosition = recentDocuments?.readingPosition(for: recentDocument)
+                    ?? recentDocument.readingPosition
+            } else {
+                restoredPosition = recentDocuments?.readingPosition(for: url)
             }
-
-            guard let refreshed = PDFDocument(url: url) else {
-                candidate.close()
-                lastError = .unreadable
-                return false
-            }
-            guard refreshed.pageCount > 0 else {
-                candidate.close()
-                lastError = .emptyDocument
-                return false
-            }
-            opened = refreshed
-        }
-
-        if let recentDocument {
-            do {
-                guard let recentDocuments,
-                      try recentDocuments.relink(recentDocument, to: url)
-                else {
-                    candidate.close()
-                    restoreAutoSaveAfterFailedOpen(
-                        wasScheduled: hadAutoSaveInProgress,
-                        activeWorkMatchesSchedule: activeWorkMatchesSchedule,
-                        writeWasCancelledBeforeStart: writeWasCancelledBeforeStart,
-                        completedOutcome: completedAutoSaveOutcome
-                    )
-                    lastError = .couldNotRelinkRecentDocument
-                    return false
+            if let restoredPosition {
+                paneModel.goToPage(restoredPosition.pageIndex)
+                let restoredZoom = CGFloat(restoredPosition.zoomScale)
+                let z = restoredZoom.isFinite ? min(max(restoredZoom, Self.minimumZoomScale), Self.maximumZoomScale) : 1
+                paneModel.setZoomScale(z)
+                if restoredPosition.usesAutomaticScaling {
+                    paneModel.fitToWindow()
                 }
-            } catch {
-                candidate.close()
-                restoreAutoSaveAfterFailedOpen(
-                    wasScheduled: hadAutoSaveInProgress,
-                    activeWorkMatchesSchedule: activeWorkMatchesSchedule,
-                    writeWasCancelledBeforeStart: writeWasCancelledBeforeStart,
-                    completedOutcome: completedAutoSaveOutcome
-                )
-                lastError = .couldNotRelinkRecentDocument
-                return false
+            } else {
+                paneModel.goToPage(0)
+                paneModel.setZoomScale(1)
+                paneModel.fitToWindow()
             }
+            paneModel.updateSelection(nil)
         }
-
-        // Swap first, then release the previous scope, so the
-        // model is never left without access to the document it displays.
-        let previous = documentSession
-        documentSession = candidate
-        previous?.close()
-
-        apply(document: opened, fileURL: url, restoring: restoredPosition)
-        if recentDocument == nil, let recentDocuments, !recentDocuments.recordOpened(url) {
-            NSLog("YoPDF could not save a recent-document bookmark for %@", url.lastPathComponent)
-        }
-        persistReadingPosition()
-        return true
+        return success
     }
 
     public func close() {
-        persistReadingPosition()
-        cancelPendingAutoSave(cancelInFlightWork: true)
-        waitForAutoSaveWork()
-        autoSavePauseDepth = 0
-        autoSaveShouldResumeAfterPause = false
-        documentSession?.close()
-        documentSession = nil
-        document = nil
-        fileURL = nil
-        title = ""
-        pageCount = 0
-        currentPageIndex = 0
-        zoomScale = 1
-        effectiveScale = 1
-        isAutoScaling = true
-        lastError = nil
-        hasUnsavedChanges = false
-        autoSaveStatus = .idle
-        lastAutoSaveOutcome = nil
-        editRevision &+= 1
-        currentSelection = nil
-        resetMarkupState()
-        noteMarkers = []
-        loadGeneration &+= 1
+        paneModel.close()
     }
 
     public func dismissError() {
-        lastError = nil
-    }
-
-    private func apply(
-        document: PDFDocument,
-        fileURL: URL?,
-        restoring position: RecentReadingPosition?
-    ) {
-        cancelPendingAutoSave()
-        self.document = document
-        self.fileURL = fileURL
-        pageCount = document.pageCount
-        currentPageIndex = Self.clamped(position?.pageIndex ?? 0, pageCount: document.pageCount)
-        let restoredZoom = CGFloat(position?.zoomScale ?? 1)
-        zoomScale = restoredZoom.isFinite
-            ? min(max(restoredZoom, Self.minimumZoomScale), Self.maximumZoomScale)
-            : 1
-        effectiveScale = zoomScale
-        isAutoScaling = position?.usesAutomaticScaling ?? true
-        lastError = nil
-        hasUnsavedChanges = false
-        autoSaveStatus = .idle
-        lastAutoSaveOutcome = nil
-        editRevision &+= 1
-        currentSelection = nil
-        resetMarkupState()
-        refreshNoteMarkers()
-        title = Self.resolvedTitle(for: document, fileURL: fileURL)
-        loadGeneration &+= 1
+        resourceSession.dismissError()
     }
 
     // MARK: - Editing support
 
-    /// Where the reader is, so that replacing the in-memory document does not
-    /// send the user back to page one.
     struct ReadingPosition {
         let pageIndex: Int
         let zoomScale: CGFloat
@@ -418,171 +256,61 @@ public final class PDFDocumentModel: ObservableObject {
 
     var readingPosition: ReadingPosition {
         ReadingPosition(
-            pageIndex: currentPageIndex,
-            zoomScale: zoomScale,
-            effectiveScale: effectiveScale,
-            isAutoScaling: isAutoScaling
+            pageIndex: paneModel.currentPageIndex,
+            zoomScale: paneModel.zoomScale,
+            effectiveScale: paneModel.effectiveScale,
+            isAutoScaling: paneModel.isAutoScaling
         )
     }
 
-    /// Replaces the displayed document without touching the navigation state
-    /// the user chose.
-    ///
-    /// Deliberately does **not** bump `loadGeneration`: the view keeps its
-    /// `PDFView` and lets its state synchronizer capture and restore the viewport
-    /// while attaching the replacement. Keeping the view alone is insufficient:
-    /// assigning PDFView.document resets its navigation.
     func swapDocument(_ newDocument: PDFDocument, at position: ReadingPosition) {
-        document = newDocument
-        pageCount = newDocument.pageCount
-        currentPageIndex = Self.clamped(position.pageIndex, pageCount: newDocument.pageCount)
-        zoomScale = position.zoomScale
-        effectiveScale = position.effectiveScale
-        isAutoScaling = position.isAutoScaling
-        currentSelection = nil
-        resetMarkupState()
-        changedAnnotationPageIndices = Array(0..<newDocument.pageCount)
-        annotationRevision &+= 1
-        refreshNoteMarkers()
-        title = Self.resolvedTitle(for: newDocument, fileURL: fileURL)
+        resourceSession.swapDocument(newDocument)
+        paneModel.goToPage(position.pageIndex)
+        paneModel.setZoomScale(position.zoomScale)
+        paneModel.updateEffectiveScale(position.effectiveScale)
+        if position.isAutoScaling {
+            paneModel.fitToWindow()
+        }
     }
 
-    /// Points the model at a new file, used by Save As.
     func adoptFileLocation(_ url: URL) {
-        fileURL = url
-        if let document {
-            title = Self.resolvedTitle(for: document, fileURL: url)
-        }
-        if let recentDocuments, !recentDocuments.recordOpened(url) {
-            NSLog("YoPDF could not save a recent-document bookmark for %@", url.lastPathComponent)
-        }
-        persistReadingPosition()
+        resourceSession.adoptFileLocation(url)
     }
 
-    /// Swaps in the session that now owns the file, closing the old one.
-    ///
-    /// Used after Save As: the new session already holds the destination's
-    /// access, and the previous file must stop being held.
     func adoptSession(_ session: DocumentSession?) {
-        let previous = documentSession
-        documentSession = session
-        if previous !== session {
-            previous?.close()
-        }
+        resourceSession.adoptSession(session)
     }
 
     func markEdited() {
-        hasUnsavedChanges = true
-        editRevision &+= 1
-        scheduleAutoSave()
+        resourceSession.markEdited()
     }
 
     func markSaved(preservingMarkupHistory: Bool = false) {
-        cancelPendingAutoSave()
-        hasUnsavedChanges = false
-        autoSaveStatus = .idle
-        lastAutoSaveOutcome = nil
-        editRevision &+= 1
-        // In-place manual and automatic saves keep the live document and its
-        // history. Save As and explicit document replacements clear references
-        // to the old annotation objects.
+        resourceSession.markSaved(preservingMarkupHistory: preservingMarkupHistory)
         if !preservingMarkupHistory {
-            resetMarkupState()
+            paneModel.clearMarkupSelection()
         }
     }
 
-    /// Clears every reference to the annotations of the document being replaced.
-    ///
-    /// The undo entries hold `PDFAnnotation` objects, and an annotation belongs
-    /// to the `PDFDocument` that created it. Keeping them after an open, close,
-    /// Save As would leave a menu action able to mutate an old in-memory
-    /// document that is no longer on screen. In-place saves retain the live
-    /// document and can safely preserve the history.
     func resetMarkupState() {
-        markupUndoStack.removeAll()
-        markupRedoStack.removeAll()
-        canUndoMarkup = false
-        canRedoMarkup = false
-        selectedMarkup = nil
-        changedAnnotationPageIndices = []
+        resourceSession.resetMarkupState()
+        paneModel.clearMarkupSelection()
     }
 
-    /// Mirrors the view's selection into the model.
-    ///
-    /// The view is the only writer: it reports what `PDFView` selected, and
-    /// reports `nil` after the model cleared it (a highlight consumed it).
     public func updateSelection(_ selection: PDFSelection?) {
-        guard selection !== currentSelection else { return }
-        currentSelection = selection
-        // A real text selection starts a new intent. Clearing the annotation
-        // controls here also covers a drag that begins over a mark: the mark is
-        // only selected by a click that did not drag.
-        if let selection,
-           !(selection.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            selectedMarkup = nil
-        }
-    }
-
-    private static func clamped(_ index: Int, pageCount: Int) -> Int {
-        guard pageCount > 0 else { return 0 }
-        return min(max(index, 0), pageCount - 1)
-    }
-
-    private static func resolvedTitle(for document: PDFDocument, fileURL: URL?) -> String {
-        if let raw = document.documentAttributes?[PDFDocumentAttribute.titleAttribute] as? String {
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty { return trimmed }
-        }
-        if let name = fileURL?.deletingPathExtension().lastPathComponent, !name.isEmpty {
-            return name
-        }
-        return "Untitled"
-    }
-
-    /// Keeps the reader's user-facing failures narrow while the store reports
-    /// the file-level situation precisely.
-    private static func loadError(from error: DocumentStoreError) -> LoadError {
-        switch error {
-        case .notAFileURL:
-            return .notAFileURL
-        case .fileMissing:
-            return .fileMissing
-        case .permissionDenied, .readOnly:
-            return .permissionDenied
-        case let .unsupportedFileSituation(situation, _):
-            return .unsupportedFileSituation(situation)
-        case .notReadable, .sessionClosed, .externalModificationDetected,
-             .targetExists, .stagingFailed, .replacementFailed,
-             .replacementStateUncertain, .committedButUnverified,
-             .sessionNeedsRefresh, .reloadRequired, .targetAppearedDuringSave,
-             .coordinationFailed:
-            // None of these can happen while opening a file; they are save- and
-            // session-level outcomes. Kept here so the mapping stays exhaustive.
-            return .unreadable
-        }
+        paneModel.updateSelection(selection)
     }
 
     // MARK: - Navigation
 
     public func goToPage(_ index: Int) {
-        guard pageCount > 0 else { return }
-        let clampedIndex = min(max(index, 0), pageCount - 1)
-        if currentPageIndex != clampedIndex {
-            currentPageIndex = clampedIndex
-        }
-        pageNavigationRevision &+= 1
-        persistReadingPosition()
+        paneModel.goToPage(index)
     }
 
-    /// Native scrolling and zoom reflow report state, rather than requesting a
-    /// jump. Keeping this separate prevents a refresh from interrupting a pinch.
     public func updateCurrentPageIndex(_ index: Int) {
-        guard index >= 0, index < pageCount, index != currentPageIndex else { return }
-        currentPageIndex = index
-        persistReadingPosition()
+        paneModel.updateCurrentPageIndex(index)
     }
 
-    /// A queued viewport report must not supersede a newer command or document.
     public func updateViewState(
         document: PDFDocument?,
         pageIndex: Int?,
@@ -590,104 +318,51 @@ public final class PDFDocumentModel: ObservableObject {
         pageNavigationRevision: Int,
         zoomCommandRevision: Int
     ) {
-        guard self.document === document,
-              self.pageNavigationRevision == pageNavigationRevision,
-              self.zoomCommandRevision == zoomCommandRevision else { return }
-        if let pageIndex {
-            updateCurrentPageIndex(pageIndex)
-        }
-        updateEffectiveScale(scale)
+        paneModel.updateViewState(
+            document: document,
+            pageIndex: pageIndex,
+            scale: scale,
+            pageNavigationRevision: pageNavigationRevision,
+            zoomCommandRevision: zoomCommandRevision
+        )
     }
 
-    /// Stepping is a no-op at the document boundaries. Bumping the navigation
-    /// revision there would replay the current page and reset its scroll offset.
     public func goToNextPage() {
-        guard currentPageIndex + 1 < pageCount else { return }
-        goToPage(currentPageIndex + 1)
+        paneModel.goToNextPage()
     }
 
-    /// See `goToNextPage()`. An explicit `goToPage` of the current page still
-    /// issues a command so callers can deliberately re-center it.
     public func goToPreviousPage() {
-        guard currentPageIndex > 0 else { return }
-        goToPage(currentPageIndex - 1)
+        paneModel.goToPreviousPage()
     }
 
     // MARK: - Zoom
 
     public func setZoomScale(_ scale: CGFloat) {
-        guard scale.isFinite else { return }
-        zoomScale = min(max(scale, Self.minimumZoomScale), Self.maximumZoomScale)
-        effectiveScale = zoomScale
-        isAutoScaling = false
-        zoomCommandRevision &+= 1
-        persistReadingPosition()
-    }
-
-    /// Base for the next zoom step: the live fitted scale while auto-scaling,
-    /// otherwise the user's chosen scale.
-    private var zoomBase: CGFloat {
-        isAutoScaling ? effectiveScale : zoomScale
+        paneModel.setZoomScale(scale)
     }
 
     public func zoomIn() {
-        setZoomScale(zoomBase * Self.zoomStep)
+        paneModel.zoomIn()
     }
 
     public func zoomOut() {
-        setZoomScale(zoomBase / Self.zoomStep)
+        paneModel.zoomOut()
     }
 
     public func resetZoom() {
-        setZoomScale(1)
+        paneModel.resetZoom()
     }
 
     public func fitToWindow() {
-        isAutoScaling = true
-        zoomCommandRevision &+= 1
-        persistReadingPosition()
+        paneModel.fitToWindow()
     }
 
-    /// Called by the view whenever PDFView's scale changes. Never flips
-    /// `isAutoScaling`: the view is the only source of truth while fitting.
     public func updateEffectiveScale(_ scale: CGFloat) {
-        guard scale.isFinite, scale > 0 else { return }
-        if effectiveScale != scale {
-            effectiveScale = scale
-        }
-        if !isAutoScaling {
-            let manualScale = min(max(scale, Self.minimumZoomScale), Self.maximumZoomScale)
-            if zoomScale != manualScale {
-                zoomScale = manualScale
-                persistReadingPosition()
-            }
-        }
+        paneModel.updateEffectiveScale(scale)
     }
 
     public func setAutoScaling(_ enabled: Bool) {
-        if enabled {
-            fitToWindow()
-        } else {
-            guard isAutoScaling else { return }
-            // PDFKit already owns the live PDFView scale during a magnify
-            // gesture. Record that manual zoom has started without sending a
-            // scale command back through NSViewRepresentable.updateNSView.
-            isAutoScaling = false
-            zoomScale = min(max(effectiveScale, Self.minimumZoomScale), Self.maximumZoomScale)
-            persistReadingPosition()
-        }
-    }
-
-    private func persistReadingPosition() {
-        guard let url = fileURL else { return }
-        recentDocuments?.updateReadingPosition(
-            RecentReadingPosition(
-                pageIndex: currentPageIndex,
-                zoomScale: Double(zoomScale),
-                usesAutomaticScaling: isAutoScaling
-            ),
-            for: url
-        )
+        paneModel.setAutoScaling(enabled)
     }
 }
 

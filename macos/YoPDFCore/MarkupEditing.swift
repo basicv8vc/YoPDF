@@ -132,43 +132,38 @@ struct MarkupEdit {
     }
 }
 
-extension PDFDocumentModel {
+struct SelectedMarkupContext {
+    let annotation: PDFAnnotation
+    let kind: MarkupKind
+    let pageIndex: Int
+}
+
+extension PDFResourceSession {
 
     // MARK: - Adding
 
-    /// The colour the next new mark of `kind` will use.
     public func defaultMarkupColor(for kind: MarkupKind) -> NSColor {
         markupPreferences.color(for: kind)
     }
 
-    /// Persists the default for new marks of `kind`.
-    ///
-    /// Deliberately separate from recolouring an existing annotation: changing
-    /// an existing mark is a document edit, changing this is an application
-    /// preference, and one must never imply the other.
     @discardableResult
     public func setDefaultMarkupColor(_ color: NSColor, for kind: MarkupKind) -> Bool {
         markupPreferences.setColor(color, for: kind)
     }
 
-    /// Whether a mark of `kind` can be created from the current selection.
-    public func canAddMarkup(_ kind: MarkupKind) -> Bool {
-        guard let document, document.allowsCommenting, let selection = currentSelection else {
+    public func canAddMarkup(_ kind: MarkupKind, from selection: PDFSelection?) -> Bool {
+        guard let document, document.allowsCommenting, let selection else {
             return false
         }
         let text = (selection.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         return !text.isEmpty
     }
 
-    /// Adds a standard markup annotation using the persisted default colour.
-    ///
-    /// All page placements of a cross-page selection are applied as one edit, so
-    /// Undo removes the entire selection rather than the last page of it.
     @discardableResult
-    public func addMarkup(_ kind: MarkupKind) -> HighlightService.Summary? {
+    public func addMarkup(_ kind: MarkupKind, from selection: PDFSelection?) -> HighlightService.Summary? {
         guard let document,
-              let selection = currentSelection,
-              canAddMarkup(kind),
+              let selection,
+              canAddMarkup(kind, from: selection),
               let creation = try? HighlightService.createMarkup(
                   kind,
                   from: selection,
@@ -181,77 +176,26 @@ extension PDFDocumentModel {
             .insert(annotation: $0.annotation, pageIndex: $0.pageIndex)
         })
         guard performMarkupEdit(edit) else { return nil }
-        updateSelection(nil)
         return creation.summary
     }
 
-    // MARK: - Selection
+    // MARK: - Recolour, Delete, Convert
 
-    /// Hit-tests annotations by their painted quads, not by their bounds.
-    ///
-    /// Returns `true` when an annotation was selected. A miss clears the current
-    /// markup selection but leaves the text selection alone: clicking the page
-    /// background is the normal way to dismiss the annotation controls.
     @discardableResult
-    public func selectMarkup(at point: CGPoint, on page: PDFPage) -> Bool {
-        guard let document,
-              page.document === document,
-              let pageIndex = Self.validPageIndex(for: page, in: document)
-        else {
-            selectedMarkup = nil
-            return false
-        }
-
-        // Last annotation wins: PDFKit draws later annotations on top.
-        for annotation in page.annotations.reversed() {
-            guard annotation.shouldDisplay,
-                  let kind = MarkupKind(annotation: annotation),
-                  MarkupGeometry.contains(annotation, point: point),
-                  let selection = MarkupSelection(
-                      annotation: annotation,
-                      kind: kind,
-                      pageIndex: pageIndex
-                  )
-            else { continue }
-            selectedMarkup = selection
-            updateSelection(nil)
-            return true
-        }
-
-        selectedMarkup = nil
-        return false
-    }
-
-    public func clearMarkupSelection() {
-        selectedMarkup = nil
-    }
-
-    /// True when the selected annotation passes every permission check for the
-    /// document and page it is currently attached to.
-    public var canModifySelectedMarkup: Bool {
-        selectedMarkupContext() != nil
-    }
-
-    /// True when something is selected but cannot be changed. The UI uses this
-    /// to explain why the editing controls are disabled rather than hiding them.
-    public var selectedMarkupIsProtected: Bool {
-        selectedMarkup != nil && !canModifySelectedMarkup
-    }
-
-    // MARK: - Recolour
-
-    /// Recolours the selected annotation without touching the new-mark default.
-    ///
-    /// A fully transparent or unconvertible colour is refused before anything is
-    /// changed. Repeating the current colour is a no-op and does not create an
-    /// undo entry.
-    @discardableResult
-    public func recolorSelectedMarkup(to color: NSColor) -> Bool {
+    public func recolorMarkup(
+        _ annotation: PDFAnnotation,
+        on pageIndex: Int,
+        to color: NSColor,
+        coalescing: Bool = true
+    ) -> Bool {
         guard let normalized = MarkupColorPalette.normalized(color),
-              let context = selectedMarkupContext()
+              let document,
+              let page = document.page(at: pageIndex),
+              MarkupPermissions.canModify(annotation, in: document, on: page),
+              document.index(for: page) == pageIndex
         else { return false }
 
-        let currentHex = MarkupColorPalette.hex(from: context.annotation.color)
+        let currentHex = MarkupColorPalette.hex(from: annotation.color)
         let newHex = MarkupColorPalette.hex(from: normalized)
         if currentHex != nil, currentHex == newHex {
             return true
@@ -259,58 +203,48 @@ extension PDFDocumentModel {
 
         let edit = MarkupEdit(changes: [
             .recolor(
-                annotation: context.annotation,
-                pageIndex: context.pageIndex,
-                from: context.annotation.color,
+                annotation: annotation,
+                pageIndex: pageIndex,
+                from: annotation.color,
                 to: normalized
             )
         ])
-        guard performMarkupEdit(edit, coalescingRecolour: true) else { return false }
-        selectedMarkup = MarkupSelection(
-            annotation: context.annotation,
-            kind: context.kind,
-            pageIndex: context.pageIndex
-        )
-        return true
+        return performMarkupEdit(edit, coalescingRecolour: coalescing)
     }
 
-    // MARK: - Delete and convert
-
     @discardableResult
-    public func deleteSelectedMarkup() -> Bool {
-        guard let context = selectedMarkupContext() else { return false }
-        let edit = MarkupEdit(changes: [
-            .remove(annotation: context.annotation, pageIndex: context.pageIndex)
-        ])
-        guard performMarkupEdit(edit) else { return false }
-        selectedMarkup = nil
-        return true
-    }
-
-    /// Replaces the selected annotation with the other markup subtype.
-    ///
-    /// The replacement keeps bounds, quads, colour and copied metadata; the two
-    /// changes are one undo entry, so ⌘Z restores the original subtype.
-    @discardableResult
-    public func convertSelectedMarkup() -> Bool {
-        guard let context = selectedMarkupContext(),
-              let replacement = try? HighlightService.replacement(
-                  for: context.annotation,
-                  as: context.kind.converted
-              )
+    public func deleteMarkup(_ annotation: PDFAnnotation, on pageIndex: Int) -> Bool {
+        guard let document,
+              let page = document.page(at: pageIndex),
+              MarkupPermissions.canModify(annotation, in: document, on: page),
+              document.index(for: page) == pageIndex
         else { return false }
 
         let edit = MarkupEdit(changes: [
-            .remove(annotation: context.annotation, pageIndex: context.pageIndex),
-            .insert(annotation: replacement, pageIndex: context.pageIndex)
+            .remove(annotation: annotation, pageIndex: pageIndex)
         ])
-        guard performMarkupEdit(edit) else { return false }
-        selectedMarkup = MarkupSelection(
-            annotation: replacement,
-            kind: context.kind.converted,
-            pageIndex: context.pageIndex
-        )
-        return true
+        return performMarkupEdit(edit)
+    }
+
+    @discardableResult
+    public func convertMarkup(_ annotation: PDFAnnotation, on pageIndex: Int) -> PDFAnnotation? {
+        guard let document,
+              let page = document.page(at: pageIndex),
+              let currentKind = MarkupKind(annotation: annotation),
+              MarkupPermissions.canModify(annotation, in: document, on: page),
+              document.index(for: page) == pageIndex,
+              let replacement = try? HighlightService.replacement(
+                  for: annotation,
+                  as: currentKind.converted
+              )
+        else { return nil }
+
+        let edit = MarkupEdit(changes: [
+            .remove(annotation: annotation, pageIndex: pageIndex),
+            .insert(annotation: replacement, pageIndex: pageIndex)
+        ])
+        guard performMarkupEdit(edit) else { return nil }
+        return replacement
     }
 
     // MARK: - Undo and redo
@@ -322,18 +256,13 @@ extension PDFDocumentModel {
         case .applied:
             markupUndoStack.removeLast()
             markupRedoStack.append(edit)
-            selectedMarkup = nil
             updateMarkupAvailability()
             markEdited()
             return true
         case .permissionDenied:
-            // The history is still valid; the annotation is simply protected at
-            // the moment. Keep the entry, the selection and the dirty state so
-            // that unlocking the annotation makes the same Undo available again.
             return false
         case .invalidHistory:
             resetMarkupHistory()
-            selectedMarkup = nil
             return false
         }
     }
@@ -345,51 +274,20 @@ extension PDFDocumentModel {
         case .applied:
             markupRedoStack.removeLast()
             markupUndoStack.append(edit)
-            selectedMarkup = nil
             updateMarkupAvailability()
             markEdited()
             return true
         case .permissionDenied:
-            // See `undoMarkup`: a protected annotation does not invalidate the
-            // redo history.
             return false
         case .invalidHistory:
             resetMarkupHistory()
-            selectedMarkup = nil
             return false
         }
     }
 
     // MARK: - Edit plumbing
 
-    private struct SelectedMarkupContext {
-        let annotation: PDFAnnotation
-        let kind: MarkupKind
-        let pageIndex: Int
-    }
-
-    private func selectedMarkupContext() -> SelectedMarkupContext? {
-        guard let document,
-              let selected = selectedMarkup,
-              let page = document.page(at: selected.pageIndex),
-              let kind = MarkupKind(annotation: selected.annotation),
-              MarkupPermissions.canModify(selected.annotation, in: document, on: page),
-              document.index(for: page) == selected.pageIndex
-        else { return nil }
-        return SelectedMarkupContext(
-            annotation: selected.annotation,
-            kind: kind,
-            pageIndex: selected.pageIndex
-        )
-    }
-
-    /// Applies a new edit, registers it for Undo and advances the dirty state.
-    ///
-    /// The edit is validated before any change is made, so a failed call cannot
-    /// leave half a cross-page annotation behind.
-    ///
-    /// Internal rather than private so `NoteEditing` uses the same pipeline
-    /// instead of a second mutation path.
+    @discardableResult
     func performMarkupEdit(
         _ edit: MarkupEdit,
         coalescingRecolour: Bool = false
@@ -409,21 +307,13 @@ extension PDFDocumentModel {
         return true
     }
 
-    private enum MarkupReplayOutcome {
+    enum MarkupReplayOutcome {
         case applied
         case permissionDenied
         case invalidHistory
     }
 
-    /// Replays an edit against the current document.
-    ///
-    /// Every change is checked first. A stale history entry — an annotation
-    /// another caller removed, or a page that no longer exists — is treated as
-    /// an unusable history rather than as a reason to mutate some other page.
-    /// Permission checks run in the same preflight pass and cover the whole
-    /// edit, so a locked annotation on one page blocks a cross-page Undo before
-    /// any page is touched.
-    private func applyMarkupEdit(_ edit: MarkupEdit, forward: Bool) -> MarkupReplayOutcome {
+    func applyMarkupEdit(_ edit: MarkupEdit, forward: Bool) -> MarkupReplayOutcome {
         guard let document, !edit.changes.isEmpty else { return .invalidHistory }
 
         var pages: [Int: PDFPage] = [:]
@@ -437,24 +327,20 @@ extension PDFDocumentModel {
             switch change {
             case .insert:
                 if forward {
-                    // Redo of an insert, or the insertion half of a conversion.
                     guard annotation.page == nil,
                           !page.annotations.contains(where: { $0 === annotation })
                     else { return .invalidHistory }
                 } else {
-                    // Undo of an add: the mark must still be on this page.
                     guard annotation.page === page,
                           page.annotations.contains(where: { $0 === annotation })
                     else { return .invalidHistory }
                 }
             case .remove:
                 if forward {
-                    // Redo of a delete: the mark must be there to remove.
                     guard annotation.page === page,
                           page.annotations.contains(where: { $0 === annotation })
                     else { return .invalidHistory }
                 } else {
-                    // Undo of a delete: the mark must still be detached.
                     guard annotation.page == nil,
                           !page.annotations.contains(where: { $0 === annotation })
                     else { return .invalidHistory }
@@ -469,12 +355,6 @@ extension PDFDocumentModel {
                 else { return .invalidHistory }
             }
 
-            // The same `/F` and document rules as a direct edit. This also
-            // covers annotations that are currently detached, so undoing a
-            // delete cannot restore a mark whose flags have since been locked.
-            // Contents have one extra bit: LockedContents blocks the body but
-            // not the paper colour or deletion of the note. The document-level
-            // commenting permission applies to every change.
             switch change {
             case .setContents:
                 guard document.allowsCommenting,
@@ -521,28 +401,23 @@ extension PDFDocumentModel {
         return .applied
     }
 
-    private func resetMarkupHistory() {
+    func updateMarkupAvailability() {
+        canUndoMarkup = !markupUndoStack.isEmpty
+        canRedoMarkup = !markupRedoStack.isEmpty
+    }
+
+    func resetMarkupHistory() {
         markupUndoStack.removeAll()
         markupRedoStack.removeAll()
         updateMarkupAvailability()
     }
 
-    private func updateMarkupAvailability() {
-        canUndoMarkup = !markupUndoStack.isEmpty
-        canRedoMarkup = !markupRedoStack.isEmpty
-    }
-
-    private func noteAnnotationsChanged(on pageIndices: [Int]) {
+    func noteAnnotationsChanged(on pageIndices: [Int]) {
         changedAnnotationPageIndices = Array(Set(pageIndices)).sorted()
         annotationRevision &+= 1
         refreshNoteMarkers()
     }
 
-    /// Removes an annotation together with the popup PDFKit may have attached.
-    ///
-    /// A `/Text` annotation is commonly paired with a `/Popup` child. Removing
-    /// only the parent leaves the popup behind as an empty, unclickable icon, so
-    /// both objects go in the same undoable step.
     func removeAnnotationAndPopup(_ annotation: PDFAnnotation, from page: PDFPage) {
         if let popup = annotation.popup,
            page.annotations.contains(where: { $0 === popup }) {
@@ -551,10 +426,6 @@ extension PDFDocumentModel {
         page.removeAnnotation(annotation)
     }
 
-    /// Puts back the popup that belonged to a restored annotation.
-    ///
-    /// PDFKit keeps the popup object on the annotation, so undoing a delete can
-    /// reattach it. It is only re-added when it is not already on the page.
     func restorePopup(of annotation: PDFAnnotation, on page: PDFPage) {
         guard let popup = annotation.popup,
               !page.annotations.contains(where: { $0 === popup })
@@ -562,8 +433,109 @@ extension PDFDocumentModel {
         page.addAnnotation(popup)
     }
 
-    private static func validPageIndex(for page: PDFPage, in document: PDFDocument) -> Int? {
+    static func validPageIndex(for page: PDFPage, in document: PDFDocument) -> Int? {
         let index = document.index(for: page)
         return index >= 0 ? index : nil
+    }
+}
+
+extension PDFDocumentModel {
+
+    // MARK: - Adding
+
+    public func defaultMarkupColor(for kind: MarkupKind) -> NSColor {
+        resourceSession.defaultMarkupColor(for: kind)
+    }
+
+    @discardableResult
+    public func setDefaultMarkupColor(_ color: NSColor, for kind: MarkupKind) -> Bool {
+        resourceSession.setDefaultMarkupColor(color, for: kind)
+    }
+
+    public func canAddMarkup(_ kind: MarkupKind) -> Bool {
+        paneModel.canAddMarkup(kind)
+    }
+
+    @discardableResult
+    public func addMarkup(_ kind: MarkupKind) -> HighlightService.Summary? {
+        paneModel.addMarkup(kind)
+    }
+
+    // MARK: - Selection
+
+    @discardableResult
+    public func selectMarkup(at point: CGPoint, on page: PDFPage) -> Bool {
+        paneModel.selectMarkup(at: point, on: page)
+    }
+
+    public func clearMarkupSelection() {
+        paneModel.clearMarkupSelection()
+    }
+
+    public var canModifySelectedMarkup: Bool {
+        paneModel.canModifySelectedMarkup
+    }
+
+    public var selectedMarkupIsProtected: Bool {
+        paneModel.selectedMarkupIsProtected
+    }
+
+    // MARK: - Recolour
+
+    @discardableResult
+    public func recolorSelectedMarkup(to color: NSColor, coalescing: Bool = true) -> Bool {
+        paneModel.recolorSelectedMarkup(to: color, coalescing: coalescing)
+    }
+
+    @discardableResult
+    public func recolorSelectedMarkup(to color: NSColor) -> Bool {
+        paneModel.recolorSelectedMarkup(to: color, coalescing: true)
+    }
+
+    // MARK: - Delete and convert
+
+    @discardableResult
+    public func deleteSelectedMarkup() -> Bool {
+        paneModel.deleteSelectedMarkup()
+    }
+
+    @discardableResult
+    public func convertSelectedMarkup() -> Bool {
+        paneModel.convertSelectedMarkup()
+    }
+
+    // MARK: - Undo and redo
+
+    @discardableResult
+    public func undoMarkup() -> Bool {
+        let success = resourceSession.undoMarkup()
+        if success {
+            paneModel.clearMarkupSelection()
+        }
+        return success
+    }
+
+    @discardableResult
+    public func redoMarkup() -> Bool {
+        let success = resourceSession.redoMarkup()
+        if success {
+            paneModel.clearMarkupSelection()
+        }
+        return success
+    }
+
+    func performMarkupEdit(
+        _ edit: MarkupEdit,
+        coalescingRecolour: Bool = false
+    ) -> Bool {
+        resourceSession.performMarkupEdit(edit, coalescingRecolour: coalescingRecolour)
+    }
+
+    func removeAnnotationAndPopup(_ annotation: PDFAnnotation, from page: PDFPage) {
+        resourceSession.removeAnnotationAndPopup(annotation, from: page)
+    }
+
+    func restorePopup(of annotation: PDFAnnotation, on page: PDFPage) {
+        resourceSession.restorePopup(of: annotation, on: page)
     }
 }
