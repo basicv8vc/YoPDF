@@ -167,6 +167,7 @@ private struct WorkspaceTabStrip: View {
     private func tabView(_ tab: WorkspaceTabSession) -> some View {
         let isActive = tab.id == workspace.activeTabID
         let isDragging = draggingTabID == tab.id
+        let showsCloseButton = workspace.tabs.count > 1
 
         return HStack(spacing: 2) {
             Button {
@@ -176,6 +177,11 @@ private struct WorkspaceTabStrip: View {
                     .lineLimit(1)
                     .frame(maxWidth: 190, alignment: .leading)
                     .padding(.leading, 10)
+                    // The close button supplies the visual spacing on the right
+                    // when it is there. A lone tab has nothing after the label,
+                    // so without this the text would sit hard against the
+                    // capsule's trailing edge and read as left shifted.
+                    .padding(.trailing, showsCloseButton ? 0 : 10)
                     .padding(.vertical, 6)
                     .contentShape(Rectangle())
             }
