@@ -315,7 +315,8 @@ public struct PaneDropPreviewOverlay: View {
             }
             .frame(width: frame.width, height: frame.height)
             .position(x: frame.midX, y: frame.midY)
-            .animation(.easeInOut(duration: 0.15), value: direction)
+            .animation(.easeOut(duration: 0.14), value: direction)
+            .transition(.opacity)
             .accessibilityElement(children: .combine)
             .accessibilityLabel("Split \(direction.rawValue) drop preview")
             .accessibilityIdentifier("pane-drop-preview-\(direction.rawValue)")
@@ -355,6 +356,7 @@ public struct PaneHeaderView: View {
     public let onActivate: () -> Void
     public let onClose: () -> Void
     public let dragPayload: PaneDragPayload
+    public var onDragStarted: (() -> Void)? = nil
 
     @State private var isHovering: Bool = false
 
@@ -366,7 +368,8 @@ public struct PaneHeaderView: View {
         canClose: Bool,
         onActivate: @escaping () -> Void,
         onClose: @escaping () -> Void,
-        dragPayload: PaneDragPayload
+        dragPayload: PaneDragPayload,
+        onDragStarted: (() -> Void)? = nil
     ) {
         self.paneID = paneID
         self.title = title
@@ -376,15 +379,40 @@ public struct PaneHeaderView: View {
         self.onActivate = onActivate
         self.onClose = onClose
         self.dragPayload = dragPayload
+        self.onDragStarted = onDragStarted
     }
 
     public var body: some View {
         HStack(spacing: 6) {
+            // Subtle drag handle that becomes prominent on hover; drag originates strictly here
             Image(systemName: "line.3.horizontal")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(isPaneActive ? Color.accentColor : Color.secondary)
-                .frame(width: 18, height: 18)
+                .frame(width: 20, height: 20)
+                .background(
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(isHovering ? Color.secondary.opacity(0.14) : Color.clear)
+                )
+                .opacity(isHovering ? 1.0 : 0.45)
+                .animation(.easeInOut(duration: 0.12), value: isHovering)
                 .contentShape(Rectangle())
+                .onDrag({
+                    onDragStarted?()
+                    return dragPayload.asItemProvider()
+                }, preview: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "doc.text.fill")
+                            .font(.system(size: 12))
+                            .foregroundStyle(Color.accentColor)
+                        Text(title)
+                            .font(.system(size: 12, weight: .medium))
+                            .lineLimit(1)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(.ultraThickMaterial, in: RoundedRectangle(cornerRadius: 6))
+                    .shadow(color: .black.opacity(0.15), radius: 4, y: 2)
+                })
                 .help("Drag to move or split pane")
                 .accessibilityLabel("Drag handle for pane \(title)")
                 .accessibilityIdentifier("pane-drag-handle-\(paneID.description)")
@@ -431,16 +459,14 @@ public struct PaneHeaderView: View {
         .onTapGesture {
             onActivate()
         }
-        .onDrag {
-            dragPayload.asItemProvider()
-        }
     }
 }
 
-/// Drop delegate for a visual pane handling drag-over direction detection and drop execution.
+/// Drop delegate for a visual pane handling drag-over direction detection with hysteresis and drop execution.
 public struct PaneDropDelegate: DropDelegate {
     public let targetPaneID: PaneID
     public let containerSize: CGSize
+    public let currentHoverDirection: LayoutInsertionDirection?
     public let validateDrop: (LayoutInsertionDirection) -> (isValid: Bool, feedback: String)
     public let onHoverChanged: (PaneDropHoverState?) -> Void
     public let onPerformDrop: (DropPayload, LayoutInsertionDirection) -> Bool
@@ -448,12 +474,14 @@ public struct PaneDropDelegate: DropDelegate {
     public init(
         targetPaneID: PaneID,
         containerSize: CGSize,
+        currentHoverDirection: LayoutInsertionDirection? = nil,
         validateDrop: @escaping (LayoutInsertionDirection) -> (isValid: Bool, feedback: String),
         onHoverChanged: @escaping (PaneDropHoverState?) -> Void,
         onPerformDrop: @escaping (DropPayload, LayoutInsertionDirection) -> Bool
     ) {
         self.targetPaneID = targetPaneID
         self.containerSize = containerSize
+        self.currentHoverDirection = currentHoverDirection
         self.validateDrop = validateDrop
         self.onHoverChanged = onHoverChanged
         self.onPerformDrop = onPerformDrop
@@ -479,7 +507,12 @@ public struct PaneDropDelegate: DropDelegate {
     }
 
     public func dropUpdated(info: DropInfo) -> DropProposal? {
-        let direction = LayoutInsertionDirection.direction(for: info.location, in: containerSize)
+        let direction = LayoutInsertionDirection.direction(
+            for: info.location,
+            in: containerSize,
+            previousDirection: currentHoverDirection,
+            hysteresis: 0.05
+        )
         let check = validateDrop(direction)
         onHoverChanged(PaneDropHoverState(direction: direction, isValid: check.isValid, feedbackMessage: check.feedback))
 
@@ -498,7 +531,12 @@ public struct PaneDropDelegate: DropDelegate {
     }
 
     public func performDrop(info: DropInfo) -> Bool {
-        let direction = LayoutInsertionDirection.direction(for: info.location, in: containerSize)
+        let direction = LayoutInsertionDirection.direction(
+            for: info.location,
+            in: containerSize,
+            previousDirection: currentHoverDirection,
+            hysteresis: 0.05
+        )
         let check = validateDrop(direction)
         onHoverChanged(nil)
         guard check.isValid else { return false }
@@ -544,7 +582,12 @@ public struct PaneDropDelegate: DropDelegate {
     }
 
     private func updateHover(info: DropInfo) {
-        let direction = LayoutInsertionDirection.direction(for: info.location, in: containerSize)
+        let direction = LayoutInsertionDirection.direction(
+            for: info.location,
+            in: containerSize,
+            previousDirection: currentHoverDirection,
+            hysteresis: 0.05
+        )
         let check = validateDrop(direction)
         onHoverChanged(PaneDropHoverState(direction: direction, isValid: check.isValid, feedbackMessage: check.feedback))
     }
@@ -554,6 +597,7 @@ public struct PaneDropDelegate: DropDelegate {
 public struct PaneDropTargetModifier: ViewModifier {
     public let targetPaneID: PaneID
     public let containerSize: CGSize
+    public let currentHoverDirection: LayoutInsertionDirection?
     public let validateDrop: (LayoutInsertionDirection) -> (isValid: Bool, feedback: String)
     public let onHoverChanged: (PaneDropHoverState?) -> Void
     public let onPerformDrop: (DropPayload, LayoutInsertionDirection) -> Bool
@@ -561,12 +605,14 @@ public struct PaneDropTargetModifier: ViewModifier {
     public init(
         targetPaneID: PaneID,
         containerSize: CGSize,
+        currentHoverDirection: LayoutInsertionDirection? = nil,
         validateDrop: @escaping (LayoutInsertionDirection) -> (isValid: Bool, feedback: String),
         onHoverChanged: @escaping (PaneDropHoverState?) -> Void,
         onPerformDrop: @escaping (DropPayload, LayoutInsertionDirection) -> Bool
     ) {
         self.targetPaneID = targetPaneID
         self.containerSize = containerSize
+        self.currentHoverDirection = currentHoverDirection
         self.validateDrop = validateDrop
         self.onHoverChanged = onHoverChanged
         self.onPerformDrop = onPerformDrop
@@ -579,6 +625,7 @@ public struct PaneDropTargetModifier: ViewModifier {
                 delegate: PaneDropDelegate(
                     targetPaneID: targetPaneID,
                     containerSize: containerSize,
+                    currentHoverDirection: currentHoverDirection,
                     validateDrop: validateDrop,
                     onHoverChanged: onHoverChanged,
                     onPerformDrop: onPerformDrop

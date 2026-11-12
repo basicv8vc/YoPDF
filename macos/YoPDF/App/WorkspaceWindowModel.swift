@@ -593,7 +593,6 @@ final class WorkspaceWindowModel: ObservableObject {
         }
 
         // 2. Reuse existing resourceSession if file is already open, or open a fresh resourceSession
-        var didCreateNewResource = false
         let resourceSessionToUse: PDFResourceSession
         if let existing = findResourceSession(for: url) {
             resourceSessionToUse = existing
@@ -605,7 +604,6 @@ final class WorkspaceWindowModel: ObservableObject {
                 return .failure(error)
             }
             resourceSessionToUse = newResource
-            didCreateNewResource = true
         }
 
         // 3. Commit layout mutation using the pre-validated tree

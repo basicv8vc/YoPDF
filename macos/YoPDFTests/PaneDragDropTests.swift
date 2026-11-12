@@ -976,4 +976,82 @@ final class PaneDragDropTests: XCTestCase {
 
         workspace.closeAllSessions()
     }
+
+    // MARK: - 17. Intra-Tab Reordering Within Existing 4-Pane Layout (UX Polish Item 4)
+
+    func testIntraTabReorderingWithinExistingFourPaneLayoutIsAllowed() throws {
+        let fixtureURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 10, named: "four-pane-reorder")
+        defer {
+            try? FileManager.default.removeItem(at: fixtureURL.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        guard case let .opened(tabID) = workspace.open(fixtureURL) else {
+            return XCTFail("Failed to open fixture PDF")
+        }
+
+        let tab = try XCTUnwrap(workspace.session(tabID: tabID))
+        let p1 = tab.activePaneID
+        let p2 = try tab.split(direction: .right)
+        let p3 = try tab.split(direction: .bottom)
+        tab.activePaneID = p2
+        let p4 = try tab.split(direction: .bottom)
+        XCTAssertEqual(tab.layoutTree.paneCount, 4)
+
+        // 1. Moving an existing pane within the 4-pane tab MUST be allowed
+        let movedID = try workspace.movePane(
+            sourceTabID: tabID,
+            paneID: p1,
+            toDestinationTabID: tabID,
+            adjacentTo: p4,
+            direction: .bottom
+        )
+        XCTAssertEqual(movedID, p1)
+        XCTAssertEqual(tab.layoutTree.paneCount, 4)
+        XCTAssertEqual(tab.activePaneID, p1)
+        XCTAssertTrue(tab.layoutTree.contains(p1))
+        XCTAssertTrue(tab.layoutTree.contains(p2))
+        XCTAssertTrue(tab.layoutTree.contains(p3))
+        XCTAssertTrue(tab.layoutTree.contains(p4))
+
+        // 2. Cross-tab insertion or Finder drop into the 4-pane tab must still be refused (maxPanes limit reached)
+        let extraTabID = workspace.createTab()
+        let extraTab = try XCTUnwrap(workspace.session(tabID: extraTabID))
+        let extraPaneID = extraTab.activePaneID
+
+        XCTAssertThrowsError(try workspace.movePane(
+            sourceTabID: extraTabID,
+            paneID: extraPaneID,
+            toDestinationTabID: tabID,
+            adjacentTo: p1,
+            direction: .right
+        )) { error in
+            XCTAssertEqual(error as? LayoutMutationError, .maximumPaneLimitReached(limit: 4))
+        }
+        XCTAssertEqual(tab.layoutTree.paneCount, 4)
+
+        workspace.closeAllSessions()
+    }
+
+    // MARK: - 18. Directional Hysteresis Prevents Zone Boundary Jitter (UX Polish Item 2)
+
+    func testDirectionalHysteresisPreventsBoundaryJitter() {
+        let size = CGSize(width: 400, height: 400)
+
+        // Point near the diagonal boundary between Left and Top:
+        // x = 98 (nLeft = 0.245), y = 100 (nTop = 0.250)
+        // Without previous direction: nLeft (0.245) < nTop (0.250) -> .left
+        let initialDir = LayoutInsertionDirection.direction(for: CGPoint(x: 98, y: 100), in: size, previousDirection: nil)
+        XCTAssertEqual(initialDir, .left)
+
+        // With previous direction set to .top:
+        // nTop is biased by -0.05 -> 0.250 - 0.05 = 0.200 < 0.245 -> stays .top!
+        let hystDir = LayoutInsertionDirection.direction(for: CGPoint(x: 98, y: 100), in: size, previousDirection: .top, hysteresis: 0.05)
+        XCTAssertEqual(hystDir, .top)
+
+        // Point deep inside Left: x = 50 (nLeft = 0.125), y = 100 (nTop = 0.250)
+        // Biased top is 0.200, but nLeft is 0.125 -> clearly switches to .left!
+        let deepLeftDir = LayoutInsertionDirection.direction(for: CGPoint(x: 50, y: 100), in: size, previousDirection: .top, hysteresis: 0.05)
+        XCTAssertEqual(deepLeftDir, .left)
+    }
 }

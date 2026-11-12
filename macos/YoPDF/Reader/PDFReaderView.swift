@@ -34,12 +34,27 @@ private struct ReaderPDFDropDestination: ViewModifier {
 
 private struct SinglePaneTabDraggableModifier: ViewModifier {
     let tab: WorkspaceTabSession
+    let onDragStarted: (() -> Void)?
 
     func body(content: Content) -> some View {
         if tab.layoutTree.paneCount == 1 {
-            content.onDrag {
-                PaneDragPayload(kind: .tab, sourceTabID: tab.id, sourcePaneID: tab.activePaneID).asItemProvider()
-            }
+            content.onDrag({
+                onDragStarted?()
+                return PaneDragPayload(kind: .tab, sourceTabID: tab.id, sourcePaneID: tab.activePaneID).asItemProvider()
+            }, preview: {
+                HStack(spacing: 6) {
+                    Image(systemName: "doc.text.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.accentColor)
+                    Text(tab.title)
+                        .font(.system(size: 12, weight: .medium))
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(.ultraThickMaterial, in: RoundedRectangle(cornerRadius: 6))
+                .shadow(color: .black.opacity(0.15), radius: 4, y: 2)
+            })
         } else {
             content
         }
@@ -59,6 +74,7 @@ private struct WorkspaceTabFramePreferenceKey: PreferenceKey {
 private struct WorkspaceTabStrip: View {
     @ObservedObject var workspace: WorkspaceWindowModel
     let closeTab: (UUID) -> Void
+    var onTabDragStarted: ((WorkspaceTabSession) -> Void)? = nil
 
     /// Layout frames of the tabs, keyed by tab ID. Reported by each tab and
     /// read only once, when a drag starts.
@@ -212,7 +228,7 @@ private struct WorkspaceTabStrip: View {
         .animation(isDragging ? nil : Self.reorderAnimation, value: dropIndex)
         .shadow(color: .black.opacity(isDragging ? 0.16 : 0), radius: 6, y: 2)
         .zIndex(isDragging ? 1 : 0)
-        .modifier(SinglePaneTabDraggableModifier(tab: tab))
+        .modifier(SinglePaneTabDraggableModifier(tab: tab, onDragStarted: { onTabDragStarted?(tab) }))
     }
 
     /// Right-click counterpart of the keyboard commands. It moves the tab that
@@ -378,6 +394,8 @@ struct PDFReaderView: View {
     @State private var currentContentSize: CGSize?
     /// Per-pane hover state during in-flight Drag & Drop over four-direction drop zones.
     @State private var paneHoverStates: [PaneID: PaneDropHoverState] = [:]
+    /// Tracks the in-flight pane or tab drag payload to enable visual source dimming and accurate intra-tab validation.
+    @State private var activeDraggedPayload: PaneDragPayload? = nil
 
     private var anchorResolver: PageAnchorResolver {
         anchorResolver(for: tab.activePaneID)
@@ -910,7 +928,13 @@ struct PDFReaderView: View {
 
     private var readerLayout: some View {
         VStack(spacing: 0) {
-            WorkspaceTabStrip(workspace: workspace, closeTab: requestCloseTab)
+            WorkspaceTabStrip(
+                workspace: workspace,
+                closeTab: requestCloseTab,
+                onTabDragStarted: { draggedTab in
+                    activeDraggedPayload = PaneDragPayload(kind: .tab, sourceTabID: draggedTab.id, sourcePaneID: draggedTab.activePaneID)
+                }
+            )
             Divider()
             toolbar
             Divider()
@@ -1490,6 +1514,8 @@ struct PDFReaderView: View {
             let paneDocModel = tab.model(for: paneSession)
             let resolver = anchorResolver(for: paneID)
 
+            let isDraggingThisPane = (activeDraggedPayload?.sourcePaneID == paneID)
+
             VStack(spacing: 0) {
                 PaneHeaderView(
                     paneID: paneID,
@@ -1499,7 +1525,10 @@ struct PDFReaderView: View {
                     canClose: tab.layoutTree.paneCount > 1,
                     onActivate: { activatePane(paneID) },
                     onClose: { requestClosePane(paneID) },
-                    dragPayload: PaneDragPayload(kind: .pane, sourceTabID: tab.id, sourcePaneID: paneID)
+                    dragPayload: PaneDragPayload(kind: .pane, sourceTabID: tab.id, sourcePaneID: paneID),
+                    onDragStarted: {
+                        activeDraggedPayload = PaneDragPayload(kind: .pane, sourceTabID: tab.id, sourcePaneID: paneID)
+                    }
                 )
 
                 GeometryReader { paneGeometry in
@@ -1567,6 +1596,7 @@ struct PDFReaderView: View {
                                 activatePane(paneID)
                             }
                         )
+                        .transaction { $0.animation = nil }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .id(resourceSession.loadGeneration)
                         .popover(
@@ -1609,6 +1639,8 @@ struct PDFReaderView: View {
                             .allowsHitTesting(false)
                         }
                     }
+                    .opacity(isDraggingThisPane ? 0.45 : 1.0)
+                    .animation(.easeInOut(duration: 0.15), value: isDraggingThisPane)
                     .contentShape(Rectangle())
                     .onTapGesture {
                         activatePane(paneID)
@@ -1616,6 +1648,7 @@ struct PDFReaderView: View {
                     .modifier(PaneDropTargetModifier(
                         targetPaneID: paneID,
                         containerSize: paneGeometry.size,
+                        currentHoverDirection: paneHoverStates[paneID]?.direction,
                         validateDrop: { direction in
                             validateDrop(on: paneID, direction: direction, in: paneGeometry.size)
                         },
@@ -1636,31 +1669,56 @@ struct PDFReaderView: View {
     // MARK: - Drag & Drop Handling
 
     private func validateDrop(on targetPaneID: PaneID, direction: LayoutInsertionDirection, in size: CGSize) -> (isValid: Bool, feedback: String) {
-        if tab.layoutTree.paneCount >= LayoutPolicy.default.maxPanes {
-            return (false, "Maximum \(LayoutPolicy.default.maxPanes) panes limit reached")
+        let isIntraTabMove: Bool
+        if let payload = activeDraggedPayload,
+           payload.sourceTabID == tab.id,
+           let sourceID = payload.sourcePaneID {
+            if sourceID == targetPaneID {
+                return (false, "Cannot drop a pane onto itself")
+            }
+            isIntraTabMove = true
+        } else {
+            isIntraTabMove = false
         }
-        switch direction.axis {
-        case .horizontal:
-            let requiredWidth = LayoutPolicy.default.minimumLeafWidth * 2 + LayoutPolicy.default.dividerThickness
-            if size.width < requiredWidth {
-                return (false, "Width too narrow to split")
+
+        if isIntraTabMove {
+            guard let sourceID = activeDraggedPayload?.sourcePaneID else {
+                return (false, "Invalid drag source")
             }
-            if size.height < LayoutPolicy.default.minimumLeafHeight {
-                return (false, "Height too short to split")
+            guard tab.layoutTree.canMove(sourceID, adjacentTo: targetPaneID, direction: direction, policy: .default, availableSize: size) else {
+                return (false, "Pane is too small to split \(direction.rawValue)")
             }
-        case .vertical:
-            let requiredHeight = LayoutPolicy.default.minimumLeafHeight * 2 + LayoutPolicy.default.dividerThickness
-            if size.height < requiredHeight {
-                return (false, "Height too short to split")
+            return (true, "")
+        } else {
+            if tab.layoutTree.paneCount >= LayoutPolicy.default.maxPanes {
+                return (false, "Maximum \(LayoutPolicy.default.maxPanes) panes limit reached")
             }
-            if size.width < LayoutPolicy.default.minimumLeafWidth {
-                return (false, "Width too narrow to split")
+            switch direction.axis {
+            case .horizontal:
+                let requiredWidth = LayoutPolicy.default.minimumLeafWidth * 2 + LayoutPolicy.default.dividerThickness
+                if size.width < requiredWidth {
+                    return (false, "Width too narrow to split")
+                }
+                if size.height < LayoutPolicy.default.minimumLeafHeight {
+                    return (false, "Height too short to split")
+                }
+            case .vertical:
+                let requiredHeight = LayoutPolicy.default.minimumLeafHeight * 2 + LayoutPolicy.default.dividerThickness
+                if size.height < requiredHeight {
+                    return (false, "Height too short to split")
+                }
+                if size.width < LayoutPolicy.default.minimumLeafWidth {
+                    return (false, "Width too narrow to split")
+                }
             }
+            return (true, "")
         }
-        return (true, "")
     }
 
     private func handlePaneDrop(payload: DropPayload, on targetPaneID: PaneID, direction: LayoutInsertionDirection, in size: CGSize) -> Bool {
+        activeDraggedPayload = nil
+        paneHoverStates.removeAll()
+
         switch payload {
         case let .pane(dragPayload):
             let sourceTabID = dragPayload.sourceTabID
@@ -1679,29 +1737,33 @@ struct PDFReaderView: View {
             }
 
             do {
-                try workspace.movePane(
-                    sourceTabID: sourceTabID,
-                    paneID: sourcePaneID,
-                    toDestinationTabID: tab.id,
-                    adjacentTo: targetPaneID,
-                    direction: direction,
-                    policy: .default,
-                    availableSize: currentContentSize
-                )
+                try withAnimation(.easeOut(duration: 0.16)) {
+                    _ = try workspace.movePane(
+                        sourceTabID: sourceTabID,
+                        paneID: sourcePaneID,
+                        toDestinationTabID: tab.id,
+                        adjacentTo: targetPaneID,
+                        direction: direction,
+                        policy: .default,
+                        availableSize: currentContentSize
+                    )
+                }
                 return true
             } catch {
                 return false
             }
 
         case let .fileURL(url):
-            let result = workspace.openPDFInSplit(
-                url: url,
-                in: tab.id,
-                adjacentTo: targetPaneID,
-                direction: direction,
-                policy: .default,
-                availableSize: currentContentSize
-            )
+            let result = withAnimation(.easeOut(duration: 0.16)) {
+                workspace.openPDFInSplit(
+                    url: url,
+                    in: tab.id,
+                    adjacentTo: targetPaneID,
+                    direction: direction,
+                    policy: .default,
+                    availableSize: currentContentSize
+                )
+            }
             switch result {
             case .success:
                 return true

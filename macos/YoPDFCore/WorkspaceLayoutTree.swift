@@ -84,14 +84,33 @@ public enum LayoutInsertionDirection: String, Codable, Sendable {
         }
     }
 
-    /// Determines the intended insertion direction based on the cursor location within a container size.
-    public static func direction(for point: CGPoint, in size: CGSize) -> LayoutInsertionDirection {
+    /// Determines the intended insertion direction based on cursor location within a container size,
+    /// with optional directional hysteresis to prevent flickering along quadrant boundaries.
+    public static func direction(
+        for point: CGPoint,
+        in size: CGSize,
+        previousDirection: LayoutInsertionDirection? = nil,
+        hysteresis: CGFloat = 0.05
+    ) -> LayoutInsertionDirection {
         let width = max(1, size.width)
         let height = max(1, size.height)
-        let nLeft = point.x / width
-        let nRight = (width - point.x) / width
-        let nTop = point.y / height
-        let nBottom = (height - point.y) / height
+        var nLeft = point.x / width
+        var nRight = (width - point.x) / width
+        var nTop = point.y / height
+        var nBottom = (height - point.y) / height
+
+        if let prev = previousDirection {
+            switch prev {
+            case .left:
+                nLeft -= hysteresis
+            case .right:
+                nRight -= hysteresis
+            case .top:
+                nTop -= hysteresis
+            case .bottom:
+                nBottom -= hysteresis
+            }
+        }
 
         let minVal = min(nLeft, nRight, nTop, nBottom)
         if minVal == nLeft {
