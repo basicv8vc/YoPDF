@@ -459,6 +459,21 @@ public struct PaneDropDelegate: DropDelegate {
         self.onPerformDrop = onPerformDrop
     }
 
+    public static func dropOperation(
+        isPaneOrTab: Bool,
+        isExternalFile: Bool,
+        isValidDestination: Bool
+    ) -> DropOperation {
+        guard isValidDestination else { return .forbidden }
+        if isPaneOrTab {
+            return .move
+        } else if isExternalFile {
+            return .copy
+        } else {
+            return .forbidden
+        }
+    }
+
     public func dropEntered(info: DropInfo) {
         updateHover(info: info)
     }
@@ -467,7 +482,15 @@ public struct PaneDropDelegate: DropDelegate {
         let direction = LayoutInsertionDirection.direction(for: info.location, in: containerSize)
         let check = validateDrop(direction)
         onHoverChanged(PaneDropHoverState(direction: direction, isValid: check.isValid, feedbackMessage: check.feedback))
-        return DropProposal(operation: check.isValid ? .move : .forbidden)
+
+        let isPaneOrTab = info.hasItemsConforming(to: [UTType.yoPDFPaneDrag])
+        let isExternalFile = info.hasItemsConforming(to: [UTType.fileURL, UTType.pdf])
+        let op = Self.dropOperation(
+            isPaneOrTab: isPaneOrTab,
+            isExternalFile: isExternalFile,
+            isValidDestination: check.isValid
+        )
+        return DropProposal(operation: op)
     }
 
     public func dropExited(info: DropInfo) {

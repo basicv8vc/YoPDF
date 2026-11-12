@@ -557,7 +557,7 @@ final class WorkspaceWindowModel: ObservableObject {
     }
 
     /// Opens a local PDF file from Finder into a split adjacent to a target pane.
-    /// Validates file and opens before committing any layout mutation.
+    /// Validates destination layout and file before committing layout mutations.
     @discardableResult
     func openPDFInSplit(
         url: URL,
@@ -575,14 +575,25 @@ final class WorkspaceWindowModel: ObservableObject {
         guard let destinationTab = sessions[targetTabID] else {
             return .failure(LayoutMutationError.targetPaneNotFound(targetPaneID))
         }
-        guard destinationTab.canSplit(paneID: targetPaneID, direction: direction, policy: policy, availableSize: availableSize) else {
-            return .failure(LayoutMutationError.insufficientSpace(required: policy.minimumLeafWidth * 2, available: 0))
-        }
-        guard destinationTab.layoutTree.paneCount < policy.maxPanes else {
-            return .failure(LayoutMutationError.maximumPaneLimitReached(limit: policy.maxPanes))
+
+        // 1. Validate destination layout first, before opening any file or creating a resource
+        let candidatePaneID = PaneID()
+        let candidateTree: WorkspaceLayoutTree
+        do {
+            candidateTree = try destinationTab.layoutTree.inserting(
+                candidatePaneID,
+                adjacentTo: targetPaneID,
+                direction: direction,
+                ratio: ratio,
+                policy: policy,
+                availableSize: availableSize
+            )
+        } catch {
+            return .failure(error)
         }
 
-        // Reuse existing resourceSession if file is already open, or open fresh resourceSession
+        // 2. Reuse existing resourceSession if file is already open, or open a fresh resourceSession
+        var didCreateNewResource = false
         let resourceSessionToUse: PDFResourceSession
         if let existing = findResourceSession(for: url) {
             resourceSessionToUse = existing
@@ -594,32 +605,20 @@ final class WorkspaceWindowModel: ObservableObject {
                 return .failure(error)
             }
             resourceSessionToUse = newResource
+            didCreateNewResource = true
         }
 
-        let newPaneID = PaneID()
-        do {
-            let newTree = try destinationTab.layoutTree.inserting(
-                newPaneID,
-                adjacentTo: targetPaneID,
-                direction: direction,
-                ratio: ratio,
-                policy: policy,
-                availableSize: availableSize
-            )
+        // 3. Commit layout mutation using the pre-validated tree
+        let newPaneModel = PDFPaneModel(id: candidatePaneID, resourceSession: resourceSessionToUse)
+        let newSession = PDFPaneSession(
+            paneID: candidatePaneID,
+            paneModel: newPaneModel,
+            resourceSession: resourceSessionToUse
+        )
 
-            let newPaneModel = PDFPaneModel(id: newPaneID, resourceSession: resourceSessionToUse)
-            let newSession = PDFPaneSession(
-                paneID: newPaneID,
-                paneModel: newPaneModel,
-                resourceSession: resourceSessionToUse
-            )
-
-            destinationTab.attachTransferredPaneSession(newSession, newLayoutTree: newTree)
-            objectWillChange.send()
-            return .success(newPaneID)
-        } catch {
-            return .failure(error)
-        }
+        destinationTab.attachTransferredPaneSession(newSession, newLayoutTree: candidateTree)
+        objectWillChange.send()
+        return .success(candidatePaneID)
     }
 
     /// Updates layout tree for the tab with observable publication.
@@ -759,7 +758,9 @@ final class WorkspaceWindowModel: ObservableObject {
             paneSession.paneModel.close()
         }
         for resourceSession in session.uniqueResourceSessions {
-            resourceSession.close()
+            if resourceSession.activeLeaseCount == 0 {
+                resourceSession.close()
+            }
         }
         objectWillChange.send()
         return true

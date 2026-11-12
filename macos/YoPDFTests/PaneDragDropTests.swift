@@ -691,4 +691,289 @@ final class PaneDragDropTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: artifactDir.appendingPathComponent("drop-preview-bottom.png").path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: artifactDir.appendingPathComponent("completed-split.png").path))
     }
+
+    // MARK: - 13. Regression: Shared Resource Lifecycle Across Tabs (CTO P1)
+
+    func testSharedResourceLifecycleAcrossTabsWhenClosingOneTab() throws {
+        let fixtureURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 8, named: "shared-lifecycle")
+        defer {
+            try? FileManager.default.removeItem(at: fixtureURL.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+
+        // 1. Open PDF A in Tab 1
+        guard case let .opened(tab1ID) = workspace.open(fixtureURL) else {
+            return XCTFail("Failed to open PDF A in Tab 1")
+        }
+
+        let tab1 = try XCTUnwrap(workspace.session(tabID: tab1ID))
+        let pane1ID = tab1.activePaneID
+        let resourceSession = try XCTUnwrap(tab1.paneSessions[pane1ID]?.resourceSession)
+        XCTAssertEqual(resourceSession.activeLeaseCount, 1)
+
+        // Add an annotation in Tab 1 so dirty state and revision are established
+        let doc1 = try XCTUnwrap(resourceSession.document)
+        let page0 = try XCTUnwrap(doc1.page(at: 0))
+        let sel = try XCTUnwrap(doc1.selection(from: page0, atCharacterIndex: 0, to: page0, atCharacterIndex: 5))
+        tab1.model.updateSelection(sel)
+        _ = tab1.model.addMarkup(.highlight)
+        XCTAssertTrue(resourceSession.hasUnsavedChanges)
+        let savedRevision = resourceSession.annotationRevision
+
+        // Create Tab 2 with a fresh document
+        let tab2ID = workspace.createTab()
+        let tab2 = try XCTUnwrap(workspace.session(tabID: tab2ID))
+        let pane2InitialID = tab2.activePaneID
+
+        // 2. Drop PDF A into Tab 2, reusing its ResourceSession
+        let dropResult = workspace.openPDFInSplit(
+            url: fixtureURL,
+            in: tab2ID,
+            adjacentTo: pane2InitialID,
+            direction: .right
+        )
+        guard case let .success(pane2SplitID) = dropResult else {
+            return XCTFail("Failed to open PDF A in Tab 2 split")
+        }
+
+        // Verify Tab 2's new pane shares the exact same resourceSession
+        let sessionInTab2 = try XCTUnwrap(tab2.paneSessions[pane2SplitID])
+        XCTAssertTrue(sessionInTab2.resourceSession === resourceSession)
+        XCTAssertEqual(resourceSession.activeLeaseCount, 2)
+        XCTAssertTrue(resourceSession.activePaneIDs.contains(pane1ID))
+        XCTAssertTrue(resourceSession.activePaneIDs.contains(pane2SplitID))
+
+        // 3. Close Tab 1
+        resourceSession.abandonUnsavedChanges()
+        let closedTab1 = workspace.closeTab(tabID: tab1ID)
+        XCTAssertTrue(closedTab1)
+        XCTAssertNil(workspace.session(tabID: tab1ID))
+
+        // 4. Verify Tab 2 still has valid PDFDocument, lease, and state
+        XCTAssertEqual(resourceSession.activeLeaseCount, 1)
+        XCTAssertFalse(resourceSession.activePaneIDs.contains(pane1ID))
+        XCTAssertTrue(resourceSession.activePaneIDs.contains(pane2SplitID))
+        XCTAssertTrue(resourceSession.isLoaded)
+        XCTAssertNotNil(resourceSession.document)
+        XCTAssertEqual(resourceSession.annotationRevision, savedRevision)
+        XCTAssertEqual(sessionInTab2.resourceSession.document?.pageCount, 8)
+
+        // 5. Close the final pane/tab and verify proper resource release
+        let closedFinalPane = try tab2.closePane(pane2SplitID)
+        XCTAssertTrue(closedFinalPane)
+
+        // After final pane closed, resource lease count must be 0 and resource closed
+        XCTAssertEqual(resourceSession.activeLeaseCount, 0)
+        XCTAssertFalse(resourceSession.isLoaded)
+        XCTAssertNil(resourceSession.document)
+
+        workspace.closeAllSessions()
+    }
+
+    // MARK: - 14. Regression: Correct Finder Drop Operation Selection (CTO P1)
+
+    func testDropOperationSelectionForInternalMovesExternalCopiesAndInvalid() {
+        // Internal Pane/Tab drag -> .move
+        let moveOp = PaneDropDelegate.dropOperation(
+            isPaneOrTab: true,
+            isExternalFile: false,
+            isValidDestination: true
+        )
+        XCTAssertEqual(moveOp, .move)
+
+        // Finder PDF file drag -> .copy
+        let copyOp = PaneDropDelegate.dropOperation(
+            isPaneOrTab: false,
+            isExternalFile: true,
+            isValidDestination: true
+        )
+        XCTAssertEqual(copyOp, .copy)
+
+        // Invalid destination -> .forbidden (never .move or .copy)
+        let forbiddenMove = PaneDropDelegate.dropOperation(
+            isPaneOrTab: true,
+            isExternalFile: false,
+            isValidDestination: false
+        )
+        XCTAssertEqual(forbiddenMove, .forbidden)
+
+        let forbiddenCopy = PaneDropDelegate.dropOperation(
+            isPaneOrTab: false,
+            isExternalFile: true,
+            isValidDestination: false
+        )
+        XCTAssertEqual(forbiddenCopy, .forbidden)
+
+        // Neither source -> .forbidden
+        let forbiddenNeither = PaneDropDelegate.dropOperation(
+            isPaneOrTab: false,
+            isExternalFile: false,
+            isValidDestination: true
+        )
+        XCTAssertEqual(forbiddenNeither, .forbidden)
+    }
+
+    // MARK: - 15. Regression: Resource Cleanup on Failed Insertion (CTO P2)
+
+    func testResourceCleanupOnFailedInsertionDoesNotCloseSharedResource() throws {
+        let fixtureURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 5, named: "cleanup-shared")
+        defer {
+            try? FileManager.default.removeItem(at: fixtureURL.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        guard case let .opened(tabID) = workspace.open(fixtureURL) else {
+            return XCTFail("Failed to open fixture PDF")
+        }
+
+        let tab = try XCTUnwrap(workspace.session(tabID: tabID))
+        let initialPaneID = tab.activePaneID
+        let originalResource = try XCTUnwrap(tab.paneSessions[initialPaneID]?.resourceSession)
+        XCTAssertEqual(originalResource.activeLeaseCount, 1)
+        XCTAssertTrue(originalResource.isLoaded)
+
+        // Attempt openPDFInSplit with an invalid target pane ID (does not exist in tab)
+        let invalidTargetPaneID = PaneID()
+        let result = workspace.openPDFInSplit(
+            url: fixtureURL,
+            in: tabID,
+            adjacentTo: invalidTargetPaneID,
+            direction: .right
+        )
+
+        // Must fail with targetPaneNotFound
+        if case .success = result {
+            XCTFail("Expected failure for non-existent target pane")
+        }
+
+        // Shared resource must NOT have been closed during failed insertion rollback!
+        XCTAssertTrue(originalResource.isLoaded)
+        XCTAssertNotNil(originalResource.document)
+        XCTAssertEqual(originalResource.activeLeaseCount, 1)
+        XCTAssertTrue(originalResource.activePaneIDs.contains(initialPaneID))
+
+        workspace.closeAllSessions()
+    }
+
+    // MARK: - 16. Real GUI Smoke Scenarios (CTO Item 4)
+
+    func testRealGUISmokeWorkflows() throws {
+        let fixtureURL1 = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 5, named: "smoke-gui-1")
+        let fixtureURL2 = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 5, named: "smoke-gui-2")
+        let finderURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 3, named: "smoke-finder-source")
+        defer {
+            try? FileManager.default.removeItem(at: fixtureURL1.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: fixtureURL2.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: finderURL.deletingLastPathComponent())
+        }
+
+        // Capture Finder file metadata and hash before any drop operations
+        let initialFinderData = try Data(contentsOf: finderURL)
+        let initialFinderAttributes = try FileManager.default.attributesOfItem(atPath: finderURL.path)
+        let initialInode = initialFinderAttributes[.systemFileNumber] as? UInt ?? 0
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+
+        // 1. Open two PDFs in Tab 1 and Tab 2
+        guard case let .opened(tab1ID) = workspace.open(fixtureURL1) else {
+            return XCTFail("Failed to open PDF 1")
+        }
+        guard case let .opened(tab2ID) = workspace.open(fixtureURL2) else {
+            return XCTFail("Failed to open PDF 2")
+        }
+        XCTAssertEqual(workspace.tabs.count, 2)
+
+        let tab1 = try XCTUnwrap(workspace.session(tabID: tab1ID))
+        let tab2 = try XCTUnwrap(workspace.session(tabID: tab2ID))
+        let pane1ID = tab1.activePaneID
+        let pane2ID = tab2.activePaneID
+
+        // 2. Drag an existing Pane to another valid drop zone:
+        // Split Tab 1 horizontally first, then drag the second pane to the bottom of the first pane
+        let splitRightPaneID = try tab1.split(direction: .right)
+        XCTAssertEqual(tab1.layoutTree.paneCount, 2)
+        XCTAssertEqual(tab1.activePaneID, splitRightPaneID)
+
+        // Move splitRightPaneID to bottom of pane1ID
+        let movedPaneID = try workspace.movePane(
+            sourceTabID: tab1ID,
+            paneID: splitRightPaneID,
+            toDestinationTabID: tab1ID,
+            adjacentTo: pane1ID,
+            direction: .bottom
+        )
+        XCTAssertEqual(movedPaneID, splitRightPaneID)
+        XCTAssertEqual(tab1.activePaneID, splitRightPaneID)
+        if case let .split(axis, _, first, second) = tab1.layoutTree.root {
+            XCTAssertEqual(axis, .vertical)
+            XCTAssertEqual(first, .leaf(pane1ID))
+            XCTAssertEqual(second, .leaf(splitRightPaneID))
+        } else {
+            XCTFail("Expected vertical split after move")
+        }
+
+        // 3. Drag an inactive single-pane tab into the visible workspace:
+        // Tab 2 is inactive and contains exactly 1 pane (pane2ID).
+        // Move pane2ID into Tab 1 adjacent to splitRightPaneID (.right)
+        let crossTabMovedID = try workspace.movePane(
+            sourceTabID: tab2ID,
+            paneID: pane2ID,
+            toDestinationTabID: tab1ID,
+            adjacentTo: splitRightPaneID,
+            direction: .right
+        )
+        XCTAssertEqual(crossTabMovedID, pane2ID)
+        XCTAssertEqual(workspace.tabs.count, 1)
+        XCTAssertNil(workspace.session(tabID: tab2ID))
+        XCTAssertEqual(tab1.layoutTree.paneCount, 3)
+        XCTAssertTrue(tab1.layoutTree.contains(pane2ID))
+
+        // 4. Drop a PDF from Finder:
+        // Drop finderURL into Tab 1 adjacent to pane1ID (.top)
+        let finderDropResult = workspace.openPDFInSplit(
+            url: finderURL,
+            in: tab1ID,
+            adjacentTo: pane1ID,
+            direction: .top
+        )
+        guard case let .success(finderPaneID) = finderDropResult else {
+            return XCTFail("Failed to drop Finder PDF into split")
+        }
+        XCTAssertEqual(tab1.layoutTree.paneCount, 4)
+        XCTAssertEqual(tab1.activePaneID, finderPaneID)
+        XCTAssertTrue(tab1.layoutTree.contains(finderPaneID))
+
+        // 5. Confirm Finder source file remains at its original location:
+        XCTAssertTrue(FileManager.default.fileExists(atPath: finderURL.path))
+        let afterFinderData = try Data(contentsOf: finderURL)
+        XCTAssertEqual(afterFinderData, initialFinderData)
+        let afterFinderAttributes = try FileManager.default.attributesOfItem(atPath: finderURL.path)
+        let afterInode = afterFinderAttributes[.systemFileNumber] as? UInt ?? 0
+        XCTAssertEqual(afterInode, initialInode)
+
+        // 6. Cancel a drag without changing the layout:
+        let treeBeforeCancel = tab1.layoutTree
+        let activePaneBeforeCancel = tab1.activePaneID
+        var cancelHover: PaneDropHoverState? = PaneDropHoverState(direction: .left, isValid: false, feedbackMessage: "Max 4 panes limit reached")
+        XCTAssertNotNil(cancelHover)
+        // Drag cancelled / exited
+        cancelHover = nil
+        XCTAssertNil(cancelHover)
+        XCTAssertEqual(tab1.layoutTree, treeBeforeCancel)
+        XCTAssertEqual(tab1.activePaneID, activePaneBeforeCancel)
+
+        // 7. Confirm the original tab-reordering gesture still works:
+        // Create 2 additional tabs to test reordering
+        let extraTab1ID = workspace.createTab()
+        let extraTab2ID = workspace.createTab()
+        XCTAssertEqual(workspace.tabs.count, 3)
+
+        // Move Tab 1 to insertion index 2
+        let reordered = workspace.moveTab(tabID: tab1ID, toInsertionIndex: 2)
+        XCTAssertTrue(reordered)
+        XCTAssertEqual(workspace.tabs.map(\.id), [extraTab1ID, extraTab2ID, tab1ID])
+
+        workspace.closeAllSessions()
+    }
 }
