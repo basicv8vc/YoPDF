@@ -46,6 +46,12 @@ public final class PDFPaneModel: ObservableObject, Identifiable {
     public let searchSession: PDFSearchSession
     @Published public var isSearchPresented: Bool = false
 
+    /// Whether this pane currently holds an active lease on the resource session.
+    ///
+    /// Marked false on `close()` to prevent background document replacement events
+    /// from resurrecting leases on dormant panes. Explicitly restored via `ensureLease()`.
+    public private(set) var isLeaseActive: Bool = true
+
     private var cancellables = Set<AnyCancellable>()
 
     public init(
@@ -61,6 +67,7 @@ public final class PDFPaneModel: ObservableObject, Identifiable {
             paneID: id.rawValue
         )
         self.noteComposerStore = NoteComposerStore()
+        self.isLeaseActive = true
 
         // Lease registration
         resourceSession.acquireLease(for: id)
@@ -81,6 +88,7 @@ public final class PDFPaneModel: ObservableObject, Identifiable {
 
     deinit {
         MainActor.assumeIsolated {
+            guard isLeaseActive else { return }
             resourceSession.releaseLease(for: id)
         }
     }
@@ -109,6 +117,7 @@ public final class PDFPaneModel: ObservableObject, Identifiable {
     }
 
     public func ensureLease() {
+        isLeaseActive = true
         resourceSession.acquireLease(for: id)
     }
 
@@ -125,6 +134,7 @@ public final class PDFPaneModel: ObservableObject, Identifiable {
     }
 
     private func handleResourceDocumentEvent(_ event: ResourceDocumentEvent) {
+        guard isLeaseActive else { return }
         switch event {
         case let .opened(newDocument):
             synchronizeWithNewDocument(newDocument, isSwap: false)
@@ -186,6 +196,7 @@ public final class PDFPaneModel: ObservableObject, Identifiable {
     }
 
     public func close() {
+        isLeaseActive = false
         currentPageIndex = 0
         zoomScale = 1
         effectiveScale = 1

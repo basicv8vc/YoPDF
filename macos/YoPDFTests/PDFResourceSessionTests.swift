@@ -675,8 +675,8 @@ final class PDFResourceSessionTests: XCTestCase {
     // MARK: - Final Review Tests: FIFO Ordering, Lease Balance, Selection Consistency
 
     func testSearchCoordinatorPreventsQueueJumpingDuringAsyncDispatch() async throws {
-        let doc = try makeDocument(pageCount: 10) { page in
-            page == 9 ? "beta gamma" : String(repeating: "word ", count: 200)
+        let doc = try makeDocument(pageCount: 3) { page in
+            "Page \(page): alpha beta gamma"
         }
         let coordinator = PDFSearchCoordinator(document: doc)
         let paneA = UUID()
@@ -685,15 +685,25 @@ final class PDFResourceSessionTests: XCTestCase {
 
         var executionOrder: [String] = []
 
-        // Start search A on a multi-page document
+        // Start search A (active)
         coordinator.requestSearch(
             paneID: paneA,
-            query: "word",
-            onComplete: { _ in executionOrder.append("alpha") }
+            query: "alpha",
+            onComplete: { _ in
+                executionOrder.append("alpha")
+                // When A completes naturally, B is already queued in the coordinator.
+                // Submit C synchronously from A's completion callback.
+                // Because B is queued, C must be placed behind B rather than starting immediately.
+                coordinator.requestSearch(
+                    paneID: paneC,
+                    query: "gamma",
+                    onComplete: { _ in executionOrder.append("gamma") }
+                )
+            }
         )
         XCTAssertTrue(coordinator.isFinding)
 
-        // Enqueue search B
+        // Enqueue search B while A is active
         coordinator.requestSearch(
             paneID: paneB,
             query: "beta",
@@ -701,23 +711,62 @@ final class PDFResourceSessionTests: XCTestCase {
         )
         XCTAssertEqual(coordinator.queuedCount, 1)
 
-        // Cancel A while active so it drains cancellation
-        coordinator.cancelSearch(for: paneA)
-
-        // Immediately submit search C from pane C
-        coordinator.requestSearch(
-            paneID: paneC,
-            query: "gamma",
-            onComplete: { _ in executionOrder.append("gamma") }
-        )
-
-        // Wait for all searches to finish
+        // Wait until all three searches complete naturally
         let deadline = Date().addingTimeInterval(5)
-        while coordinator.isFinding && Date() < deadline {
+        while executionOrder.count < 3 && Date() < deadline {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
 
-        XCTAssertEqual(executionOrder, ["beta", "gamma"], "Search B must execute before Search C. C must not jump the queue.")
+        XCTAssertEqual(
+            executionOrder,
+            ["alpha", "beta", "gamma"],
+            "Search B must execute before Search C. Submitting C from A's completion must not overtake queued B."
+        )
+    }
+
+    func testClosedPaneDoesNotReacquireLeaseOnDocumentReplacement() throws {
+        let url1 = try makeTemporaryPDF(pageCount: 2, named: "lease-replace-1") { _ in "Doc 1" }
+        let url2 = try makeTemporaryPDF(pageCount: 2, named: "lease-replace-2") { _ in "Doc 2" }
+        let invalidURL = URL(fileURLWithPath: "/nonexistent/invalid.pdf")
+
+        let resource = PDFResourceSession(access: SecurityScopeSpy())
+        XCTAssertTrue(resource.open(url: url1))
+
+        let paneA = PDFPaneModel(id: PaneID(), resourceSession: resource)
+        let paneB = PDFPaneModel(id: PaneID(), resourceSession: resource)
+        let modelA = PDFDocumentModel(resourceSession: resource, paneModel: paneA)
+
+        // 1. Pane A and B share a ResourceSession
+        XCTAssertEqual(resource.activeLeaseCount, 2)
+        XCTAssertTrue(paneA.isLeaseActive)
+        XCTAssertTrue(paneB.isLeaseActive)
+
+        // 2. Close A but retain its PaneModel instance
+        paneA.close()
+        XCTAssertFalse(paneA.isLeaseActive)
+        XCTAssertEqual(resource.activeLeaseCount, 1)
+
+        // 3. B replaces the document
+        XCTAssertTrue(resource.open(url: url2))
+
+        // 4. Verify A does not reacquire its lease
+        XCTAssertFalse(paneA.isLeaseActive, "Closed pane must not reacquire lease on document replacement.")
+        XCTAssertEqual(resource.activeLeaseCount, 1, "Only Pane B's lease should remain active.")
+
+        // 5. Close B and verify the resource is fully released
+        paneB.close()
+        XCTAssertEqual(resource.activeLeaseCount, 0)
+        XCTAssertNil(resource.documentSession, "Resource must be fully released when all active panes are closed.")
+
+        // 6. Verify explicitly reopening A restores its lease
+        XCTAssertTrue(modelA.open(url: url1))
+        XCTAssertTrue(paneA.isLeaseActive, "Explicit open must restore lease on reopened pane.")
+        XCTAssertEqual(resource.activeLeaseCount, 1)
+        XCTAssertNotNil(resource.documentSession)
+
+        // 7. Verify a failed reopen does not create an extra lease
+        XCTAssertFalse(modelA.open(url: invalidURL))
+        XCTAssertEqual(resource.activeLeaseCount, 1, "Failed reopen must not alter lease count.")
     }
 
     func testCloseReopenCloseBalancesSecurityScope() throws {
@@ -809,7 +858,7 @@ final class PDFResourceSessionTests: XCTestCase {
         XCTAssertNil(paneA.selectedMarkup, "Pane A's selected markup must be automatically invalidated when removed by Pane B.")
     }
 
-    func testPDFDocumentModelConstructorEnforcesSameResourceSessionPrecondition() {
+    func testPDFDocumentModelConstructorWithMatchingResourceSessionSucceeds() {
         let resource = PDFResourceSession(access: SecurityScopeSpy())
         let pane = PDFPaneModel(id: PaneID(), resourceSession: resource)
 
