@@ -987,15 +987,10 @@ struct PDFReaderView: View {
 
     private var toolbar: some View {
         HStack(spacing: 12) {
-            Button {
-                isImporterPresented = true
-            } label: {
-                Label("Open", systemImage: "folder")
-            }
-            .help("Open a PDF (⌘O)")
-
-            Divider().frame(height: 18)
-
+            // No "Open" button here: the empty workspace already offers
+            // "Open PDF…" in the middle of the window, and File › Open (⌘O)
+            // covers the loaded-document case. Repeating it in the toolbar
+            // only costs horizontal room for the reading controls.
             Button {
                 toggleSidebar()
             } label: {
