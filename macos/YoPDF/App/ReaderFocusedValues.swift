@@ -96,6 +96,18 @@ struct ReaderSidebarActionsFocusKey: FocusedValueKey {
     typealias Value = ReaderSidebarActions
 }
 
+struct SplitRightActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
+struct SplitDownActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
+struct ClosePaneActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
 extension FocusedValues {
     var documentModel: PDFDocumentModel? {
         get { self[DocumentModelFocusKey.self] }
@@ -185,5 +197,20 @@ extension FocusedValues {
     var readerSidebarActions: ReaderSidebarActions? {
         get { self[ReaderSidebarActionsFocusKey.self] }
         set { self[ReaderSidebarActionsFocusKey.self] = newValue }
+    }
+
+    var splitRight: (@MainActor () -> Void)? {
+        get { self[SplitRightActionKey.self] }
+        set { self[SplitRightActionKey.self] = newValue }
+    }
+
+    var splitDown: (@MainActor () -> Void)? {
+        get { self[SplitDownActionKey.self] }
+        set { self[SplitDownActionKey.self] = newValue }
+    }
+
+    var closePane: (@MainActor () -> Void)? {
+        get { self[ClosePaneActionKey.self] }
+        set { self[ClosePaneActionKey.self] = newValue }
     }
 }

@@ -31,6 +31,9 @@ struct PDFReaderCommands: Commands {
     @FocusedValue(\.underlineSelection) private var underlineSelection
     @FocusedValue(\.addNote) private var addNote
     @FocusedValue(\.readerSidebarActions) private var sidebarActions
+    @FocusedValue(\.splitRight) private var splitRight
+    @FocusedValue(\.splitDown) private var splitDown
+    @FocusedValue(\.closePane) private var closePane
 
     init(updateController: SparkleUpdateController, recentDocuments: RecentDocumentsStore) {
         self.updateController = updateController
@@ -286,6 +289,26 @@ struct PDFReaderCommands: Commands {
             }
             .keyboardShortcut("9", modifiers: .command)
             .disabled(model?.isLoaded != true)
+        }
+
+        CommandMenu("Layout") {
+            Button("Split Right") {
+                splitRight?()
+            }
+            .keyboardShortcut("\\", modifiers: .command)
+            .disabled(splitRight == nil)
+
+            Button("Split Down") {
+                splitDown?()
+            }
+            .keyboardShortcut("\\", modifiers: [.command, .shift])
+            .disabled(splitDown == nil)
+
+            Button("Close Pane") {
+                closePane?()
+            }
+            .keyboardShortcut("w", modifiers: [.command, .option])
+            .disabled(closePane == nil)
         }
 
         CommandGroup(after: .appInfo) {

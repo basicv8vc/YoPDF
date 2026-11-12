@@ -3,28 +3,257 @@ import Foundation
 import YoPDFCore
 
 @MainActor
-final class WorkspaceTabSession: Identifiable {
+final class WorkspaceTabSession: Identifiable, ObservableObject {
     let id: UUID
-    let paneID: UUID
-    let model: PDFDocumentModel
-    let composerStore: NoteComposerStore
-    let searchSession: PDFSearchSession
+    @Published var layoutTree: WorkspaceLayoutTree
+    @Published var activePaneID: PaneID
+    private(set) var paneSessions: [PaneID: PDFPaneSession]
     let navigationState: ReaderNavigationState
+
+    private var documentModels: [PaneID: PDFDocumentModel] = [:]
+    private var cancellables = Set<AnyCancellable>()
 
     init(
         identity: WorkspaceTabIdentity = WorkspaceTabIdentity(),
         model: PDFDocumentModel
     ) {
         id = identity.id
-        paneID = identity.paneID
-        self.model = model
-        composerStore = NoteComposerStore()
-        searchSession = PDFSearchSession()
+        let initialPaneID = model.paneModel.id
+        activePaneID = initialPaneID
+        layoutTree = WorkspaceLayoutTree(leaf: initialPaneID)
+
+        let initialSession = PDFPaneSession(
+            paneID: initialPaneID,
+            paneModel: model.paneModel,
+            resourceSession: model.resourceSession
+        )
+        paneSessions = [initialPaneID: initialSession]
+        documentModels[initialPaneID] = model
         navigationState = ReaderNavigationState()
+
+        setupObserving(for: initialSession)
+    }
+
+    init(
+        id: UUID = UUID(),
+        resourceSession: PDFResourceSession,
+        initialPaneID: PaneID = PaneID()
+    ) {
+        self.id = id
+        self.activePaneID = initialPaneID
+        self.layoutTree = WorkspaceLayoutTree(leaf: initialPaneID)
+        let initialSession = PDFPaneSession(
+            paneID: initialPaneID,
+            resourceSession: resourceSession
+        )
+        self.paneSessions = [initialPaneID: initialSession]
+        self.navigationState = ReaderNavigationState()
+
+        setupObserving(for: initialSession)
+    }
+
+    // MARK: - Active Pane Accessors
+
+    var activePaneSession: PDFPaneSession? {
+        paneSessions[activePaneID] ?? paneSessions.values.first
+    }
+
+    var paneID: UUID {
+        activePaneID.rawValue
+    }
+
+    var model: PDFDocumentModel {
+        if let session = activePaneSession {
+            return model(for: session)
+        }
+        fatalError("WorkspaceTabSession must have at least one pane session.")
+    }
+
+    func model(for session: PDFPaneSession) -> PDFDocumentModel {
+        if let existing = documentModels[session.id] {
+            return existing
+        }
+        let docModel = PDFDocumentModel(
+            resourceSession: session.resourceSession,
+            paneModel: session.paneModel
+        )
+        documentModels[session.id] = docModel
+        return docModel
+    }
+
+    func model(for paneID: PaneID) -> PDFDocumentModel? {
+        guard let session = paneSessions[paneID] else { return nil }
+        return model(for: session)
+    }
+
+    var composerStore: NoteComposerStore {
+        activePaneSession?.paneModel.noteComposerStore ?? NoteComposerStore()
+    }
+
+    var searchSession: PDFSearchSession {
+        activePaneSession?.paneModel.searchSession ?? PDFSearchSession()
     }
 
     var title: String {
-        model.fileURL?.lastPathComponent ?? "New Workspace"
+        activePaneSession?.resourceSession.fileURL?.lastPathComponent ?? "New Workspace"
+    }
+
+    // MARK: - Multi-Pane Mutations
+
+    var uniqueResourceSessions: [PDFResourceSession] {
+        var seen = Set<ObjectIdentifier>()
+        var result: [PDFResourceSession] = []
+        for session in paneSessions.values {
+            let res = session.resourceSession
+            let objID = ObjectIdentifier(res)
+            if !seen.contains(objID) {
+                seen.insert(objID)
+                result.append(res)
+            }
+        }
+        return result
+    }
+
+    var hasUncommittedChanges: Bool {
+        paneSessions.values.contains { $0.paneModel.noteComposerStore.hasUncommittedChanges }
+    }
+
+    var hasUnsavedDocumentChanges: Bool {
+        uniqueResourceSessions.contains { $0.hasUnsavedChanges }
+    }
+
+    /// Resolves and commits uncommitted drafts across all pane sessions in this tab.
+    @discardableResult
+    func saveAllDrafts() -> Result<Void, NoteEditError> {
+        for paneSession in paneSessions.values {
+            let store = paneSession.paneModel.noteComposerStore
+            guard store.hasUncommittedChanges else { continue }
+            switch store.resolvePendingDraft(using: paneSession.paneModel) {
+            case .success:
+                continue
+            case let .failure(error):
+                return .failure(error)
+            }
+        }
+        return .success(())
+    }
+
+    /// Explicitly updates layout tree with observable change notification.
+    func updateLayoutTree(_ newTree: WorkspaceLayoutTree) {
+        layoutTree = newTree
+    }
+
+    func canSplit(
+        paneID: PaneID? = nil,
+        direction: LayoutInsertionDirection,
+        policy: LayoutPolicy = .default,
+        availableSize: CGSize? = nil
+    ) -> Bool {
+        let targetID = paneID ?? activePaneID
+        guard paneSessions[targetID] != nil else { return false }
+        guard layoutTree.paneCount < policy.maxPanes else { return false }
+
+        if let availableSize {
+            let existingFrames = layoutTree.paneFrames(in: availableSize, policy: policy)
+            guard let targetFrame = existingFrames[targetID] else { return false }
+            switch direction.axis {
+            case .horizontal:
+                let requiredWidth = policy.minimumLeafWidth * 2 + policy.dividerThickness
+                if targetFrame.width < requiredWidth || targetFrame.height < policy.minimumLeafHeight {
+                    return false
+                }
+            case .vertical:
+                let requiredHeight = policy.minimumLeafHeight * 2 + policy.dividerThickness
+                if targetFrame.height < requiredHeight || targetFrame.width < policy.minimumLeafWidth {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
+    @discardableResult
+    func split(
+        paneID: PaneID? = nil,
+        direction: LayoutInsertionDirection,
+        ratio: Double = 0.5,
+        policy: LayoutPolicy = .default,
+        availableSize: CGSize? = nil
+    ) throws -> PaneID {
+        let targetID = paneID ?? activePaneID
+        guard let targetSession = paneSessions[targetID] else {
+            throw LayoutMutationError.targetPaneNotFound(targetID)
+        }
+
+        let newPaneID = PaneID()
+        let newTree = try layoutTree.inserting(
+            newPaneID,
+            adjacentTo: targetID,
+            direction: direction,
+            ratio: ratio,
+            policy: policy,
+            availableSize: availableSize
+        )
+
+        // New pane shares target's resourceSession
+        let newPaneModel = PDFPaneModel(id: newPaneID, resourceSession: targetSession.resourceSession)
+        newPaneModel.updateCurrentPageIndex(targetSession.paneModel.currentPageIndex)
+        newPaneModel.setZoomScale(targetSession.paneModel.zoomScale)
+        if targetSession.paneModel.isAutoScaling {
+            newPaneModel.fitToWindow()
+        }
+
+        let newSession = PDFPaneSession(
+            paneID: newPaneID,
+            paneModel: newPaneModel,
+            resourceSession: targetSession.resourceSession
+        )
+
+        layoutTree = newTree
+        paneSessions[newPaneID] = newSession
+        activePaneID = newPaneID
+        setupObserving(for: newSession)
+        objectWillChange.send()
+        return newPaneID
+    }
+
+    @discardableResult
+    func closePane(_ paneID: PaneID) throws -> Bool {
+        guard paneSessions.count > 1 else {
+            throw LayoutMutationError.cannotCloseOnlyPane
+        }
+        guard let sessionToClose = paneSessions[paneID] else {
+            throw LayoutMutationError.targetPaneNotFound(paneID)
+        }
+        // Direct close of a dirty pane cannot silently discard its draft
+        guard !sessionToClose.paneModel.noteComposerStore.hasUncommittedChanges else {
+            return false
+        }
+
+        let newTree = try layoutTree.removing(paneID)
+        layoutTree = newTree
+
+        sessionToClose.paneModel.close()
+        paneSessions.removeValue(forKey: paneID)
+        documentModels.removeValue(forKey: paneID)
+
+        if activePaneID == paneID {
+            if let first = layoutTree.leafIDs.first {
+                activePaneID = first
+            }
+        }
+        objectWillChange.send()
+        return true
+    }
+
+    private func setupObserving(for session: PDFPaneSession) {
+        session.paneModel.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+
+        session.resourceSession.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
     }
 }
 
@@ -48,17 +277,19 @@ final class WorkspaceWindowModel: ObservableObject {
     private var lastDraftRevisions: [UUID: Int] = [:]
     private var documentRevision = 0
     private var draftRevision = 0
+    private var tabObservingCancellables: [UUID: AnyCancellable] = [:]
 
     init(modelFactory: @escaping @MainActor () -> PDFDocumentModel) {
-        let firstIdentity = WorkspaceTabIdentity()
+        let firstModel = modelFactory()
+        let firstIdentity = WorkspaceTabIdentity(paneID: firstModel.paneModel.id.rawValue)
         self.modelFactory = modelFactory
         state = WorkspaceState(initialTab: firstIdentity)
-        sessions = [
-            firstIdentity.id: WorkspaceTabSession(
-                identity: firstIdentity,
-                model: modelFactory()
-            )
-        ]
+        let initialSession = WorkspaceTabSession(
+            identity: firstIdentity,
+            model: firstModel
+        )
+        sessions = [firstIdentity.id: initialSession]
+        observeTabSession(initialSession)
     }
 
     var tabs: [WorkspaceTabSession] {
@@ -76,6 +307,7 @@ final class WorkspaceWindowModel: ObservableObject {
 
     var activeTabID: UUID { activeTab.id }
     var activePaneID: UUID { activeTab.paneID }
+    var activeLayoutPaneID: PaneID { activeTab.activePaneID }
 
     func session(tabID: UUID) -> WorkspaceTabSession? {
         sessions[tabID]
@@ -85,8 +317,20 @@ final class WorkspaceWindowModel: ObservableObject {
         guard let session = sessions[tabID] else { return nil }
         return ReaderPromptPolicy.prompt(
             for: .closeTab,
-            draftHasChanges: session.composerStore.hasUncommittedChanges,
-            documentHasChanges: session.model.hasUnsavedChanges
+            draftHasChanges: session.hasUncommittedChanges,
+            documentHasChanges: session.hasUnsavedDocumentChanges
+        )
+    }
+
+    func closePanePrompt(tabID: UUID? = nil, paneID: PaneID? = nil) -> ReaderPrompt? {
+        let targetTabID = tabID ?? activeTabID
+        guard let session = sessions[targetTabID] else { return nil }
+        let targetPaneID = paneID ?? session.activePaneID
+        guard let paneSession = session.paneSessions[targetPaneID] else { return nil }
+        return ReaderPromptPolicy.prompt(
+            for: .closeTab,
+            draftHasChanges: paneSession.paneModel.noteComposerStore.hasUncommittedChanges,
+            documentHasChanges: false
         )
     }
 
@@ -94,9 +338,115 @@ final class WorkspaceWindowModel: ObservableObject {
         guard state.activate(tabID: tabID) else { return }
     }
 
+    func activate(paneID: PaneID, in tabID: UUID? = nil) {
+        let targetTabID = tabID ?? activeTabID
+        guard let session = sessions[targetTabID],
+              session.paneSessions[paneID] != nil else { return }
+        session.activePaneID = paneID
+        objectWillChange.send()
+    }
+
+    @discardableResult
+    func canSplit(
+        in tabID: UUID? = nil,
+        paneID: PaneID? = nil,
+        direction: LayoutInsertionDirection,
+        policy: LayoutPolicy = .default,
+        availableSize: CGSize? = nil
+    ) -> Bool {
+        let targetTabID = tabID ?? activeTabID
+        guard let session = sessions[targetTabID] else { return false }
+        return session.canSplit(
+            paneID: paneID,
+            direction: direction,
+            policy: policy,
+            availableSize: availableSize
+        )
+    }
+
+    @discardableResult
+    func splitActivePane(
+        direction: LayoutInsertionDirection,
+        ratio: Double = 0.5,
+        policy: LayoutPolicy = .default,
+        availableSize: CGSize? = nil
+    ) throws -> PaneID {
+        let newPaneID = try activeTab.split(
+            direction: direction,
+            ratio: ratio,
+            policy: policy,
+            availableSize: availableSize
+        )
+        objectWillChange.send()
+        return newPaneID
+    }
+
+    @discardableResult
+    func splitPane(
+        paneID: PaneID,
+        in tabID: UUID? = nil,
+        direction: LayoutInsertionDirection,
+        ratio: Double = 0.5,
+        policy: LayoutPolicy = .default,
+        availableSize: CGSize? = nil
+    ) throws -> PaneID {
+        let targetTabID = tabID ?? activeTabID
+        guard let session = sessions[targetTabID] else {
+            throw LayoutMutationError.targetPaneNotFound(paneID)
+        }
+        let newPaneID = try session.split(
+            paneID: paneID,
+            direction: direction,
+            ratio: ratio,
+            policy: policy,
+            availableSize: availableSize
+        )
+        objectWillChange.send()
+        return newPaneID
+    }
+
+    /// Updates layout tree for the tab with observable publication.
+    func updateLayoutTree(_ newTree: WorkspaceLayoutTree, in tabID: UUID? = nil) {
+        let targetTabID = tabID ?? activeTabID
+        guard let session = sessions[targetTabID] else { return }
+        session.updateLayoutTree(newTree)
+        objectWillChange.send()
+    }
+
+    /// Resolves and commits drafts across all panes in all tabs.
+    @discardableResult
+    func saveAllWorkspaceDrafts() -> Result<Void, NoteEditError> {
+        for tab in tabs where tab.hasUncommittedChanges {
+            let result = tab.saveAllDrafts()
+            if case .failure = result {
+                return result
+            }
+        }
+        return .success(())
+    }
+
+    @discardableResult
+    func closePane(
+        tabID: UUID? = nil,
+        paneID: PaneID? = nil
+    ) throws -> Bool {
+        let targetTabID = tabID ?? activeTabID
+        guard let session = sessions[targetTabID] else { return false }
+        let targetPaneID = paneID ?? session.activePaneID
+        guard let paneSession = session.paneSessions[targetPaneID],
+              !paneSession.paneModel.noteComposerStore.hasUncommittedChanges else {
+            return false
+        }
+        let closed = try session.closePane(targetPaneID)
+        if closed {
+            objectWillChange.send()
+        }
+        return closed
+    }
+
     /// Commits a tab strip drag. The ordering rule lives in `WorkspaceState`;
     /// this republishes the result so the tab strip and the reader's active
-    /// model stay in sync without touching any PDF session.
+    /// model stay in sync without touching any PDF session.\
     @discardableResult
     func moveTab(tabID: UUID, toInsertionIndex insertionIndex: Int) -> Bool {
         state.move(tabID: tabID, toInsertionIndex: insertionIndex)
@@ -128,6 +478,7 @@ final class WorkspaceWindowModel: ObservableObject {
         let session = makeSession()
         _ = state.insert(WorkspaceTabIdentity(id: session.id, paneID: session.paneID))
         sessions[session.id] = session
+        observeTabSession(session)
         return session.id
     }
 
@@ -141,7 +492,9 @@ final class WorkspaceWindowModel: ObservableObject {
         guard url.isFileURL else { return .failed(.notAFileURL) }
 
         if let existing = tabs.first(where: {
-            $0.model.fileURL?.standardizedFileURL == url.standardizedFileURL
+            $0.uniqueResourceSessions.contains(where: {
+                $0.fileURL?.standardizedFileURL == url.standardizedFileURL
+            })
         }) {
             activate(tabID: existing.id)
             return .activatedExisting(tabID: existing.id)
@@ -157,12 +510,18 @@ final class WorkspaceWindowModel: ObservableObject {
         let candidate = makeSession()
         guard candidate.model.open(url: url, relinking: recentDocument) else {
             let error = candidate.model.lastError ?? .unreadable
-            candidate.model.close()
+            for paneSession in candidate.paneSessions.values {
+                paneSession.paneModel.close()
+            }
+            for resourceSession in candidate.uniqueResourceSessions {
+                resourceSession.close()
+            }
             return .failed(error)
         }
 
         _ = state.insert(WorkspaceTabIdentity(id: candidate.id, paneID: candidate.paneID))
         sessions[candidate.id] = candidate
+        observeTabSession(candidate)
         return .opened(tabID: candidate.id)
     }
 
@@ -171,15 +530,20 @@ final class WorkspaceWindowModel: ObservableObject {
     @discardableResult
     func closeTab(tabID: UUID) -> Bool {
         guard let session = sessions[tabID],
-              !session.composerStore.hasUncommittedChanges,
-              !session.model.hasUnsavedChanges,
+              !session.hasUncommittedChanges,
+              !session.hasUnsavedDocumentChanges,
               state.tabs.count > 1,
               state.close(tabID: tabID) != nil
         else { return false }
 
         sessions[tabID] = nil
-        session.searchSession.clear()
-        session.model.close()
+        tabObservingCancellables.removeValue(forKey: tabID)
+        for paneSession in session.paneSessions.values {
+            paneSession.paneModel.close()
+        }
+        for resourceSession in session.uniqueResourceSessions {
+            resourceSession.close()
+        }
         objectWillChange.send()
         return true
     }
@@ -187,14 +551,18 @@ final class WorkspaceWindowModel: ObservableObject {
     @discardableResult
     func discardDraft(tabID: UUID) -> Bool {
         guard let session = sessions[tabID] else { return false }
-        session.composerStore.end()
+        for paneSession in session.paneSessions.values {
+            paneSession.paneModel.noteComposerStore.end()
+        }
         return true
     }
 
     @discardableResult
     func discardDocumentChanges(tabID: UUID) -> Bool {
         guard let session = sessions[tabID] else { return false }
-        session.model.abandonUnsavedChanges()
+        for resourceSession in session.uniqueResourceSessions {
+            resourceSession.abandonUnsavedChanges()
+        }
         return true
     }
 
@@ -203,38 +571,59 @@ final class WorkspaceWindowModel: ObservableObject {
         return UnsavedWork(
             documentRevision: documentRevision,
             draftRevision: draftRevision,
-            documentHasChanges: tabs.contains(where: { $0.model.hasUnsavedChanges }),
-            draftHasChanges: tabs.contains(where: { $0.composerStore.hasUncommittedChanges })
+            documentHasChanges: tabs.contains(where: { $0.hasUnsavedDocumentChanges }),
+            draftHasChanges: tabs.contains(where: { $0.hasUncommittedChanges })
         )
     }
 
     func discardAllDrafts() {
-        tabs.forEach { $0.composerStore.end() }
+        for tab in tabs {
+            for paneSession in tab.paneSessions.values {
+                paneSession.paneModel.noteComposerStore.end()
+            }
+        }
     }
 
     func discardAllDocumentChanges() {
-        tabs.forEach { $0.model.abandonUnsavedChanges() }
+        for tab in tabs {
+            for resourceSession in tab.uniqueResourceSessions {
+                resourceSession.abandonUnsavedChanges()
+            }
+        }
     }
 
     func closeAllSessions() {
         for session in sessions.values {
-            session.composerStore.end()
-            session.searchSession.clear()
-            session.model.close()
+            for paneSession in session.paneSessions.values {
+                paneSession.paneModel.close()
+            }
+            for resourceSession in session.uniqueResourceSessions {
+                resourceSession.close()
+            }
         }
+        tabObservingCancellables.removeAll()
     }
 
     private func makeSession() -> WorkspaceTabSession {
         WorkspaceTabSession(model: modelFactory())
     }
 
+    private func observeTabSession(_ session: WorkspaceTabSession) {
+        tabObservingCancellables[session.id] = session.objectWillChange
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+    }
+
     private func synchronizeRevisions() {
-        let currentDocuments = Dictionary(
-            uniqueKeysWithValues: tabs.map { ($0.id, $0.model.editRevision) }
-        )
-        let currentDrafts = Dictionary(
-            uniqueKeysWithValues: tabs.map { ($0.id, $0.composerStore.revision) }
-        )
+        var currentDocuments: [UUID: Int] = [:]
+        var currentDrafts: [UUID: Int] = [:]
+        for tab in tabs {
+            let docRev = tab.uniqueResourceSessions.map(\.editRevision).reduce(0, +)
+            let draftRev = tab.paneSessions.values.map(\.paneModel.noteComposerStore.revision).reduce(0, +)
+            currentDocuments[tab.id] = docRev
+            currentDrafts[tab.id] = draftRev
+        }
         if currentDocuments != lastDocumentRevisions {
             documentRevision &+= 1
             lastDocumentRevisions = currentDocuments
