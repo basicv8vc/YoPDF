@@ -32,6 +32,20 @@ private struct ReaderPDFDropDestination: ViewModifier {
     }
 }
 
+private struct SinglePaneTabDraggableModifier: ViewModifier {
+    let tab: WorkspaceTabSession
+
+    func body(content: Content) -> some View {
+        if tab.layoutTree.paneCount == 1 {
+            content.onDrag {
+                PaneDragPayload(kind: .tab, sourceTabID: tab.id, sourcePaneID: tab.activePaneID).asItemProvider()
+            }
+        } else {
+            content
+        }
+    }
+}
+
 /// Reports each tab's layout frame in the tab strip's own coordinate space so a
 /// drag can decide which slot the pointer is over.
 private struct WorkspaceTabFramePreferenceKey: PreferenceKey {
@@ -198,6 +212,7 @@ private struct WorkspaceTabStrip: View {
         .animation(isDragging ? nil : Self.reorderAnimation, value: dropIndex)
         .shadow(color: .black.opacity(isDragging ? 0.16 : 0), radius: 6, y: 2)
         .zIndex(isDragging ? 1 : 0)
+        .modifier(SinglePaneTabDraggableModifier(tab: tab))
     }
 
     /// Right-click counterpart of the keyboard commands. It moves the tab that
@@ -361,6 +376,8 @@ struct PDFReaderView: View {
     @State private var anchorResolvers: [PaneID: PageAnchorResolver] = [:]
     /// Current size of the content layout area.
     @State private var currentContentSize: CGSize?
+    /// Per-pane hover state during in-flight Drag & Drop over four-direction drop zones.
+    @State private var paneHoverStates: [PaneID: PaneDropHoverState] = [:]
 
     private var anchorResolver: PageAnchorResolver {
         anchorResolver(for: tab.activePaneID)
@@ -1473,109 +1490,227 @@ struct PDFReaderView: View {
             let paneDocModel = tab.model(for: paneSession)
             let resolver = anchorResolver(for: paneID)
 
-            ZStack(alignment: .topTrailing) {
-                PDFViewerRepresentable(
-                    document: resourceSession.document,
-                    currentPageIndex: Binding(
-                        get: { paneModel.currentPageIndex },
-                        set: { paneModel.updateCurrentPageIndex($0) }
-                    ),
-                    selection: Binding(
-                        get: { paneModel.currentSelection },
-                        set: { paneModel.updateSelection($0) }
-                    ),
-                    autoScales: paneModel.isAutoScaling,
-                    zoomScale: paneModel.zoomScale,
-                    zoomCommandRevision: paneModel.zoomCommandRevision,
-                    pageNavigationRevision: paneModel.pageNavigationRevision,
-                    navigationDestination: isPaneActive ? pendingNavigationDestination : nil,
-                    navigationRevision: navigationRevision,
-                    onScaleChange: { paneModel.updateEffectiveScale($0) },
-                    onSettledViewState: { document, pageIndex, scale, pageRevision, zoomRevision in
-                        paneModel.updateViewState(
-                            document: document,
-                            pageIndex: pageIndex,
-                            scale: scale,
-                            pageNavigationRevision: pageRevision,
-                            zoomCommandRevision: zoomRevision
+            VStack(spacing: 0) {
+                PaneHeaderView(
+                    paneID: paneID,
+                    title: resourceSession.fileURL?.lastPathComponent ?? "Document",
+                    pageIndicator: resourceSession.pageCount > 0 ? "\(paneModel.currentPageIndex + 1) / \(resourceSession.pageCount)" : "",
+                    isPaneActive: isPaneActive,
+                    canClose: tab.layoutTree.paneCount > 1,
+                    onActivate: { activatePane(paneID) },
+                    onClose: { requestClosePane(paneID) },
+                    dragPayload: PaneDragPayload(kind: .pane, sourceTabID: tab.id, sourcePaneID: paneID)
+                )
+
+                GeometryReader { paneGeometry in
+                    ZStack(alignment: .topTrailing) {
+                        PDFViewerRepresentable(
+                            document: resourceSession.document,
+                            currentPageIndex: Binding(
+                                get: { paneModel.currentPageIndex },
+                                set: { paneModel.updateCurrentPageIndex($0) }
+                            ),
+                            selection: Binding(
+                                get: { paneModel.currentSelection },
+                                set: { paneModel.updateSelection($0) }
+                            ),
+                            autoScales: paneModel.isAutoScaling,
+                            zoomScale: paneModel.zoomScale,
+                            zoomCommandRevision: paneModel.zoomCommandRevision,
+                            pageNavigationRevision: paneModel.pageNavigationRevision,
+                            navigationDestination: isPaneActive ? pendingNavigationDestination : nil,
+                            navigationRevision: navigationRevision,
+                            onScaleChange: { paneModel.updateEffectiveScale($0) },
+                            onSettledViewState: { document, pageIndex, scale, pageRevision, zoomRevision in
+                                paneModel.updateViewState(
+                                    document: document,
+                                    pageIndex: pageIndex,
+                                    scale: scale,
+                                    pageNavigationRevision: pageRevision,
+                                    zoomCommandRevision: zoomRevision
+                                )
+                            },
+                            onManualMagnification: { paneModel.setAutoScaling(false) },
+                            selectedMarkup: paneModel.selectedMarkup,
+                            noteMarkers: resourceSession.noteMarkers,
+                            isPlacingNote: isPaneActive && isPlacingNote,
+                            annotationRevision: resourceSession.annotationRevision,
+                            changedAnnotationPageIndices: resourceSession.changedAnnotationPageIndices,
+                            onMarkupClick: { point, page in
+                                paneModel.selectMarkup(at: point, on: page)
+                            },
+                            onNoteHit: { point, page in
+                                paneModel.noteSelection(at: point, on: page)
+                            },
+                            onNoteActivated: { note, anchor in
+                                requestNoteComposer(note, anchor: anchor, in: paneID)
+                            },
+                            onNoteMoved: { note, center in
+                                _ = resourceSession.moveNoteMarker(note, to: center)
+                            },
+                            onPlaceNote: { point, page, anchor in
+                                placePageNote(at: point, on: page, anchor: anchor, in: paneID)
+                            },
+                            onCancelPlacement: {
+                                if isPaneActive { isPlacingNote = false }
+                            },
+                            searchSelections: searchBelongsToDisplayedDocument ? paneModel.searchSession.results : [],
+                            activeSearchSelection: searchBelongsToDisplayedDocument
+                                ? paneModel.searchSession.currentSelection
+                                : nil,
+                            searchResultsRevision: paneModel.searchSession.resultsRevision,
+                            makeMenuItems: { context in
+                                pageMenuItems(for: context, in: paneID)
+                            },
+                            anchorResolver: resolver,
+                            onActivatePane: {
+                                activatePane(paneID)
+                            }
                         )
-                    },
-                    onManualMagnification: { paneModel.setAutoScaling(false) },
-                    selectedMarkup: paneModel.selectedMarkup,
-                    noteMarkers: resourceSession.noteMarkers,
-                    isPlacingNote: isPaneActive && isPlacingNote,
-                    annotationRevision: resourceSession.annotationRevision,
-                    changedAnnotationPageIndices: resourceSession.changedAnnotationPageIndices,
-                    onMarkupClick: { point, page in
-                        paneModel.selectMarkup(at: point, on: page)
-                    },
-                    onNoteHit: { point, page in
-                        paneModel.noteSelection(at: point, on: page)
-                    },
-                    onNoteActivated: { note, anchor in
-                        requestNoteComposer(note, anchor: anchor, in: paneID)
-                    },
-                    onNoteMoved: { note, center in
-                        _ = resourceSession.moveNoteMarker(note, to: center)
-                    },
-                    onPlaceNote: { point, page, anchor in
-                        placePageNote(at: point, on: page, anchor: anchor, in: paneID)
-                    },
-                    onCancelPlacement: {
-                        if isPaneActive { isPlacingNote = false }
-                    },
-                    searchSelections: searchBelongsToDisplayedDocument ? paneModel.searchSession.results : [],
-                    activeSearchSelection: searchBelongsToDisplayedDocument
-                        ? paneModel.searchSession.currentSelection
-                        : nil,
-                    searchResultsRevision: paneModel.searchSession.resultsRevision,
-                    makeMenuItems: { context in
-                        pageMenuItems(for: context, in: paneID)
-                    },
-                    anchorResolver: resolver,
-                    onActivatePane: {
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .id(resourceSession.loadGeneration)
+                        .popover(
+                            isPresented: Binding(
+                                get: { paneModel.noteComposerStore.isPresented },
+                                set: { paneModel.noteComposerStore.isPresented = $0 }
+                            ),
+                            attachmentAnchor: .rect(.rect(paneModel.noteComposerStore.session?.anchorRect ?? Self.fallbackAnchor)),
+                            arrowEdge: .top
+                        ) {
+                            if let session = paneModel.noteComposerStore.session {
+                                NoteComposerView(session: session, model: paneDocModel) {
+                                    paneModel.noteComposerStore.end()
+                                } onEditGroupEntry: { group, entry in
+                                    guard let note = paneDocModel.noteSelection(forThreadEntry: entry, in: group) else {
+                                        return
+                                    }
+                                    let anchor = resolver.containerRect(
+                                        forPageBounds: group.bounds,
+                                        pageIndex: group.pageIndex
+                                    ) ?? Self.fallbackAnchor
+                                    requestCompose(.note(note, anchor), in: paneID)
+                                }
+                                .id(session.id)
+                            }
+                        }
+
+                        if tab.layoutTree.paneCount > 1 {
+                            Rectangle()
+                                .strokeBorder(isPaneActive ? Color.accentColor.opacity(0.65) : Color.clear, lineWidth: 2)
+                                .allowsHitTesting(false)
+                        }
+
+                        if let hoverState = paneHoverStates[paneID] {
+                            PaneDropPreviewOverlay(
+                                direction: hoverState.direction,
+                                isValid: hoverState.isValid,
+                                feedbackMessage: hoverState.feedbackMessage
+                            )
+                            .allowsHitTesting(false)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
                         activatePane(paneID)
                     }
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .id(resourceSession.loadGeneration)
-                .popover(
-                    isPresented: Binding(
-                        get: { paneModel.noteComposerStore.isPresented },
-                        set: { paneModel.noteComposerStore.isPresented = $0 }
-                    ),
-                    attachmentAnchor: .rect(.rect(paneModel.noteComposerStore.session?.anchorRect ?? Self.fallbackAnchor)),
-                    arrowEdge: .top
-                ) {
-                    if let session = paneModel.noteComposerStore.session {
-                        NoteComposerView(session: session, model: paneDocModel) {
-                            paneModel.noteComposerStore.end()
-                        } onEditGroupEntry: { group, entry in
-                            guard let note = paneDocModel.noteSelection(forThreadEntry: entry, in: group) else {
-                                return
-                            }
-                            let anchor = resolver.containerRect(
-                                forPageBounds: group.bounds,
-                                pageIndex: group.pageIndex
-                            ) ?? Self.fallbackAnchor
-                            requestCompose(.note(note, anchor), in: paneID)
+                    .modifier(PaneDropTargetModifier(
+                        targetPaneID: paneID,
+                        containerSize: paneGeometry.size,
+                        validateDrop: { direction in
+                            validateDrop(on: paneID, direction: direction, in: paneGeometry.size)
+                        },
+                        onHoverChanged: { hover in
+                            paneHoverStates[paneID] = hover
+                        },
+                        onPerformDrop: { payload, direction in
+                            handlePaneDrop(payload: payload, on: paneID, direction: direction, in: paneGeometry.size)
                         }
-                        .id(session.id)
-                    }
+                    ))
                 }
-
-                if tab.layoutTree.paneCount > 1 {
-                    Rectangle()
-                        .strokeBorder(isPaneActive ? Color.accentColor.opacity(0.65) : Color.clear, lineWidth: 2)
-                        .allowsHitTesting(false)
-                }
-            }
-            .contentShape(Rectangle())
-            .onTapGesture {
-                activatePane(paneID)
             }
             .accessibilityElement(children: .contain)
             .accessibilityLabel("Pane \(paneID.description)\(isPaneActive ? ", active" : "")")
+        }
+    }
+
+    // MARK: - Drag & Drop Handling
+
+    private func validateDrop(on targetPaneID: PaneID, direction: LayoutInsertionDirection, in size: CGSize) -> (isValid: Bool, feedback: String) {
+        if tab.layoutTree.paneCount >= LayoutPolicy.default.maxPanes {
+            return (false, "Maximum \(LayoutPolicy.default.maxPanes) panes limit reached")
+        }
+        switch direction.axis {
+        case .horizontal:
+            let requiredWidth = LayoutPolicy.default.minimumLeafWidth * 2 + LayoutPolicy.default.dividerThickness
+            if size.width < requiredWidth {
+                return (false, "Width too narrow to split")
+            }
+            if size.height < LayoutPolicy.default.minimumLeafHeight {
+                return (false, "Height too short to split")
+            }
+        case .vertical:
+            let requiredHeight = LayoutPolicy.default.minimumLeafHeight * 2 + LayoutPolicy.default.dividerThickness
+            if size.height < requiredHeight {
+                return (false, "Height too short to split")
+            }
+            if size.width < LayoutPolicy.default.minimumLeafWidth {
+                return (false, "Width too narrow to split")
+            }
+        }
+        return (true, "")
+    }
+
+    private func handlePaneDrop(payload: DropPayload, on targetPaneID: PaneID, direction: LayoutInsertionDirection, in size: CGSize) -> Bool {
+        switch payload {
+        case let .pane(dragPayload):
+            let sourceTabID = dragPayload.sourceTabID
+            let sourcePaneID: PaneID
+            if let id = dragPayload.sourcePaneID {
+                sourcePaneID = id
+            } else if let sourceTab = workspace.session(tabID: sourceTabID),
+                      let firstID = sourceTab.layoutTree.leafIDs.first {
+                sourcePaneID = firstID
+            } else {
+                return false
+            }
+
+            if sourceTabID == tab.id && sourcePaneID == targetPaneID {
+                return false
+            }
+
+            do {
+                try workspace.movePane(
+                    sourceTabID: sourceTabID,
+                    paneID: sourcePaneID,
+                    toDestinationTabID: tab.id,
+                    adjacentTo: targetPaneID,
+                    direction: direction,
+                    policy: .default,
+                    availableSize: currentContentSize
+                )
+                return true
+            } catch {
+                return false
+            }
+
+        case let .fileURL(url):
+            let result = workspace.openPDFInSplit(
+                url: url,
+                in: tab.id,
+                adjacentTo: targetPaneID,
+                direction: direction,
+                policy: .default,
+                availableSize: currentContentSize
+            )
+            switch result {
+            case .success:
+                return true
+            case let .failure(error):
+                if let loadErr = error as? PDFDocumentModel.LoadError {
+                    pendingOpenFailure = loadErr
+                }
+                return false
+            }
         }
     }
 
