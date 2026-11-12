@@ -83,6 +83,46 @@ public enum LayoutInsertionDirection: String, Codable, Sendable {
             return false
         }
     }
+
+    /// Determines the intended insertion direction based on cursor location within a container size,
+    /// with optional directional hysteresis to prevent flickering along quadrant boundaries.
+    public static func direction(
+        for point: CGPoint,
+        in size: CGSize,
+        previousDirection: LayoutInsertionDirection? = nil,
+        hysteresis: CGFloat = 0.05
+    ) -> LayoutInsertionDirection {
+        let width = max(1, size.width)
+        let height = max(1, size.height)
+        var nLeft = point.x / width
+        var nRight = (width - point.x) / width
+        var nTop = point.y / height
+        var nBottom = (height - point.y) / height
+
+        if let prev = previousDirection {
+            switch prev {
+            case .left:
+                nLeft -= hysteresis
+            case .right:
+                nRight -= hysteresis
+            case .top:
+                nTop -= hysteresis
+            case .bottom:
+                nBottom -= hysteresis
+            }
+        }
+
+        let minVal = min(nLeft, nRight, nTop, nBottom)
+        if minVal == nLeft {
+            return .left
+        } else if minVal == nRight {
+            return .right
+        } else if minVal == nTop {
+            return .top
+        } else {
+            return .bottom
+        }
+    }
 }
 
 // MARK: - LayoutMutationError
@@ -864,6 +904,109 @@ public struct WorkspaceLayoutTree: Equatable, Sendable, Codable {
             adjacentTo: target,
             direction: direction,
             ratio: ratio,
+            policy: policy,
+            availableSize: availableSize
+        )
+    }
+
+    /// Checks whether inserting a new pane is allowed according to policy and available size.
+    public func canInsert(
+        _ newPaneID: PaneID,
+        adjacentTo target: PaneID,
+        direction: LayoutInsertionDirection,
+        policy: LayoutPolicy = .default,
+        availableSize: CGSize? = nil
+    ) -> Bool {
+        guard contains(target), !contains(newPaneID), paneCount < policy.maxPanes else {
+            return false
+        }
+        if let availableSize {
+            let existingFrames = paneFrames(in: availableSize, policy: policy)
+            guard let targetFrame = existingFrames[target] else { return false }
+            switch direction.axis {
+            case .horizontal:
+                let requiredWidth = policy.minimumLeafWidth * 2 + policy.dividerThickness
+                if targetFrame.width < requiredWidth || targetFrame.height < policy.minimumLeafHeight {
+                    return false
+                }
+            case .vertical:
+                let requiredHeight = policy.minimumLeafHeight * 2 + policy.dividerThickness
+                if targetFrame.height < requiredHeight || targetFrame.width < policy.minimumLeafWidth {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
+    /// Moves an existing pane within the tree adjacent to `target` along `direction`.
+    ///
+    /// Throws `LayoutMutationError` if:
+    /// - `paneID` or `target` are not found.
+    /// - `paneID == target` (cannot move a pane adjacent to itself).
+    /// - The resulting layout cannot satisfy minimum dimensions.
+    public func moving(
+        _ paneID: PaneID,
+        adjacentTo target: PaneID,
+        direction: LayoutInsertionDirection,
+        ratio: Double = 0.5,
+        policy: LayoutPolicy = .default,
+        availableSize: CGSize? = nil
+    ) throws -> WorkspaceLayoutTree {
+        guard paneID != target else {
+            throw LayoutMutationError.duplicatePaneID(paneID)
+        }
+        guard contains(paneID) else {
+            throw LayoutMutationError.targetPaneNotFound(paneID)
+        }
+        guard contains(target) else {
+            throw LayoutMutationError.targetPaneNotFound(target)
+        }
+
+        let treeWithoutPane = try removing(paneID)
+        return try treeWithoutPane.inserting(
+            paneID,
+            adjacentTo: target,
+            direction: direction,
+            ratio: ratio,
+            policy: policy,
+            availableSize: availableSize
+        )
+    }
+
+    /// Mutating variant of `moving`.
+    public mutating func move(
+        _ paneID: PaneID,
+        adjacentTo target: PaneID,
+        direction: LayoutInsertionDirection,
+        ratio: Double = 0.5,
+        policy: LayoutPolicy = .default,
+        availableSize: CGSize? = nil
+    ) throws {
+        self = try moving(
+            paneID,
+            adjacentTo: target,
+            direction: direction,
+            ratio: ratio,
+            policy: policy,
+            availableSize: availableSize
+        )
+    }
+
+    /// Checks whether moving an existing pane within the tree is allowed.
+    public func canMove(
+        _ paneID: PaneID,
+        adjacentTo target: PaneID,
+        direction: LayoutInsertionDirection,
+        policy: LayoutPolicy = .default,
+        availableSize: CGSize? = nil
+    ) -> Bool {
+        guard paneID != target, contains(paneID), contains(target) else { return false }
+        guard let treeWithoutPane = try? removing(paneID) else { return false }
+        return treeWithoutPane.canInsert(
+            paneID,
+            adjacentTo: target,
+            direction: direction,
             policy: policy,
             availableSize: availableSize
         )

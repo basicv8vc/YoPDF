@@ -246,7 +246,55 @@ final class WorkspaceTabSession: Identifiable, ObservableObject {
         return true
     }
 
-    private func setupObserving(for session: PDFPaneSession) {
+    @discardableResult
+    func detachPaneSession(_ paneID: PaneID) -> PDFPaneSession? {
+        guard let session = paneSessions[paneID] else { return nil }
+        if layoutTree.paneCount > 1 {
+            if let newTree = try? layoutTree.removing(paneID) {
+                layoutTree = newTree
+            }
+            if activePaneID == paneID {
+                if let first = layoutTree.leafIDs.first {
+                    activePaneID = first
+                }
+            }
+        }
+        paneSessions.removeValue(forKey: paneID)
+        documentModels.removeValue(forKey: paneID)
+        objectWillChange.send()
+        return session
+    }
+
+    func attachTransferredPaneSession(_ session: PDFPaneSession, newLayoutTree: WorkspaceLayoutTree) {
+        layoutTree = newLayoutTree
+        paneSessions[session.id] = session
+        activePaneID = session.id
+        setupObserving(for: session)
+        objectWillChange.send()
+    }
+
+    func movePaneWithinTab(
+        paneID: PaneID,
+        adjacentTo target: PaneID,
+        direction: LayoutInsertionDirection,
+        ratio: Double = 0.5,
+        policy: LayoutPolicy = .default,
+        availableSize: CGSize? = nil
+    ) throws {
+        let newTree = try layoutTree.moving(
+            paneID,
+            adjacentTo: target,
+            direction: direction,
+            ratio: ratio,
+            policy: policy,
+            availableSize: availableSize
+        )
+        layoutTree = newTree
+        activePaneID = paneID
+        objectWillChange.send()
+    }
+
+    func setupObserving(for session: PDFPaneSession) {
         session.paneModel.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
@@ -313,12 +361,25 @@ final class WorkspaceWindowModel: ObservableObject {
         sessions[tabID]
     }
 
+    /// Resource sessions whose pane leases all live inside `tabID`.
+    ///
+    /// Closing the tab releases those leases, so these are the only resources
+    /// whose document state the close may prompt for, discard, or destroy.
+    /// A resource that is still leased by a pane in another tab survives the
+    /// close: its dirty state, pending autosave, and markup undo history must
+    /// stay untouched for the remaining panes.
+    private func resourceSessionsLosingFinalPane(in tabID: UUID) -> [PDFResourceSession] {
+        guard let session = sessions[tabID] else { return [] }
+        let tabPaneIDs = Set(session.paneSessions.keys)
+        return session.uniqueResourceSessions.filter { $0.activePaneIDs.isSubset(of: tabPaneIDs) }
+    }
+
     func closeTabPrompt(tabID: UUID) -> ReaderPrompt? {
         guard let session = sessions[tabID] else { return nil }
         return ReaderPromptPolicy.prompt(
             for: .closeTab,
             draftHasChanges: session.hasUncommittedChanges,
-            documentHasChanges: session.hasUnsavedDocumentChanges
+            documentHasChanges: resourceSessionsLosingFinalPane(in: tabID).contains { $0.hasUnsavedChanges }
         )
     }
 
@@ -403,6 +464,172 @@ final class WorkspaceWindowModel: ObservableObject {
         )
         objectWillChange.send()
         return newPaneID
+    }
+
+    /// Finds any live PDFResourceSession in the workspace that references the specified file URL.
+    func findResourceSession(for url: URL) -> PDFResourceSession? {
+        for tab in tabs {
+            for session in tab.uniqueResourceSessions {
+                if let fileURL = session.fileURL,
+                   fileURL.standardizedFileURL == url.standardizedFileURL {
+                    return session
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Safely closes a tab that has had all its pane sessions transferred out.
+    /// Does NOT close any PDFResourceSession or PDFPaneModel instances since they were transferred.
+    func closeEmptyTabAfterTransfer(_ tabID: UUID) {
+        guard let session = sessions[tabID], session.paneSessions.isEmpty else { return }
+        sessions.removeValue(forKey: tabID)
+        tabObservingCancellables.removeValue(forKey: tabID)
+        _ = state.close(tabID: tabID)
+        if state.activeTabID == tabID {
+            if let nextTab = state.tabs.first {
+                state.activate(tabID: nextTab.id)
+            }
+        }
+        objectWillChange.send()
+    }
+
+    /// Moves a pane from a source tab to adjacent to a target pane in a destination tab.
+    /// Supports both intra-tab moves and inter-tab transfers while preserving all sessions and drafts.
+    @discardableResult
+    func movePane(
+        sourceTabID: UUID,
+        paneID: PaneID,
+        toDestinationTabID destinationTabID: UUID,
+        adjacentTo targetPaneID: PaneID,
+        direction: LayoutInsertionDirection,
+        ratio: Double = 0.5,
+        policy: LayoutPolicy = .default,
+        availableSize: CGSize? = nil
+    ) throws -> PaneID {
+        if sourceTabID == destinationTabID {
+            guard let tab = sessions[sourceTabID] else {
+                throw LayoutMutationError.targetPaneNotFound(targetPaneID)
+            }
+            try tab.movePaneWithinTab(
+                paneID: paneID,
+                adjacentTo: targetPaneID,
+                direction: direction,
+                ratio: ratio,
+                policy: policy,
+                availableSize: availableSize
+            )
+            objectWillChange.send()
+            return paneID
+        }
+
+        // Cross-tab transfer
+        guard let sourceTab = sessions[sourceTabID] else {
+            throw LayoutMutationError.targetPaneNotFound(paneID)
+        }
+        guard let destinationTab = sessions[destinationTabID] else {
+            throw LayoutMutationError.targetPaneNotFound(targetPaneID)
+        }
+        guard sourceTab.paneSessions[paneID] != nil else {
+            throw LayoutMutationError.targetPaneNotFound(paneID)
+        }
+        guard destinationTab.paneSessions[targetPaneID] != nil else {
+            throw LayoutMutationError.targetPaneNotFound(targetPaneID)
+        }
+        guard destinationTab.layoutTree.paneCount < policy.maxPanes else {
+            throw LayoutMutationError.maximumPaneLimitReached(limit: policy.maxPanes)
+        }
+
+        // Validate destination insertion before mutating anything
+        let newTree = try destinationTab.layoutTree.inserting(
+            paneID,
+            adjacentTo: targetPaneID,
+            direction: direction,
+            ratio: ratio,
+            policy: policy,
+            availableSize: availableSize
+        )
+
+        let isSourceTabEmptying = (sourceTab.layoutTree.paneCount <= 1)
+
+        // Detach from source without destroying session
+        guard let transferredSession = sourceTab.detachPaneSession(paneID) else {
+            throw LayoutMutationError.targetPaneNotFound(paneID)
+        }
+
+        if isSourceTabEmptying {
+            closeEmptyTabAfterTransfer(sourceTabID)
+        }
+
+        // Attach to destination
+        destinationTab.attachTransferredPaneSession(transferredSession, newLayoutTree: newTree)
+        state.activate(tabID: destinationTab.id)
+        destinationTab.activePaneID = paneID
+        objectWillChange.send()
+        return paneID
+    }
+
+    /// Opens a local PDF file from Finder into a split adjacent to a target pane.
+    /// Validates destination layout and file before committing layout mutations.
+    @discardableResult
+    func openPDFInSplit(
+        url: URL,
+        in tabID: UUID? = nil,
+        adjacentTo targetPaneID: PaneID,
+        direction: LayoutInsertionDirection,
+        ratio: Double = 0.5,
+        policy: LayoutPolicy = .default,
+        availableSize: CGSize? = nil
+    ) -> Result<PaneID, Error> {
+        guard url.isFileURL else {
+            return .failure(PDFDocumentModel.LoadError.notAFileURL)
+        }
+        let targetTabID = tabID ?? activeTabID
+        guard let destinationTab = sessions[targetTabID] else {
+            return .failure(LayoutMutationError.targetPaneNotFound(targetPaneID))
+        }
+
+        // 1. Validate destination layout first, before opening any file or creating a resource
+        let candidatePaneID = PaneID()
+        let candidateTree: WorkspaceLayoutTree
+        do {
+            candidateTree = try destinationTab.layoutTree.inserting(
+                candidatePaneID,
+                adjacentTo: targetPaneID,
+                direction: direction,
+                ratio: ratio,
+                policy: policy,
+                availableSize: availableSize
+            )
+        } catch {
+            return .failure(error)
+        }
+
+        // 2. Reuse existing resourceSession if file is already open, or open a fresh resourceSession
+        let resourceSessionToUse: PDFResourceSession
+        if let existing = findResourceSession(for: url) {
+            resourceSessionToUse = existing
+        } else {
+            let newResource = PDFResourceSession()
+            guard newResource.open(url: url) else {
+                let error = newResource.lastError ?? .unreadable
+                newResource.close()
+                return .failure(error)
+            }
+            resourceSessionToUse = newResource
+        }
+
+        // 3. Commit layout mutation using the pre-validated tree
+        let newPaneModel = PDFPaneModel(id: candidatePaneID, resourceSession: resourceSessionToUse)
+        let newSession = PDFPaneSession(
+            paneID: candidatePaneID,
+            paneModel: newPaneModel,
+            resourceSession: resourceSessionToUse
+        )
+
+        destinationTab.attachTransferredPaneSession(newSession, newLayoutTree: candidateTree)
+        objectWillChange.send()
+        return .success(candidatePaneID)
     }
 
     /// Updates layout tree for the tab with observable publication.
@@ -527,11 +754,15 @@ final class WorkspaceWindowModel: ObservableObject {
 
     /// The last tab belongs to the native window close path. This method only
     /// removes a tab after its draft and PDF changes have been resolved.
+    ///
+    /// Only resources losing their final Pane are required to be clean: a
+    /// resource still leased from another tab keeps its dirty state, pending
+    /// autosave, and undo history for the remaining panes.
     @discardableResult
     func closeTab(tabID: UUID) -> Bool {
         guard let session = sessions[tabID],
               !session.hasUncommittedChanges,
-              !session.hasUnsavedDocumentChanges,
+              !resourceSessionsLosingFinalPane(in: tabID).contains(where: { $0.hasUnsavedChanges }),
               state.tabs.count > 1,
               state.close(tabID: tabID) != nil
         else { return false }
@@ -542,7 +773,9 @@ final class WorkspaceWindowModel: ObservableObject {
             paneSession.paneModel.close()
         }
         for resourceSession in session.uniqueResourceSessions {
-            resourceSession.close()
+            if resourceSession.activeLeaseCount == 0 {
+                resourceSession.close()
+            }
         }
         objectWillChange.send()
         return true
@@ -559,8 +792,11 @@ final class WorkspaceWindowModel: ObservableObject {
 
     @discardableResult
     func discardDocumentChanges(tabID: UUID) -> Bool {
-        guard let session = sessions[tabID] else { return false }
-        for resourceSession in session.uniqueResourceSessions {
+        guard sessions[tabID] != nil else { return false }
+        // "Don't Save" resolves the documents this tab is the final reference
+        // for. A shared resource is still owned by panes in other tabs, so its
+        // dirty state, pending autosave, and undo history stay intact.
+        for resourceSession in resourceSessionsLosingFinalPane(in: tabID) {
             resourceSession.abandonUnsavedChanges()
         }
         return true
