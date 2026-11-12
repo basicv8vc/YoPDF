@@ -7,6 +7,7 @@
 //
 
 import AppKit
+import Combine
 import PDFKit
 import XCTest
 @testable import YoPDFCore
@@ -368,6 +369,409 @@ final class MultiPaneWorkspaceTests: XCTestCase {
 
         // Now Pane A can be closed cleanly
         XCTAssertTrue(try workspace.closePane(paneID: paneA))
+
+        workspace.closeAllSessions()
+    }
+
+    // MARK: - 8. P1-1 Regression Tests: Preserve All Pane Drafts During Close and Quit
+
+    func testSaveAllCommitsDraftWhenActivePaneIsCleanAndInactivePaneIsDirty() throws {
+        let fixtureURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 5, named: "pane-draft-inactive")
+        defer {
+            try? FileManager.default.removeItem(at: fixtureURL.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        guard case .opened = workspace.open(fixtureURL) else {
+            return XCTFail("Failed to open fixture PDF")
+        }
+
+        let tab = workspace.activeTab
+        let paneA = tab.activePaneID
+        let paneB = try workspace.splitActivePane(direction: .right)
+
+        guard let sessionA = tab.paneSessions[paneA],
+              let sessionB = tab.paneSessions[paneB],
+              let page0 = sessionA.resourceSession.document?.page(at: 0),
+              let draftA = tab.model(for: sessionA).pageNoteDraft(at: CGPoint(x: 120, y: 120), on: page0)
+        else {
+            return XCTFail("Could not create note draft for Pane A")
+        }
+
+        // Active pane is Pane B (clean)
+        XCTAssertEqual(tab.activePaneID, paneB)
+        XCTAssertFalse(sessionB.paneModel.noteComposerStore.hasUncommittedChanges)
+        XCTAssertFalse(tab.composerStore.hasUncommittedChanges)
+
+        // Create uncommitted draft in inactive Pane A
+        XCTAssertTrue(sessionA.paneModel.noteComposerStore.begin(
+            mode: .create(draftA),
+            anchorRect: .zero,
+            pageLabel: "1",
+            excerpt: nil,
+            contents: "",
+            paper: .honey
+        ))
+        sessionA.paneModel.noteComposerStore.session?.contents = "Draft from inactive Pane A"
+
+        XCTAssertTrue(sessionA.paneModel.noteComposerStore.hasUncommittedChanges)
+        XCTAssertTrue(tab.hasUncommittedChanges)
+        // Active pane's composerStore remains clean
+        XCTAssertFalse(tab.composerStore.hasUncommittedChanges)
+
+        // Save All must commit Pane A's draft even though active pane is clean
+        let result = workspace.saveAllWorkspaceDrafts()
+        guard case .success = result else {
+            return XCTFail("saveAllWorkspaceDrafts should succeed")
+        }
+
+        XCTAssertFalse(sessionA.paneModel.noteComposerStore.hasUncommittedChanges)
+        XCTAssertFalse(tab.hasUncommittedChanges)
+
+        // Verify note marker was added to shared document
+        XCTAssertFalse(sessionB.resourceSession.noteMarkers.isEmpty)
+        XCTAssertTrue(page0.annotations.contains(where: { $0.contents == "Draft from inactive Pane A" }))
+
+        workspace.closeAllSessions()
+    }
+
+    func testSaveAllCommitsDraftsWhenMultiplePanesAreDirty() throws {
+        let fixtureURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 5, named: "pane-draft-multiple")
+        defer {
+            try? FileManager.default.removeItem(at: fixtureURL.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        guard case .opened = workspace.open(fixtureURL) else {
+            return XCTFail("Failed to open fixture PDF")
+        }
+
+        let tab = workspace.activeTab
+        let paneA = tab.activePaneID
+        let paneB = try workspace.splitActivePane(direction: .right)
+
+        guard let sessionA = tab.paneSessions[paneA],
+              let sessionB = tab.paneSessions[paneB],
+              let page0 = sessionA.resourceSession.document?.page(at: 0),
+              let draftA = tab.model(for: sessionA).pageNoteDraft(at: CGPoint(x: 100, y: 100), on: page0),
+              let draftB = tab.model(for: sessionB).pageNoteDraft(at: CGPoint(x: 200, y: 200), on: page0)
+        else {
+            return XCTFail("Could not create note drafts")
+        }
+
+        // Pane A dirty
+        XCTAssertTrue(sessionA.paneModel.noteComposerStore.begin(
+            mode: .create(draftA),
+            anchorRect: .zero,
+            pageLabel: "1",
+            excerpt: nil,
+            contents: "",
+            paper: .honey
+        ))
+        sessionA.paneModel.noteComposerStore.session?.contents = "Draft text from Pane A"
+
+        // Pane B dirty
+        XCTAssertTrue(sessionB.paneModel.noteComposerStore.begin(
+            mode: .create(draftB),
+            anchorRect: .zero,
+            pageLabel: "1",
+            excerpt: nil,
+            contents: "",
+            paper: .lavender
+        ))
+        sessionB.paneModel.noteComposerStore.session?.contents = "Draft text from Pane B"
+
+        XCTAssertTrue(sessionA.paneModel.noteComposerStore.hasUncommittedChanges)
+        XCTAssertTrue(sessionB.paneModel.noteComposerStore.hasUncommittedChanges)
+
+        // Save all workspace drafts must commit both
+        let result = workspace.saveAllWorkspaceDrafts()
+        guard case .success = result else {
+            return XCTFail("Expected successful commit of both drafts")
+        }
+
+        XCTAssertFalse(sessionA.paneModel.noteComposerStore.hasUncommittedChanges)
+        XCTAssertFalse(sessionB.paneModel.noteComposerStore.hasUncommittedChanges)
+        XCTAssertFalse(tab.hasUncommittedChanges)
+
+        // Verify both notes are in the shared document
+        let markers = sessionA.resourceSession.noteMarkers
+        XCTAssertTrue(markers.contains(where: { $0.threadContents.contains("Draft text from Pane A") }))
+        XCTAssertTrue(markers.contains(where: { $0.threadContents.contains("Draft text from Pane B") }))
+
+        workspace.closeAllSessions()
+    }
+
+    func testOneDraftCommitFailsAbortsClosingAndPreservesDraft() throws {
+        let fixtureURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 5, named: "pane-draft-fail")
+        defer {
+            try? FileManager.default.removeItem(at: fixtureURL.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        guard case .opened = workspace.open(fixtureURL) else {
+            return XCTFail("Failed to open fixture PDF")
+        }
+
+        let tab = workspace.activeTab
+        let paneA = tab.activePaneID
+        let paneB = try workspace.splitActivePane(direction: .right)
+
+        guard let sessionA = tab.paneSessions[paneA],
+              let sessionB = tab.paneSessions[paneB],
+              let page0 = sessionA.resourceSession.document?.page(at: 0),
+              let draftA = tab.model(for: sessionA).pageNoteDraft(at: CGPoint(x: 100, y: 100), on: page0)
+        else {
+            return XCTFail("Could not create note drafts")
+        }
+
+        // Commit one initial note first so we can edit it
+        let initialDraft = try XCTUnwrap(tab.model(for: sessionA).pageNoteDraft(at: CGPoint(x: 200, y: 200), on: page0))
+        XCTAssertTrue(sessionA.paneModel.noteComposerStore.begin(
+            mode: .create(initialDraft),
+            anchorRect: .zero,
+            pageLabel: "1",
+            excerpt: nil,
+            contents: "Existing note",
+            paper: .honey
+        ))
+        guard case let .success(initialNote) = sessionA.paneModel.noteComposerStore.commit(using: sessionA.paneModel) else {
+            return XCTFail("Failed to commit initial note")
+        }
+
+        // In Pane B: Edit the existing note and clear its body (emptyContents error on resolve)
+        XCTAssertTrue(sessionB.paneModel.noteComposerStore.begin(
+            mode: .edit(initialNote),
+            anchorRect: .zero,
+            pageLabel: "1",
+            excerpt: nil,
+            contents: "Existing note",
+            paper: .honey
+        ))
+        sessionB.paneModel.noteComposerStore.session?.contents = "   " // blank string in edit mode
+
+        // In Pane A: Valid draft
+        XCTAssertTrue(sessionA.paneModel.noteComposerStore.begin(
+            mode: .create(draftA),
+            anchorRect: .zero,
+            pageLabel: "1",
+            excerpt: nil,
+            contents: "",
+            paper: .mint
+        ))
+        sessionA.paneModel.noteComposerStore.session?.contents = "Valid note A"
+
+        // Save All must fail because Pane B has empty edit
+        let result = workspace.saveAllWorkspaceDrafts()
+        guard case let .failure(error) = result else {
+            return XCTFail("Expected failure due to emptyContents in edit mode")
+        }
+        XCTAssertEqual(error, .emptyContents)
+
+        // Failed draft in Pane B must remain available and uncommitted
+        XCTAssertTrue(sessionB.paneModel.noteComposerStore.hasUncommittedChanges)
+        XCTAssertNotNil(sessionB.paneModel.noteComposerStore.session)
+
+        workspace.closeAllSessions()
+    }
+
+    func testTabCloseWithInactiveDirtyPaneProtectsDraftAndDiscardsProperly() throws {
+        let firstURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 5, named: "tab-close-dirty-first")
+        let secondURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 5, named: "tab-close-dirty-second")
+        defer {
+            try? FileManager.default.removeItem(at: firstURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: secondURL.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        guard case let .opened(firstTabID) = workspace.open(firstURL) else {
+            return XCTFail("Failed to open first tab")
+        }
+
+        // Split first tab into Pane A and Pane B (Pane B is active)
+        let tab1 = workspace.session(tabID: firstTabID)!
+        let paneA = tab1.activePaneID
+        let paneB = try tab1.split(direction: .right)
+        XCTAssertEqual(tab1.activePaneID, paneB)
+
+        // Put uncommitted draft in inactive Pane A
+        let sessionA = tab1.paneSessions[paneA]!
+        let page0 = sessionA.resourceSession.document!.page(at: 0)!
+        let draftA = tab1.model(for: sessionA).pageNoteDraft(at: CGPoint(x: 100, y: 100), on: page0)!
+        XCTAssertTrue(sessionA.paneModel.noteComposerStore.begin(
+            mode: .create(draftA),
+            anchorRect: .zero,
+            pageLabel: "1",
+            excerpt: nil,
+            contents: "",
+            paper: .honey
+        ))
+        sessionA.paneModel.noteComposerStore.session?.contents = "Protected draft in inactive pane"
+
+        // Open second tab so first tab is eligible for closing
+        guard case let .opened(secondTabID) = workspace.open(secondURL) else {
+            return XCTFail("Failed to open second tab")
+        }
+        XCTAssertEqual(workspace.activeTabID, secondTabID)
+
+        // 1. closeTabPrompt on tab1 protects the inactive dirty pane
+        let prompt = workspace.closeTabPrompt(tabID: firstTabID)
+        XCTAssertEqual(prompt, .draft)
+
+        // 2. Direct closeTab is refused while draft is dirty
+        XCTAssertFalse(workspace.closeTab(tabID: firstTabID))
+        XCTAssertEqual(workspace.tabs.count, 2)
+
+        // 3. Save Note commits draft across inactive pane
+        let saveResult = tab1.saveAllDrafts()
+        guard case .success = saveResult else {
+            return XCTFail("Failed to commit draft")
+        }
+        XCTAssertFalse(tab1.hasUncommittedChanges)
+
+        // Now discard document changes and close tab
+        _ = workspace.discardDocumentChanges(tabID: firstTabID)
+        XCTAssertTrue(workspace.closeTab(tabID: firstTabID))
+        XCTAssertEqual(workspace.tabs.count, 1)
+
+        workspace.closeAllSessions()
+    }
+
+    func testDirectCloseOfDirtyPaneCannotSilentlyDiscardDraft() throws {
+        let fixtureURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 5, named: "pane-direct-close-dirty")
+        defer {
+            try? FileManager.default.removeItem(at: fixtureURL.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        guard case .opened = workspace.open(fixtureURL) else {
+            return XCTFail("Failed to open fixture PDF")
+        }
+
+        let tab = workspace.activeTab
+        let paneA = tab.activePaneID
+        let paneB = try workspace.splitActivePane(direction: .right)
+
+        let sessionB = tab.paneSessions[paneB]!
+        let page0 = sessionB.resourceSession.document!.page(at: 0)!
+        let draftB = tab.model(for: sessionB).pageNoteDraft(at: CGPoint(x: 100, y: 100), on: page0)!
+
+        XCTAssertTrue(sessionB.paneModel.noteComposerStore.begin(
+            mode: .create(draftB),
+            anchorRect: .zero,
+            pageLabel: "1",
+            excerpt: nil,
+            contents: "",
+            paper: .honey
+        ))
+        sessionB.paneModel.noteComposerStore.session?.contents = "Critical unsaved draft in Pane B"
+
+        // 1. Direct close of dirty Pane B via tab.closePane returns false
+        XCTAssertFalse(try tab.closePane(paneB))
+        XCTAssertEqual(tab.layoutTree.paneCount, 2)
+        XCTAssertNotNil(tab.paneSessions[paneB])
+        XCTAssertEqual(sessionB.paneModel.noteComposerStore.session?.contents, "Critical unsaved draft in Pane B")
+
+        // 2. Direct close via workspace.closePane also returns false
+        XCTAssertFalse(try workspace.closePane(paneID: paneB))
+        XCTAssertEqual(tab.layoutTree.paneCount, 2)
+        XCTAssertNotNil(tab.paneSessions[paneB])
+
+        // 3. Discarding the draft explicitly allows closePane to proceed
+        sessionB.paneModel.noteComposerStore.end()
+        XCTAssertFalse(sessionB.paneModel.noteComposerStore.hasUncommittedChanges)
+
+        XCTAssertTrue(try workspace.closePane(paneID: paneB))
+        XCTAssertEqual(tab.layoutTree.paneCount, 1)
+        XCTAssertNil(tab.paneSessions[paneB])
+
+        workspace.closeAllSessions()
+    }
+
+    // MARK: - 9. P1-2 Regression Tests: Publish Divider Layout Changes
+
+    func testDraggingDividerPublishesObservableChangesAndUpdatesGeometryStably() throws {
+        let fixtureURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 5, named: "divider-drag-publish")
+        defer {
+            try? FileManager.default.removeItem(at: fixtureURL.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        guard case .opened = workspace.open(fixtureURL) else {
+            return XCTFail("Failed to open fixture PDF")
+        }
+
+        let tab = workspace.activeTab
+        let paneA = tab.activePaneID
+        let paneB = try workspace.splitActivePane(direction: .right)
+
+        let containerSize = CGSize(width: 1000, height: 800)
+        let initialFrames = tab.layoutTree.paneFrames(in: containerSize)
+        let initialWidthA = initialFrames[paneA]!.width
+        let initialWidthB = initialFrames[paneB]!.width
+        XCTAssertEqual(initialWidthA, 499.5, accuracy: 0.1)
+        XCTAssertEqual(initialWidthB, 499.5, accuracy: 0.1)
+
+        var tabChangeFired = false
+        var workspaceChangeFired = false
+        var cancellables = Set<AnyCancellable>()
+
+        tab.objectWillChange.sink {
+            tabChangeFired = true
+        }.store(in: &cancellables)
+
+        workspace.objectWillChange.sink {
+            workspaceChangeFired = true
+        }.store(in: &cancellables)
+
+        // Simulate dragging divider by +120 pt to the right
+        let availableDim = containerSize.width - LayoutPolicy.default.dividerThickness
+        let startDim = availableDim * 0.5
+        let proposedFirstDim = startDim + 120.0
+        let proposedRatio = Double(proposedFirstDim / availableDim)
+        let clampedRatio = LayoutNode.clampedRatio(
+            proposedRatio,
+            axis: .horizontal,
+            first: .leaf(paneA),
+            second: .leaf(paneB),
+            in: containerSize.width,
+            policy: .default
+        )
+
+        let updatedTree = WorkspaceLayoutTree(
+            root: .split(
+                axis: .horizontal,
+                ratio: clampedRatio,
+                first: .leaf(paneA),
+                second: .leaf(paneB)
+            )
+        )
+
+        // Apply updated layout tree
+        tab.updateLayoutTree(updatedTree)
+
+        // Verify observable changes fired
+        XCTAssertTrue(tabChangeFired, "tab.objectWillChange must fire on layout tree update")
+        XCTAssertTrue(workspaceChangeFired, "workspace.objectWillChange must fire on layout tree update")
+
+        // Verify actual pane geometry changed
+        let updatedFrames = tab.layoutTree.paneFrames(in: containerSize)
+        let newWidthA = updatedFrames[paneA]!.width
+        let newWidthB = updatedFrames[paneB]!.width
+
+        XCTAssertEqual(newWidthA, 619.5, accuracy: 0.5)
+        XCTAssertEqual(newWidthB, 379.5, accuracy: 0.5)
+        XCTAssertEqual(newWidthA + newWidthB + LayoutPolicy.default.dividerThickness, 1000.0, accuracy: 0.01)
+
+        // Verify geometry remains stable after drag ends across repeated queries
+        for _ in 1...5 {
+            let stableFrames = tab.layoutTree.paneFrames(in: containerSize)
+            XCTAssertEqual(stableFrames[paneA]!.width, newWidthA, accuracy: 0.001)
+            XCTAssertEqual(stableFrames[paneB]!.width, newWidthB, accuracy: 0.001)
+        }
+
+        // Verify Pane identities remain unchanged
+        XCTAssertEqual(tab.layoutTree.leafIDs, [paneA, paneB])
 
         workspace.closeAllSessions()
     }

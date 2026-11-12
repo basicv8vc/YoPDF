@@ -5,8 +5,8 @@ import YoPDFCore
 @MainActor
 final class WorkspaceTabSession: Identifiable, ObservableObject {
     let id: UUID
-    var layoutTree: WorkspaceLayoutTree
-    var activePaneID: PaneID
+    @Published var layoutTree: WorkspaceLayoutTree
+    @Published var activePaneID: PaneID
     private(set) var paneSessions: [PaneID: PDFPaneSession]
     let navigationState: ReaderNavigationState
 
@@ -122,6 +122,27 @@ final class WorkspaceTabSession: Identifiable, ObservableObject {
         uniqueResourceSessions.contains { $0.hasUnsavedChanges }
     }
 
+    /// Resolves and commits uncommitted drafts across all pane sessions in this tab.
+    @discardableResult
+    func saveAllDrafts() -> Result<Void, NoteEditError> {
+        for paneSession in paneSessions.values {
+            let store = paneSession.paneModel.noteComposerStore
+            guard store.hasUncommittedChanges else { continue }
+            switch store.resolvePendingDraft(using: paneSession.paneModel) {
+            case .success:
+                continue
+            case let .failure(error):
+                return .failure(error)
+            }
+        }
+        return .success(())
+    }
+
+    /// Explicitly updates layout tree with observable change notification.
+    func updateLayoutTree(_ newTree: WorkspaceLayoutTree) {
+        layoutTree = newTree
+    }
+
     func canSplit(
         paneID: PaneID? = nil,
         direction: LayoutInsertionDirection,
@@ -203,6 +224,10 @@ final class WorkspaceTabSession: Identifiable, ObservableObject {
         }
         guard let sessionToClose = paneSessions[paneID] else {
             throw LayoutMutationError.targetPaneNotFound(paneID)
+        }
+        // Direct close of a dirty pane cannot silently discard its draft
+        guard !sessionToClose.paneModel.noteComposerStore.hasUncommittedChanges else {
+            return false
         }
 
         let newTree = try layoutTree.removing(paneID)
@@ -380,6 +405,26 @@ final class WorkspaceWindowModel: ObservableObject {
         return newPaneID
     }
 
+    /// Updates layout tree for the tab with observable publication.
+    func updateLayoutTree(_ newTree: WorkspaceLayoutTree, in tabID: UUID? = nil) {
+        let targetTabID = tabID ?? activeTabID
+        guard let session = sessions[targetTabID] else { return }
+        session.updateLayoutTree(newTree)
+        objectWillChange.send()
+    }
+
+    /// Resolves and commits drafts across all panes in all tabs.
+    @discardableResult
+    func saveAllWorkspaceDrafts() -> Result<Void, NoteEditError> {
+        for tab in tabs where tab.hasUncommittedChanges {
+            let result = tab.saveAllDrafts()
+            if case .failure = result {
+                return result
+            }
+        }
+        return .success(())
+    }
+
     @discardableResult
     func closePane(
         tabID: UUID? = nil,
@@ -388,6 +433,10 @@ final class WorkspaceWindowModel: ObservableObject {
         let targetTabID = tabID ?? activeTabID
         guard let session = sessions[targetTabID] else { return false }
         let targetPaneID = paneID ?? session.activePaneID
+        guard let paneSession = session.paneSessions[targetPaneID],
+              !paneSession.paneModel.noteComposerStore.hasUncommittedChanges else {
+            return false
+        }
         let closed = try session.closePane(targetPaneID)
         if closed {
             objectWillChange.send()

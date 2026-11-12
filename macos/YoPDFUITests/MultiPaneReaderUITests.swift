@@ -56,12 +56,17 @@ final class MultiPaneReaderUITests: XCTestCase {
         let expectation = XCTNSPredicateExpectation(predicate: predicate, object: closePaneButton)
         XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: 5), .completed)
 
-        // 2. Pane B is active right after split. Navigate Pane B to Page 10 and Zoom In
+        // 2. Pane B is active right after split. Verify divider exists.
+        let verticalDivider = app.buttons["Vertical split divider"]
+        XCTAssertTrue(verticalDivider.waitForExistence(timeout: 5), "Vertical split divider should be present in 2-pane layout")
+
+        // Navigate Pane B to Page 10 and Zoom In
         for _ in 1...9 {
             app.typeKey(.downArrow, modifierFlags: .command)
         }
         app.typeKey("+", modifierFlags: .command)
         app.typeKey("+", modifierFlags: .command)
+        XCTAssertTrue(app.staticTexts["10 / 15"].waitForExistence(timeout: 5), "Active Pane B indicator should reflect Page 10 / 15")
 
         // 3. Click left half of the window to activate Pane A
         let paneACoordinate = window.coordinate(withNormalizedOffset: CGVector(dx: 0.35, dy: 0.5))
@@ -71,6 +76,7 @@ final class MultiPaneReaderUITests: XCTestCase {
         app.typeKey(.downArrow, modifierFlags: .command)
         app.typeKey(.downArrow, modifierFlags: .command)
         app.typeKey("-", modifierFlags: .command)
+        XCTAssertTrue(app.staticTexts["3 / 15"].waitForExistence(timeout: 5), "Active Pane A indicator should reflect Page 3 / 15")
 
         // 4. Capture screenshot of the active two-pane Reader
         let screenshot = window.screenshot()

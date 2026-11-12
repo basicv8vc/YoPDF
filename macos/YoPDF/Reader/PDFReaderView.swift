@@ -1437,9 +1437,15 @@ struct PDFReaderView: View {
             WorkspaceRootLayoutView(
                 layoutTree: Binding(
                     get: { tab.layoutTree },
-                    set: { tab.layoutTree = $0 }
+                    set: { newTree in
+                        tab.updateLayoutTree(newTree)
+                        workspace.objectWillChange.send()
+                    }
                 ),
-                policy: .default
+                policy: .default,
+                onRatioChanged: { newTree in
+                    workspace.objectWillChange.send()
+                }
             ) { paneID in
                 paneView(for: paneID)
             }
@@ -2213,6 +2219,15 @@ struct PDFReaderView: View {
             )
             return
         }
+        guard !workspace.tabs.contains(where: { $0.hasUncommittedChanges }) else {
+            prompt = .saveProblem(
+                title: "Couldn’t save the note",
+                message: "An uncommitted note draft remains open. Save or discard it first.",
+                offersSaveAs: false,
+                tabID: workspace.activeTabID
+            )
+            return
+        }
         guard saveWorkspaceDocuments() else { return }
         closeGuard.closeNow()
     }
@@ -2226,7 +2241,7 @@ struct PDFReaderView: View {
 
     /// Returns a user-facing failure while keeping every failed draft intact.
     private func saveWorkspaceDrafts() -> String? {
-        for tab in workspace.tabs where tab.composerStore.hasUncommittedChanges {
+        for tab in workspace.tabs where tab.hasUncommittedChanges {
             if let failure = saveDraft(in: tab) {
                 workspace.activate(tabID: tab.id)
                 return failure
@@ -2237,14 +2252,8 @@ struct PDFReaderView: View {
 
     /// "Save Note" in a draft prompt: resolves the draft so the interrupted
     /// action can run, instead of merely writing through it.
-    ///
-    /// A draft with no text cannot be written at all, and a thread draft used
-    /// to stay open after a successful write. Either one could leave a session
-    /// behind that the next note click would protect again, so the store owns
-    /// both cases and always closes the composer on success.
     private func saveDraft(in tab: WorkspaceTabSession) -> String? {
-        guard tab.composerStore.hasUncommittedChanges else { return nil }
-        switch tab.composerStore.resolvePendingDraft(using: tab.model) {
+        switch tab.saveAllDrafts() {
         case .success:
             return nil
         case let .failure(error):
@@ -2255,9 +2264,12 @@ struct PDFReaderView: View {
     /// Saves every PDF in place. A failed, conflicting, or uncertain result
     /// stops the close and leaves the remaining sessions available.
     private func saveWorkspaceDocuments() -> Bool {
-        for tab in workspace.tabs where tab.model.hasUnsavedChanges {
+        for tab in workspace.tabs where tab.hasUnsavedDocumentChanges {
             workspace.activate(tabID: tab.id)
-            guard present(tab.model.save(), for: tab.id) else { return false }
+            for resourceSession in tab.uniqueResourceSessions where resourceSession.hasUnsavedChanges {
+                let outcome = resourceSession.save()
+                guard present(outcome, for: tab.id) else { return false }
+            }
         }
         return true
     }
@@ -2359,8 +2371,8 @@ struct PDFReaderView: View {
         case .endedNow:
             if case let .closePane(paneID) = action {
                 tab.paneSessions[paneID]?.paneModel.noteComposerStore.end()
-            } else {
-                session(for: action)?.composerStore.end()
+            } else if let target = session(for: action) {
+                _ = workspace.discardDraft(tabID: target.id)
             }
             proceed(afterDraft: action)
         case let .deferredUntilQuitCommit(need):
@@ -2376,7 +2388,12 @@ struct PDFReaderView: View {
         // the popover on its way in. Put it back: the draft is still there.
         if let target = session(for: action) {
             workspace.activate(tabID: target.id)
-            if target.composerStore.hasSession { target.composerStore.isPresented = true }
+            for paneSession in target.paneSessions.values {
+                let store = paneSession.paneModel.noteComposerStore
+                if store.hasSession {
+                    store.isPresented = true
+                }
+            }
         }
         finishFinderOpenRequestIfResolved()
     }
@@ -2387,9 +2404,15 @@ struct PDFReaderView: View {
     /// interrupted still has to go through the ordinary unsaved-changes prompt —
     /// "Save Note" is not "the file is saved".
     private func proceed(afterDraft action: PendingAction) {
+        let hasChanges: Bool
+        if let target = session(for: action) {
+            hasChanges = target.hasUnsavedDocumentChanges
+        } else {
+            hasChanges = false
+        }
         switch ReaderPromptPolicy.promptAfterDraft(
             for: action.readerAction,
-            documentHasChanges: session(for: action)?.model.hasUnsavedChanges ?? false
+            documentHasChanges: hasChanges
         ) {
         case .document:
             prompt = .unsavedChanges(action)
