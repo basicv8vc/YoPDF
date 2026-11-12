@@ -94,8 +94,11 @@ final class WorkspaceTabSession: Identifiable, ObservableObject {
         activePaneSession?.paneModel.searchSession ?? PDFSearchSession()
     }
 
+    /// Tab label: the document's file name, or the short placeholder for an
+    /// empty workspace. "New Workspace" was long enough to crowd the tab strip
+    /// next to real file names, so the placeholder is "New".
     var title: String {
-        activePaneSession?.resourceSession.fileURL?.lastPathComponent ?? "New Workspace"
+        activePaneSession?.resourceSession.fileURL?.lastPathComponent ?? "New"
     }
 
     // MARK: - Multi-Pane Mutations
