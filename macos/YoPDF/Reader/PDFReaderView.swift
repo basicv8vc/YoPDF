@@ -35,26 +35,23 @@ private struct ReaderPDFDropDestination: ViewModifier {
 private struct SinglePaneTabDraggableModifier: ViewModifier {
     let tab: WorkspaceTabSession
     let onDragStarted: (() -> Void)?
+    let onDragEnded: (() -> Void)?
 
     func body(content: Content) -> some View {
         if tab.layoutTree.paneCount == 1 {
-            content.onDrag({
-                onDragStarted?()
-                return PaneDragPayload(kind: .tab, sourceTabID: tab.id, sourcePaneID: tab.activePaneID).asItemProvider()
-            }, preview: {
-                HStack(spacing: 6) {
-                    Image(systemName: "doc.text.fill")
-                        .font(.system(size: 12))
-                        .foregroundStyle(Color.accentColor)
-                    Text(tab.title)
-                        .font(.system(size: 12, weight: .medium))
-                        .lineLimit(1)
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(.ultraThickMaterial, in: RoundedRectangle(cornerRadius: 6))
-                .shadow(color: .black.opacity(0.15), radius: 4, y: 2)
-            })
+            // The capsule is the drag source. The native drag session reports
+            // every session end, so a cancelled or rejected tab drag cannot
+            // strand the dimmed source pane or hover overlays. Plain clicks
+            // are forwarded to the Buttons underneath.
+            content.overlay {
+                PaneDragSource(
+                    payload: PaneDragPayload(kind: .tab, sourceTabID: tab.id, sourcePaneID: tab.activePaneID),
+                    previewTitle: tab.title,
+                    onDragStarted: { onDragStarted?() },
+                    onDragEnded: { onDragEnded?() },
+                    forwardsUnclaimedClicks: true
+                )
+            }
         } else {
             content
         }
@@ -75,6 +72,7 @@ private struct WorkspaceTabStrip: View {
     @ObservedObject var workspace: WorkspaceWindowModel
     let closeTab: (UUID) -> Void
     var onTabDragStarted: ((WorkspaceTabSession) -> Void)? = nil
+    var onTabDragEnded: (() -> Void)? = nil
 
     /// Layout frames of the tabs, keyed by tab ID. Reported by each tab and
     /// read only once, when a drag starts.
@@ -228,7 +226,11 @@ private struct WorkspaceTabStrip: View {
         .animation(isDragging ? nil : Self.reorderAnimation, value: dropIndex)
         .shadow(color: .black.opacity(isDragging ? 0.16 : 0), radius: 6, y: 2)
         .zIndex(isDragging ? 1 : 0)
-        .modifier(SinglePaneTabDraggableModifier(tab: tab, onDragStarted: { onTabDragStarted?(tab) }))
+        .modifier(SinglePaneTabDraggableModifier(
+            tab: tab,
+            onDragStarted: { onTabDragStarted?(tab) },
+            onDragEnded: { onTabDragEnded?() }
+        ))
     }
 
     /// Right-click counterpart of the keyboard commands. It moves the tab that
@@ -933,6 +935,9 @@ struct PDFReaderView: View {
                 closeTab: requestCloseTab,
                 onTabDragStarted: { draggedTab in
                     activeDraggedPayload = PaneDragPayload(kind: .tab, sourceTabID: draggedTab.id, sourcePaneID: draggedTab.activePaneID)
+                },
+                onTabDragEnded: {
+                    endActiveDrag()
                 }
             )
             Divider()
@@ -1528,6 +1533,9 @@ struct PDFReaderView: View {
                     dragPayload: PaneDragPayload(kind: .pane, sourceTabID: tab.id, sourcePaneID: paneID),
                     onDragStarted: {
                         activeDraggedPayload = PaneDragPayload(kind: .pane, sourceTabID: tab.id, sourcePaneID: paneID)
+                    },
+                    onDragEnded: {
+                        endActiveDrag()
                     }
                 )
 
@@ -1650,7 +1658,7 @@ struct PDFReaderView: View {
                         containerSize: paneGeometry.size,
                         currentHoverDirection: paneHoverStates[paneID]?.direction,
                         validateDrop: { direction in
-                            validateDrop(on: paneID, direction: direction, in: paneGeometry.size)
+                            validateDrop(on: paneID, direction: direction)
                         },
                         onHoverChanged: { hover in
                             paneHoverStates[paneID] = hover
@@ -1668,7 +1676,29 @@ struct PDFReaderView: View {
 
     // MARK: - Drag & Drop Handling
 
-    private func validateDrop(on targetPaneID: PaneID, direction: LayoutInsertionDirection, in size: CGSize) -> (isValid: Bool, feedback: String) {
+    /// Restores the UI after a drag session ends for any reason. The native
+    /// `NSDraggingSource` drag-ended callback runs this for successful drops,
+    /// rejected drops, Esc cancellations, and releases outside every target,
+    /// so the source pane opacity and hover overlays cannot get stranded.
+    private func endActiveDrag() {
+        activeDraggedPayload = nil
+        paneHoverStates.removeAll()
+    }
+
+    /// Validates a prospective drop the same way the commit path will.
+    ///
+    /// All layout geometry is evaluated against the root Workspace content
+    /// size (`currentContentSize`), never the target Pane's local dimensions.
+    /// `WorkspaceLayoutTree.canMove` / `canInsert` interpret `availableSize` as
+    /// the root container, so passing a pane's local size would reject valid
+    /// four-pane reorders. The commit calls (`movePane`, `openPDFInSplit`)
+    /// already validate with `currentContentSize`; this keeps the preview
+    /// consistent with them.
+    private func validateDrop(on targetPaneID: PaneID, direction: LayoutInsertionDirection) -> (isValid: Bool, feedback: String) {
+        guard let rootSize = currentContentSize else {
+            return (false, "Workspace layout is not ready")
+        }
+
         let isIntraTabMove: Bool
         if let payload = activeDraggedPayload,
            payload.sourceTabID == tab.id,
@@ -1685,29 +1715,35 @@ struct PDFReaderView: View {
             guard let sourceID = activeDraggedPayload?.sourcePaneID else {
                 return (false, "Invalid drag source")
             }
-            guard tab.layoutTree.canMove(sourceID, adjacentTo: targetPaneID, direction: direction, policy: .default, availableSize: size) else {
+            guard tab.layoutTree.canMove(sourceID, adjacentTo: targetPaneID, direction: direction, policy: .default, availableSize: rootSize) else {
                 return (false, "Pane is too small to split \(direction.rawValue)")
             }
             return (true, "")
         } else {
+            // Mirror `WorkspaceLayoutTree.canInsert`, which is the exact check
+            // the commit path runs before mutating the layout.
             if tab.layoutTree.paneCount >= LayoutPolicy.default.maxPanes {
                 return (false, "Maximum \(LayoutPolicy.default.maxPanes) panes limit reached")
+            }
+            let frames = tab.layoutTree.paneFrames(in: rootSize, policy: .default)
+            guard let targetFrame = frames[targetPaneID] else {
+                return (false, "Invalid drop target")
             }
             switch direction.axis {
             case .horizontal:
                 let requiredWidth = LayoutPolicy.default.minimumLeafWidth * 2 + LayoutPolicy.default.dividerThickness
-                if size.width < requiredWidth {
+                if targetFrame.width < requiredWidth {
                     return (false, "Width too narrow to split")
                 }
-                if size.height < LayoutPolicy.default.minimumLeafHeight {
+                if targetFrame.height < LayoutPolicy.default.minimumLeafHeight {
                     return (false, "Height too short to split")
                 }
             case .vertical:
                 let requiredHeight = LayoutPolicy.default.minimumLeafHeight * 2 + LayoutPolicy.default.dividerThickness
-                if size.height < requiredHeight {
+                if targetFrame.height < requiredHeight {
                     return (false, "Height too short to split")
                 }
-                if size.width < LayoutPolicy.default.minimumLeafWidth {
+                if targetFrame.width < LayoutPolicy.default.minimumLeafWidth {
                     return (false, "Width too narrow to split")
                 }
             }

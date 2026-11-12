@@ -361,12 +361,25 @@ final class WorkspaceWindowModel: ObservableObject {
         sessions[tabID]
     }
 
+    /// Resource sessions whose pane leases all live inside `tabID`.
+    ///
+    /// Closing the tab releases those leases, so these are the only resources
+    /// whose document state the close may prompt for, discard, or destroy.
+    /// A resource that is still leased by a pane in another tab survives the
+    /// close: its dirty state, pending autosave, and markup undo history must
+    /// stay untouched for the remaining panes.
+    private func resourceSessionsLosingFinalPane(in tabID: UUID) -> [PDFResourceSession] {
+        guard let session = sessions[tabID] else { return [] }
+        let tabPaneIDs = Set(session.paneSessions.keys)
+        return session.uniqueResourceSessions.filter { $0.activePaneIDs.isSubset(of: tabPaneIDs) }
+    }
+
     func closeTabPrompt(tabID: UUID) -> ReaderPrompt? {
         guard let session = sessions[tabID] else { return nil }
         return ReaderPromptPolicy.prompt(
             for: .closeTab,
             draftHasChanges: session.hasUncommittedChanges,
-            documentHasChanges: session.hasUnsavedDocumentChanges
+            documentHasChanges: resourceSessionsLosingFinalPane(in: tabID).contains { $0.hasUnsavedChanges }
         )
     }
 
@@ -741,11 +754,15 @@ final class WorkspaceWindowModel: ObservableObject {
 
     /// The last tab belongs to the native window close path. This method only
     /// removes a tab after its draft and PDF changes have been resolved.
+    ///
+    /// Only resources losing their final Pane are required to be clean: a
+    /// resource still leased from another tab keeps its dirty state, pending
+    /// autosave, and undo history for the remaining panes.
     @discardableResult
     func closeTab(tabID: UUID) -> Bool {
         guard let session = sessions[tabID],
               !session.hasUncommittedChanges,
-              !session.hasUnsavedDocumentChanges,
+              !resourceSessionsLosingFinalPane(in: tabID).contains(where: { $0.hasUnsavedChanges }),
               state.tabs.count > 1,
               state.close(tabID: tabID) != nil
         else { return false }
@@ -775,8 +792,11 @@ final class WorkspaceWindowModel: ObservableObject {
 
     @discardableResult
     func discardDocumentChanges(tabID: UUID) -> Bool {
-        guard let session = sessions[tabID] else { return false }
-        for resourceSession in session.uniqueResourceSessions {
+        guard sessions[tabID] != nil else { return false }
+        // "Don't Save" resolves the documents this tab is the final reference
+        // for. A shared resource is still owned by panes in other tabs, so its
+        // dirty state, pending autosave, and undo history stay intact.
+        for resourceSession in resourceSessionsLosingFinalPane(in: tabID) {
             resourceSession.abandonUnsavedChanges()
         }
         return true

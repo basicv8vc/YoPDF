@@ -771,6 +771,100 @@ final class PaneDragDropTests: XCTestCase {
         workspace.closeAllSessions()
     }
 
+    // MARK: - 13b. Regression: Closing one Tab keeps a shared dirty document intact (CTO P1-1)
+
+    func testClosingTabWithSharedDirtyDocumentPreservesStateForRemainingTab() throws {
+        let fixtureURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 6, named: "shared-dirty-close")
+        defer {
+            try? FileManager.default.removeItem(at: fixtureURL.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        guard case let .opened(tabAID) = workspace.open(fixtureURL) else {
+            return XCTFail("Failed to open the PDF in Tab A")
+        }
+
+        let tabA = try XCTUnwrap(workspace.session(tabID: tabAID))
+        let paneA = tabA.activePaneID
+        let resource = try XCTUnwrap(tabA.paneSessions[paneA]?.resourceSession)
+
+        // Long debounce so the pending autosave cannot fire mid-test.
+        resource.autoSaveDebounceNanoseconds = 60_000_000_000
+
+        // Establish dirty state, annotation content, undo history, and a
+        // pending autosave on the shared document.
+        let doc = try XCTUnwrap(resource.document)
+        let page0 = try XCTUnwrap(doc.page(at: 0))
+        let selection = try XCTUnwrap(doc.selection(
+            from: page0,
+            atCharacterIndex: 0,
+            to: page0,
+            atCharacterIndex: 5
+        ))
+        tabA.model.updateSelection(selection)
+        XCTAssertNotNil(tabA.model.addMarkup(.highlight))
+        XCTAssertTrue(resource.hasUnsavedChanges)
+        XCTAssertTrue(resource.canUndoMarkup)
+        XCTAssertEqual(resource.autoSaveStatus, .pending)
+        let annotationCountAfterEdit = page0.annotations.count
+        XCTAssertGreaterThan(annotationCountAfterEdit, 0)
+        let annotationRevisionAfterEdit = resource.annotationRevision
+
+        // Tab B shares the exact same PDFResourceSession.
+        let tabBID = workspace.createTab()
+        let tabB = try XCTUnwrap(workspace.session(tabID: tabBID))
+        let dropResult = workspace.openPDFInSplit(
+            url: fixtureURL,
+            in: tabBID,
+            adjacentTo: tabB.activePaneID,
+            direction: .right
+        )
+        guard case let .success(paneBShared) = dropResult else {
+            return XCTFail("Failed to share the document into Tab B")
+        }
+        let sessionB = try XCTUnwrap(tabB.paneSessions[paneBShared])
+        XCTAssertTrue(sessionB.resourceSession === resource)
+        XCTAssertEqual(resource.activeLeaseCount, 2)
+
+        // Tab A is not the document's final Pane reference, so closing it must
+        // not raise the Save / Don't Save / Cancel document prompt...
+        XCTAssertEqual(workspace.closeTabPrompt(tabID: tabAID), ReaderPrompt.none)
+
+        // ...and even an explicit discard request must leave the shared
+        // resource's dirty state, pending autosave, and undo history alone.
+        XCTAssertTrue(workspace.discardDocumentChanges(tabID: tabAID))
+        XCTAssertTrue(resource.hasUnsavedChanges)
+        XCTAssertEqual(resource.autoSaveStatus, .pending)
+        XCTAssertTrue(resource.canUndoMarkup)
+
+        XCTAssertTrue(workspace.closeTab(tabID: tabAID))
+        XCTAssertNil(workspace.session(tabID: tabAID))
+
+        // Tab B remains loaded and dirty with its annotation and undo history.
+        XCTAssertNotNil(workspace.session(tabID: tabBID))
+        XCTAssertTrue(sessionB.resourceSession === resource)
+        XCTAssertTrue(resource.isLoaded)
+        XCTAssertEqual(resource.document?.pageCount, 6)
+        XCTAssertTrue(resource.hasUnsavedChanges)
+        XCTAssertEqual(resource.autoSaveStatus, .pending, "Closing Tab A must not cancel the pending autosave")
+        XCTAssertEqual(resource.annotationRevision, annotationRevisionAfterEdit)
+        XCTAssertEqual(page0.annotations.count, annotationCountAfterEdit)
+        XCTAssertTrue(resource.canUndoMarkup)
+
+        // Undo and Redo still operate on the shared document.
+        XCTAssertTrue(tabB.model.undoMarkup())
+        XCTAssertTrue(tabB.model.canRedoMarkup)
+        XCTAssertTrue(tabB.model.redoMarkup())
+        XCTAssertTrue(resource.hasUnsavedChanges)
+
+        // Tab B can still save the shared document.
+        let outcome = tabB.model.save()
+        XCTAssertEqual(outcome, .saved)
+        XCTAssertFalse(resource.hasUnsavedChanges)
+
+        workspace.closeAllSessions()
+    }
+
     // MARK: - 14. Regression: Correct Finder Drop Operation Selection (CTO P1)
 
     func testDropOperationSelectionForInternalMovesExternalCopiesAndInvalid() {
@@ -1033,6 +1127,76 @@ final class PaneDragDropTests: XCTestCase {
         workspace.closeAllSessions()
     }
 
+    // MARK: - 17b. Regression: Four-Pane validation uses the root Workspace size (CTO P1-3)
+
+    func testIntraTabReorderValidationUsesRootWorkspaceContentSize() throws {
+        let fixtureURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 8, named: "four-pane-geometry")
+        defer {
+            try? FileManager.default.removeItem(at: fixtureURL.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        guard case let .opened(tabID) = workspace.open(fixtureURL) else {
+            return XCTFail("Failed to open fixture PDF")
+        }
+
+        let tab = try XCTUnwrap(workspace.session(tabID: tabID))
+
+        // Build a 2x2 four-pane grid:
+        //   split(H, split(V, p1, p3), split(V, p2, p4))
+        let p1 = tab.activePaneID
+        let p2 = try tab.split(direction: .right)
+        tab.activePaneID = p1
+        let p3 = try tab.split(direction: .bottom)
+        tab.activePaneID = p2
+        let p4 = try tab.split(direction: .bottom)
+        XCTAssertEqual(tab.layoutTree.paneCount, 4)
+
+        // A realistic workspace content size for a desktop reader window.
+        let rootSize = CGSize(width: 1440, height: 900)
+
+        // A valid intra-tab reorder must validate when the root Workspace
+        // content size is used, which is what the preview path now passes to
+        // canMove and what the commit path validates with.
+        XCTAssertTrue(tab.layoutTree.canMove(
+            p1,
+            adjacentTo: p2,
+            direction: .right,
+            policy: .default,
+            availableSize: rootSize
+        ))
+
+        // Passing the target Pane's local dimensions as the root layout size —
+        // what the preview path did before the fix — makes the tree scale its
+        // frames into the pane's own slot and falsely refuse the reorder.
+        let paneLocalSize = try XCTUnwrap(tab.layoutTree.paneFrames(in: rootSize, policy: .default)[p2]).size
+        XCTAssertFalse(tab.layoutTree.canMove(
+            p1,
+            adjacentTo: p2,
+            direction: .right,
+            policy: .default,
+            availableSize: paneLocalSize
+        ))
+
+        // The commit with the root size must succeed and keep four panes.
+        let movedID = try workspace.movePane(
+            sourceTabID: tabID,
+            paneID: p1,
+            toDestinationTabID: tabID,
+            adjacentTo: p2,
+            direction: .right,
+            availableSize: rootSize
+        )
+        XCTAssertEqual(movedID, p1)
+        XCTAssertEqual(tab.layoutTree.paneCount, 4)
+        XCTAssertTrue(tab.layoutTree.contains(p1))
+        XCTAssertTrue(tab.layoutTree.contains(p2))
+        XCTAssertTrue(tab.layoutTree.contains(p3))
+        XCTAssertTrue(tab.layoutTree.contains(p4))
+
+        workspace.closeAllSessions()
+    }
+
     // MARK: - 18. Directional Hysteresis Prevents Zone Boundary Jitter (UX Polish Item 2)
 
     func testDirectionalHysteresisPreventsBoundaryJitter() {
@@ -1053,5 +1217,90 @@ final class PaneDragDropTests: XCTestCase {
         // Biased top is 0.200, but nLeft is 0.125 -> clearly switches to .left!
         let deepLeftDir = LayoutInsertionDirection.direction(for: CGPoint(x: 50, y: 100), in: size, previousDirection: .top, hysteresis: 0.05)
         XCTAssertEqual(deepLeftDir, .left)
+    }
+
+    // MARK: - 19. Regression: Drag-ended lifecycle cleanup (CTO P1-2)
+
+    /// The drag-ended lifecycle callback must restore visual state for every
+    /// session end (drop, rejection, Esc, release outside), and the trailing
+    /// mouse-up of a finished drag must never fire a stale click.
+    func testDragSessionEndRestoresStateAndSuppressesStaleClick() {
+        let source = PaneDragSourceView(frame: NSRect(x: 0, y: 0, width: 20, height: 20))
+        var dragStartedCount = 0
+        var dragEndedCount = 0
+        var clickCount = 0
+        source.onDragStarted = { dragStartedCount += 1 }
+        source.onDragEnded = { dragEndedCount += 1 }
+        source.onClick = { clickCount += 1 }
+
+        let down = NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1
+        )!
+        let up = NSEvent.mouseEvent(
+            with: .leftMouseUp,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 2,
+            clickCount: 1,
+            pressure: 0
+        )!
+
+        // A plain click fires the click handler.
+        source.mouseDown(with: down)
+        source.mouseUp(with: up)
+        XCTAssertEqual(clickCount, 1)
+
+        // The native drag-ended lifecycle callback reports the end...
+        source.mouseDown(with: down)
+        source.dragSessionDidEnd()
+        XCTAssertEqual(dragEndedCount, 1)
+
+        // ...and the trailing mouse-up of the finished drag must not click.
+        source.mouseUp(with: up)
+        XCTAssertEqual(clickCount, 1)
+    }
+
+    func testSubThresholdMovementStaysAClickAndNeverStartsASession() {
+        let source = PaneDragSourceView(frame: NSRect(x: 0, y: 0, width: 20, height: 20))
+        var dragStartedCount = 0
+        source.onDragStarted = { dragStartedCount += 1 }
+
+        let down = NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1
+        )!
+        let jiggle = NSEvent.mouseEvent(
+            with: .leftMouseDragged,
+            location: NSPoint(x: 1, y: 1),
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 2,
+            clickCount: 1,
+            pressure: 0.5
+        )!
+
+        source.mouseDown(with: down)
+        source.mouseDragged(with: jiggle)
+        XCTAssertEqual(dragStartedCount, 0, "Movement below the drag threshold must not start a session")
     }
 }

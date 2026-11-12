@@ -357,6 +357,10 @@ public struct PaneHeaderView: View {
     public let onClose: () -> Void
     public let dragPayload: PaneDragPayload
     public var onDragStarted: (() -> Void)? = nil
+    /// Called from the native `NSDraggingSource` drag-ended lifecycle callback
+    /// for every session end: successful drop, rejected drop, Esc
+    /// cancellation, or release outside every drop target.
+    public var onDragEnded: (() -> Void)? = nil
 
     @State private var isHovering: Bool = false
 
@@ -369,7 +373,8 @@ public struct PaneHeaderView: View {
         onActivate: @escaping () -> Void,
         onClose: @escaping () -> Void,
         dragPayload: PaneDragPayload,
-        onDragStarted: (() -> Void)? = nil
+        onDragStarted: (() -> Void)? = nil,
+        onDragEnded: (() -> Void)? = nil
     ) {
         self.paneID = paneID
         self.title = title
@@ -380,6 +385,7 @@ public struct PaneHeaderView: View {
         self.onClose = onClose
         self.dragPayload = dragPayload
         self.onDragStarted = onDragStarted
+        self.onDragEnded = onDragEnded
     }
 
     public var body: some View {
@@ -396,23 +402,15 @@ public struct PaneHeaderView: View {
                 .opacity(isHovering ? 1.0 : 0.45)
                 .animation(.easeInOut(duration: 0.12), value: isHovering)
                 .contentShape(Rectangle())
-                .onDrag({
-                    onDragStarted?()
-                    return dragPayload.asItemProvider()
-                }, preview: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "doc.text.fill")
-                            .font(.system(size: 12))
-                            .foregroundStyle(Color.accentColor)
-                        Text(title)
-                            .font(.system(size: 12, weight: .medium))
-                            .lineLimit(1)
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(.ultraThickMaterial, in: RoundedRectangle(cornerRadius: 6))
-                    .shadow(color: .black.opacity(0.15), radius: 4, y: 2)
-                })
+                .overlay {
+                    PaneDragSource(
+                        payload: dragPayload,
+                        previewTitle: title,
+                        onDragStarted: { onDragStarted?() },
+                        onDragEnded: { onDragEnded?() },
+                        onClick: { onActivate() }
+                    )
+                }
                 .help("Drag to move or split pane")
                 .accessibilityLabel("Drag handle for pane \(title)")
                 .accessibilityIdentifier("pane-drag-handle-\(paneID.description)")
@@ -631,5 +629,243 @@ public struct PaneDropTargetModifier: ViewModifier {
                     onPerformDrop: onPerformDrop
                 )
             )
+    }
+}
+
+// MARK: - Native Drag Source
+
+/// AppKit drag source for pane and tab payloads.
+///
+/// SwiftUI's `onDrag` never reports when a drag session ends, so a drag that
+/// was cancelled (Esc), rejected, or released outside every drop target would
+/// leave the source pane dimmed and hover overlays stuck on screen. This view
+/// starts the session natively and restores that state from
+/// `draggingSession(_:endedAt:operation:)`, the callback AppKit guarantees for
+/// every session end. No polling or custom drag tracking is involved.
+@MainActor
+final class PaneDragSourceView: NSView, NSDraggingSource {
+
+    /// Payload serialized when a drag actually starts.
+    var makePayload: () -> PaneDragPayload = {
+        PaneDragPayload(kind: .pane, sourceTabID: UUID(), sourcePaneID: nil)
+    }
+    /// Title shown on the floating drag preview pill.
+    var previewTitle: () -> String = { "" }
+    var onDragStarted: () -> Void = {}
+    var onDragEnded: () -> Void = {}
+    /// Fired for a plain left click that never became a drag. When `nil` and
+    /// `forwardsUnclaimedClicks` is set, such a click is forwarded to the
+    /// SwiftUI content underneath instead (tab capsules with Buttons).
+    var onClick: (() -> Void)?
+    var forwardsUnclaimedClicks = false
+
+    /// Movement in points before a press turns into a drag, matching the
+    /// feel of SwiftUI's `onDrag` threshold.
+    private static let dragThreshold: CGFloat = 3
+    private static let previewOffset = CGPoint(x: 12, y: 4)
+
+    private var pendingMouseDown: NSEvent?
+    private var didBeginSession = false
+    private var isForwardingClick = false
+
+    // MARK: Hit Testing
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // While forwarding a synthetic click the content underneath must win.
+        if isForwardingClick { return nil }
+        // Only left presses are claimed. Right clicks and other events fall
+        // through so context menus, hover, and scrolling keep working.
+        if NSApp.currentEvent?.type != .leftMouseDown { return nil }
+        return super.hitTest(point)
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        // A click in an inactive window should activate the window first,
+        // matching the SwiftUI behaviour this replaces.
+        false
+    }
+
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    // MARK: Mouse Tracking
+
+    override func mouseDown(with event: NSEvent) {
+        pendingMouseDown = event
+        didBeginSession = false
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard !didBeginSession, let mouseDown = pendingMouseDown else { return }
+        let start = convert(mouseDown.locationInWindow, from: nil)
+        let current = convert(event.locationInWindow, from: nil)
+        guard hypot(current.x - start.x, current.y - start.y) >= Self.dragThreshold else { return }
+        didBeginSession = true
+        beginPayloadSession(with: event, dragPoint: current)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let mouseDown = pendingMouseDown, !didBeginSession else {
+            pendingMouseDown = nil
+            return
+        }
+        pendingMouseDown = nil
+        guard bounds.contains(convert(event.locationInWindow, from: nil)) else { return }
+        if let onClick {
+            onClick()
+        } else if forwardsUnclaimedClicks {
+            deliverSyntheticClick(down: mouseDown, up: event)
+        }
+    }
+
+    private func beginPayloadSession(with event: NSEvent, dragPoint: NSPoint) {
+        let payload = makePayload()
+        let pasteboardItem = NSPasteboardItem()
+        if let data = try? JSONEncoder().encode(payload) {
+            pasteboardItem.setData(
+                data,
+                forType: NSPasteboard.PasteboardType(UTType.yoPDFPaneDrag.identifier)
+            )
+        }
+        let item = NSDraggingItem(pasteboardWriter: pasteboardItem)
+        let image = Self.previewImage(title: previewTitle())
+        // The pill floats near the pointer like a SwiftUI drag preview. The
+        // frame is in this view's coordinate system, as beginDraggingSession
+        // requires.
+        let frame = CGRect(
+            x: dragPoint.x + Self.previewOffset.x,
+            y: dragPoint.y - image.size.height / 2,
+            width: image.size.width,
+            height: image.size.height
+        )
+        item.setDraggingFrame(frame, contents: image)
+        onDragStarted()
+        let session = beginDraggingSession(with: [item], event: event, source: self)
+        session.draggingFormation = NSDraggingFormation.none
+    }
+
+    /// Forwards a plain click to the SwiftUI content underneath this overlay,
+    /// so Buttons keep their actions without any hit-testable gap.
+    private func deliverSyntheticClick(down: NSEvent, up: NSEvent) {
+        guard let contentView = window?.contentView else {
+            onClick?()
+            return
+        }
+        isForwardingClick = true
+        defer { isForwardingClick = false }
+        // `hitTest` points are in the superview's coordinate system, which for
+        // the content view is the window base coordinate space.
+        guard let target = contentView.hitTest(down.locationInWindow), target !== self else {
+            onClick?()
+            return
+        }
+        target.mouseDown(with: down)
+        target.mouseUp(with: up)
+    }
+
+    /// Restores visual state after any drag session end. Also invoked by
+    /// `draggingSession(_:endedAt:operation:)`; exposed for model-level tests.
+    func dragSessionDidEnd() {
+        pendingMouseDown = nil
+        didBeginSession = false
+        onDragEnded()
+    }
+
+    // MARK: NSDraggingSource
+
+    func draggingSession(
+        _ session: NSDraggingSession,
+        sourceOperationMaskFor context: NSDraggingContext
+    ) -> NSDragOperation {
+        context == .outsideApplication ? [] : [.move, .copy]
+    }
+
+    func draggingSession(
+        _ session: NSDraggingSession,
+        endedAt screenPoint: NSPoint,
+        operation: NSDragOperation
+    ) {
+        // AppKit fires this for every session end: successful drop, rejected
+        // drop, Esc cancellation, or release outside every target.
+        dragSessionDidEnd()
+    }
+
+    func ignoreModifierKeys(for session: NSDraggingSession) -> Bool {
+        true
+    }
+
+    // MARK: Preview
+
+    private static func previewImage(title: String) -> NSImage {
+        let iconSize = NSSize(width: 12, height: 12)
+        let font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        let displayTitle = title.count > 28 ? String(title.prefix(28)) + "…" : title
+        let titleString = NSAttributedString(
+            string: displayTitle,
+            attributes: [
+                .font: font,
+                .foregroundColor: NSColor.labelColor
+            ]
+        )
+        let spacing: CGFloat = 6
+        let paddingX: CGFloat = 10
+        let paddingY: CGFloat = 6
+        let titleSize = titleString.size()
+        let width = ceil(paddingX * 2 + iconSize.width + spacing + titleSize.width)
+        let height = ceil(paddingY * 2 + max(iconSize.height, titleSize.height))
+        let size = NSSize(width: max(width, 40), height: max(height, 24))
+
+        return NSImage(size: size, flipped: false) { rect in
+            let pillRect = rect.insetBy(dx: 0.5, dy: 0.5)
+            let path = NSBezierPath(roundedRect: pillRect, xRadius: 6, yRadius: 6)
+            NSColor.windowBackgroundColor.withAlphaComponent(0.97).setFill()
+            path.fill()
+            NSColor.separatorColor.setStroke()
+            path.lineWidth = 1
+            path.stroke()
+
+            if let icon = NSImage(
+                systemSymbolName: "doc.text.fill",
+                accessibilityDescription: nil
+            )?.withSymbolConfiguration(.init(paletteColors: [.controlAccentColor])) {
+                let iconRect = NSRect(
+                    x: paddingX,
+                    y: paddingY + (size.height - paddingY * 2 - iconSize.height) / 2,
+                    width: iconSize.width,
+                    height: iconSize.height
+                )
+                icon.draw(in: iconRect)
+            }
+
+            titleString.draw(
+                at: NSPoint(
+                    x: paddingX + iconSize.width + spacing,
+                    y: paddingY + (size.height - paddingY * 2 - titleSize.height) / 2
+                )
+            )
+            return true
+        }
+    }
+}
+
+/// SwiftUI wrapper hosting `PaneDragSourceView` over a drag handle or capsule.
+struct PaneDragSource: NSViewRepresentable {
+    let payload: PaneDragPayload
+    let previewTitle: String
+    let onDragStarted: () -> Void
+    let onDragEnded: () -> Void
+    var onClick: (() -> Void)? = nil
+    var forwardsUnclaimedClicks = false
+
+    func makeNSView(context: Context) -> PaneDragSourceView {
+        PaneDragSourceView()
+    }
+
+    func updateNSView(_ nsView: PaneDragSourceView, context: Context) {
+        nsView.makePayload = { payload }
+        nsView.previewTitle = { previewTitle }
+        nsView.onDragStarted = onDragStarted
+        nsView.onDragEnded = onDragEnded
+        nsView.onClick = onClick
+        nsView.forwardsUnclaimedClicks = forwardsUnclaimedClicks
     }
 }
