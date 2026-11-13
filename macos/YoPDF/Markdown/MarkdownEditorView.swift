@@ -158,6 +158,8 @@ private struct MarkdownEditorRepresentable: NSViewRepresentable {
         private var isSyncingFromModel = false
         private var isApplyingHighlighting = false
         private var pendingEditedRange: NSRange?
+        private var activeMarkedRange: NSRange?
+        private var pendingPaletteRehighlight = false
         private var lastSyncedText: String = ""
         private(set) var lastHighlightStats: MarkdownHighlightStats?
 
@@ -276,14 +278,13 @@ private struct MarkdownEditorRepresentable: NSViewRepresentable {
 
         private func syncAfterUndoOrRedoIfNeeded() {
             guard let textView else { return }
+            guard !textView.hasMarkedText() else { return }
             let updatedText = textView.string
-            guard updatedText != lastSyncedText else { return }
+            guard !Self.utf8Equal(updatedText, lastSyncedText) else { return }
             lastSyncedText = updatedText
-            if !textView.hasMarkedText() {
-                applyHighlighting(editedRange: nil)
-                updateTypingAttributes()
-            }
-            if parent.text != updatedText {
+            applyHighlighting(editedRange: nil)
+            updateTypingAttributes()
+            if !Self.utf8Equal(parent.text, updatedText) {
                 parent.text = updatedText
             }
             parent.onTextChange?(updatedText)
@@ -358,13 +359,18 @@ private struct MarkdownEditorRepresentable: NSViewRepresentable {
             textView.insertionPointColor = nextPalette.insertionPoint
 
             if paletteChanged || forceHighlight {
-                // Only update plain-text base properties when the palette actually changed,
-                // because assigning `NSTextView.font`/`textColor` resets attributes on the whole textStorage.
-                textView.font = nextPalette.bodyFont
-                textView.textColor = nextPalette.bodyText
-                textView.defaultParagraphStyle = nextPalette.defaultParagraphStyle
-                highlighter.invalidateCache()
-                applyHighlighting(editedRange: nil)
+                if textView.hasMarkedText() {
+                    pendingPaletteRehighlight = true
+                } else {
+                    // Only update plain-text base properties when the palette actually changed,
+                    // because assigning `NSTextView.font`/`textColor` resets attributes on the whole textStorage.
+                    textView.font = nextPalette.bodyFont
+                    textView.textColor = nextPalette.bodyText
+                    textView.defaultParagraphStyle = nextPalette.defaultParagraphStyle
+                    highlighter.invalidateCache()
+                    applyHighlighting(editedRange: nil)
+                    pendingPaletteRehighlight = false
+                }
             }
             updateTypingAttributes()
         }
@@ -382,11 +388,17 @@ private struct MarkdownEditorRepresentable: NSViewRepresentable {
             scrollView?.backgroundColor = nextPalette.editorBackground
             textView.backgroundColor = nextPalette.editorBackground
             textView.insertionPointColor = nextPalette.insertionPoint
-            textView.font = nextPalette.bodyFont
-            textView.textColor = nextPalette.bodyText
-            highlighter.invalidateCache()
-            applyHighlighting(editedRange: nil)
-            updateTypingAttributes()
+            if textView.hasMarkedText() {
+                pendingPaletteRehighlight = true
+            } else {
+                textView.font = nextPalette.bodyFont
+                textView.textColor = nextPalette.bodyText
+                textView.defaultParagraphStyle = nextPalette.defaultParagraphStyle
+                highlighter.invalidateCache()
+                applyHighlighting(editedRange: nil)
+                pendingPaletteRehighlight = false
+                updateTypingAttributes()
+            }
         }
 
         func handleFirstResponderChanged(_ isFocused: Bool) {
@@ -416,14 +428,38 @@ private struct MarkdownEditorRepresentable: NSViewRepresentable {
 
         func handleMarkedTextEnded(_ priorMarkedRange: NSRange) {
             guard let textView, !textView.hasMarkedText() else { return }
-            let edited = priorMarkedRange.location == NSNotFound ? textView.selectedRange() : priorMarkedRange
-            applyHighlighting(editedRange: edited)
-            updateTypingAttributes()
             let updatedText = textView.string
+            let maxLen = (updatedText as NSString).length
+            let edited = Self.mergedEditedRange(
+                pending: pendingEditedRange,
+                marked: priorMarkedRange.location == NSNotFound ? activeMarkedRange : priorMarkedRange,
+                fallback: textView.selectedRange(),
+                maxLength: maxLen
+            )
+            pendingEditedRange = nil
+            activeMarkedRange = nil
+
+            if pendingPaletteRehighlight {
+                applyPaletteBaseAttributes(to: textView, palette: currentPalette)
+                highlighter.invalidateCache()
+                applyHighlighting(editedRange: nil)
+                pendingPaletteRehighlight = false
+            } else {
+                applyHighlighting(editedRange: edited)
+            }
+            updateTypingAttributes()
+
+            let changed = !Self.utf8Equal(updatedText, lastSyncedText)
             lastSyncedText = updatedText
-            if parent.text != updatedText {
+            if !Self.utf8Equal(parent.text, updatedText) {
                 parent.text = updatedText
+            }
+            if changed {
                 parent.onTextChange?(updatedText)
+            }
+            let currentRange = textView.selectedRange()
+            if let selectionBinding = parent.selection, selectionBinding.wrappedValue != currentRange {
+                selectionBinding.wrappedValue = currentRange
             }
             attachedController?.syncStateFromHost()
         }
@@ -433,6 +469,9 @@ private struct MarkdownEditorRepresentable: NSViewRepresentable {
         func syncInitialText(_ text: String, selection: NSRange?) {
             guard let textView else { return }
             isSyncingFromModel = true
+            pendingEditedRange = nil
+            activeMarkedRange = nil
+            pendingPaletteRehighlight = false
             lastSyncedText = text
             if let textStorage = textView.textStorage {
                 isApplyingHighlighting = true
@@ -453,14 +492,17 @@ private struct MarkdownEditorRepresentable: NSViewRepresentable {
         func syncExternalTextIfNeeded(_ text: String) {
             guard let textView else { return }
             guard !textView.hasMarkedText() else { return }
-            // Never overwrite textView.string when it already matches the binding.
-            guard text != lastSyncedText, textView.string != text else {
+            // Never overwrite textView.string when exact UTF-8 bytes already match the binding.
+            guard !Self.utf8Equal(text, lastSyncedText), !Self.utf8Equal(textView.string, text) else {
                 lastSyncedText = text
                 return
             }
 
             let priorSelection = textView.selectedRange()
             isSyncingFromModel = true
+            pendingEditedRange = nil
+            activeMarkedRange = nil
+            pendingPaletteRehighlight = false
             isolatedUndoManager.removeAllActions()
             lastSyncedText = text
             if let textStorage = textView.textStorage {
@@ -508,21 +550,46 @@ private struct MarkdownEditorRepresentable: NSViewRepresentable {
         func textDidChange(_ notification: Notification) {
             guard !isSyncingFromModel, let textView else { return }
 
+            // While IME composition is active, keep marked text live in NSTextView without
+            // mutating textStorage attributes or publishing provisional text to persistence/bindings.
+            if textView.hasMarkedText() {
+                let marked = textView.markedRange()
+                if marked.location != NSNotFound {
+                    activeMarkedRange = marked
+                }
+                return
+            }
+
             let updatedText = textView.string
+            let maxLen = (updatedText as NSString).length
+            let edited = Self.mergedEditedRange(
+                pending: pendingEditedRange,
+                marked: activeMarkedRange,
+                fallback: textView.selectedRange(),
+                maxLength: maxLen
+            )
+            pendingEditedRange = nil
+            activeMarkedRange = nil
+
+            if pendingPaletteRehighlight {
+                applyPaletteBaseAttributes(to: textView, palette: currentPalette)
+                highlighter.invalidateCache()
+                applyHighlighting(editedRange: nil)
+                pendingPaletteRehighlight = false
+            } else {
+                applyHighlighting(editedRange: edited)
+            }
+            updateTypingAttributes()
+
+            let changed = !Self.utf8Equal(updatedText, lastSyncedText)
             lastSyncedText = updatedText
 
-            // Do not mutate textStorage attributes while IME composition is active!
-            if !textView.hasMarkedText() {
-                let edited = pendingEditedRange ?? textView.selectedRange()
-                pendingEditedRange = nil
-                applyHighlighting(editedRange: edited)
-                updateTypingAttributes()
-            }
-
-            if parent.text != updatedText {
+            if !Self.utf8Equal(parent.text, updatedText) {
                 parent.text = updatedText
             }
-            parent.onTextChange?(updatedText)
+            if changed {
+                parent.onTextChange?(updatedText)
+            }
 
             let currentRange = textView.selectedRange()
             if let selectionBinding = parent.selection, selectionBinding.wrappedValue != currentRange {
@@ -546,6 +613,12 @@ private struct MarkdownEditorRepresentable: NSViewRepresentable {
         }
 
         // MARK: - Highlighting & Helpers
+
+        private func applyPaletteBaseAttributes(to textView: MarkdownNSTextView, palette: MarkdownEditorPalette) {
+            textView.font = palette.bodyFont
+            textView.textColor = palette.bodyText
+            textView.defaultParagraphStyle = palette.defaultParagraphStyle
+        }
 
         private func applyHighlighting(editedRange: NSRange?) {
             guard let textView, let textStorage = textView.textStorage else { return }
@@ -579,6 +652,32 @@ private struct MarkdownEditorRepresentable: NSViewRepresentable {
             )
         }
 
+        static func utf8Equal(_ lhs: String, _ rhs: String) -> Bool {
+            lhs.utf8.elementsEqual(rhs.utf8)
+        }
+
+        static func mergedEditedRange(
+            pending: NSRange?,
+            marked: NSRange?,
+            fallback: NSRange,
+            maxLength: Int
+        ) -> NSRange {
+            let candidate: NSRange
+            switch (pending, marked) {
+            case let (p?, m?) where p.location != NSNotFound && m.location != NSNotFound:
+                let start = min(p.location, m.location)
+                let end = max(p.location + p.length, m.location + m.length)
+                candidate = NSRange(location: start, length: max(0, end - start))
+            case let (p?, _) where p.location != NSNotFound:
+                candidate = p
+            case let (_, m?) where m.location != NSNotFound:
+                candidate = m
+            default:
+                candidate = fallback
+            }
+            return clampedSelection(candidate, utf16Length: maxLength)
+        }
+
         static func clampedSelection(_ range: NSRange, utf16Length: Int) -> NSRange {
             let location = min(max(range.location, 0), max(0, utf16Length))
             let maxLength = max(0, utf16Length - location)
@@ -605,6 +704,7 @@ public final class MarkdownNSTextView: NSTextView {
     weak var coordinator: AnyObject?
 
     private let fallbackUndoManager = UndoManager()
+    private var isCommittingInsertText = false
 
     public init(engine: MarkdownTextEngine = .textKit2) {
         let textStorage = NSTextStorage()
@@ -713,11 +813,18 @@ public final class MarkdownNSTextView: NSTextView {
         pasteAsPlainText(sender)
     }
 
+    public override func insertText(_ string: Any, replacementRange: NSRange) {
+        isCommittingInsertText = true
+        defer { isCommittingInsertText = false }
+        super.insertText(string, replacementRange: replacementRange)
+    }
+
     public override func unmarkText() {
         let priorMarked = markedRange()
         super.unmarkText()
-        // When an IME cancels or commits via unmarkText without insertText, ensure highlighting catches up.
-        if !hasMarkedText() {
+        // When an IME cancels or commits via unmarkText without insertText, ensure highlighting
+        // and committed-text publication catch up without leaking during insertText's internal unmark.
+        if !isCommittingInsertText && !hasMarkedText() {
             onMarkedTextEnded?(priorMarked)
         }
     }
