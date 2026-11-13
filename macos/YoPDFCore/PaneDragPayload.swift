@@ -6,6 +6,7 @@
 //  Apache-2.0 Open Source License.
 //
 
+import AppKit
 import Foundation
 import CoreTransferable
 import UniformTypeIdentifiers
@@ -78,5 +79,33 @@ public struct PaneDropHoverState: Equatable, Sendable {
         self.direction = direction
         self.isValid = isValid
         self.feedbackMessage = feedbackMessage
+    }
+}
+
+/// Callbacks wiring a drop destination (AppKit or SwiftUI) into the pane
+/// layout model, so the destination layer only decides *where* and *what*,
+/// while the layout rules stay here.
+public struct PaneDropSink: Sendable {
+    public let validate: @Sendable (LayoutInsertionDirection) -> (isValid: Bool, feedback: String)
+    public let onHoverChanged: @Sendable (PaneDropHoverState?) -> Void
+    public let onPerformDrop: @Sendable (DropPayload, LayoutInsertionDirection) -> Bool
+
+    public init(
+        validate: @escaping @Sendable (LayoutInsertionDirection) -> (isValid: Bool, feedback: String),
+        onHoverChanged: @escaping @Sendable (PaneDropHoverState?) -> Void,
+        onPerformDrop: @escaping @Sendable (DropPayload, LayoutInsertionDirection) -> Bool
+    ) {
+        self.validate = validate
+        self.onHoverChanged = onHoverChanged
+        self.onPerformDrop = onPerformDrop
+    }
+
+    /// AppKit drag operation for a resolved payload: in-app panes move,
+    /// external files copy.
+    public func dropOperation(for payload: DropPayload) -> NSDragOperation {
+        switch payload {
+        case .pane: return [.move]
+        case .fileURL: return [.copy]
+        }
     }
 }
