@@ -55,6 +55,105 @@ public final class DocumentStore: Sendable {
             throw error
         }
     }
+
+    /// Atomically creates a brand-new file at `url` and returns an open
+    /// `DocumentSession` for it.
+    ///
+    /// Never overwrites an existing file or symlink: if anything already exists
+    /// at `url` before or during the coordinated write, this throws
+    /// `DocumentStoreError.targetExists` or `.targetAppearedDuringSave` and
+    /// leaves the existing item untouched.
+    public func create(_ url: URL, contents: Data = Data()) throws -> DocumentSession {
+        guard url.isFileURL else { throw DocumentStoreError.notAFileURL }
+
+        let lease = SecurityScopeLease(url: url, access: access)
+        do {
+            let existing = try io.status(of: url)
+            if existing.exists || existing.isSymbolicLink {
+                throw DocumentStoreError.targetExists(url)
+            }
+            try DocumentSession.validateCreatableDestination(url)
+
+            let staged = try io.createStagingFile(nextTo: url, contents: contents)
+            var committed = false
+            var keepStaging = false
+            defer {
+                if !committed && !keepStaging {
+                    try? io.removeItemIfExists(at: staged.url)
+                }
+            }
+
+            let finalURL: URL
+            do {
+                finalURL = try io.withCoordinatedWrite(at: url) { coordinatedURL in
+                    let liveStatus = try io.status(of: coordinatedURL)
+                    guard !liveStatus.exists && !liveStatus.isSymbolicLink else {
+                        throw DocumentStoreError.targetAppearedDuringSave(coordinatedURL)
+                    }
+                    do {
+                        try io.moveItem(at: staged.url, to: coordinatedURL)
+                    } catch {
+                        let stagingStillExists = (try? io.status(of: staged.url).exists) ?? true
+                        if !stagingStillExists,
+                           let created = try? io.version(of: coordinatedURL),
+                           created.contentHash == staged.contentHash {
+                            try? io.setPermissions(0o644, at: coordinatedURL)
+                            return coordinatedURL
+                        }
+                        if stagingStillExists,
+                           let targetStatus = try? io.status(of: coordinatedURL),
+                           targetStatus.exists || targetStatus.isSymbolicLink {
+                            throw DocumentStoreError.targetAppearedDuringSave(coordinatedURL)
+                        }
+                        throw error
+                    }
+                    try? io.setPermissions(0o644, at: coordinatedURL)
+                    return coordinatedURL
+                }
+            } catch {
+                if let storeError = error as? DocumentStoreError {
+                    switch storeError {
+                    case .targetAppearedDuringSave, .targetExists:
+                        throw storeError
+                    default:
+                        break
+                    }
+                }
+                let stagingStillExists = (try? io.status(of: staged.url).exists) ?? true
+                if !stagingStillExists,
+                   (try? io.version(of: url))?.contentHash == staged.contentHash {
+                    committed = true
+                    return try DocumentSession.makeCreatedSession(
+                        at: url,
+                        lease: lease,
+                        io: io,
+                        access: access
+                    )
+                }
+                if stagingStillExists,
+                   let targetStatus = try? io.status(of: url),
+                   targetStatus.exists || targetStatus.isSymbolicLink {
+                    throw DocumentStoreError.targetAppearedDuringSave(url)
+                }
+                if let storeError = error as? DocumentStoreError,
+                   case .replacementStateUncertain = storeError {
+                    keepStaging = true
+                }
+                throw error
+            }
+
+            committed = true
+            return try DocumentSession.makeCreatedSession(
+                at: finalURL,
+                lease: lease,
+                io: io,
+                access: access
+            )
+        } catch {
+            lease.release()
+            throw error
+        }
+    }
 }
 
 /// One open file, and the only owner of its security scope.
@@ -584,6 +683,15 @@ public final class DocumentSession: @unchecked Sendable {
     }
 
     private func makeSession(at url: URL, lease: SecurityScopeLease) throws -> DocumentSession {
+        try Self.makeCreatedSession(at: url, lease: lease, io: io, access: access)
+    }
+
+    static func makeCreatedSession(
+        at url: URL,
+        lease: SecurityScopeLease,
+        io: any DocumentStoreIO,
+        access: any SecurityScopeAccessing
+    ) throws -> DocumentSession {
         do {
             let version = try io.version(of: url)
             return DocumentSession(
@@ -633,7 +741,7 @@ public final class DocumentSession: @unchecked Sendable {
         guard status.isWritable else { throw DocumentStoreError.readOnly(url) }
     }
 
-    private static func validateCreatableDestination(_ destination: URL) throws {
+    static func validateCreatableDestination(_ destination: URL) throws {
         let directory = destination.deletingLastPathComponent()
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),

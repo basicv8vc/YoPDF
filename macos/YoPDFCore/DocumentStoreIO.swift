@@ -165,6 +165,10 @@ public struct SystemDocumentStoreIO: DocumentStoreIO {
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
+    static func sha256Hex(of data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
     public func readContents(of url: URL) throws -> Data {
         do {
             return try Data(contentsOf: url)
