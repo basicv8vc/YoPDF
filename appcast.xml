@@ -6,6 +6,15 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>YoPDF</title>
         <item>
+            <title>2026.11.13</title>
+            <pubDate>Fri, 13 Nov 2026 15:37:34 +0900</pubDate>
+            <link>https://github.com/basicv8vc/YoPDF/releases</link>
+            <sparkle:version>9</sparkle:version>
+            <sparkle:shortVersionString>2026.11.13</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.13/YoPDF-2026.11.13-build9-universal.dmg" length="6861844" type="application/octet-stream" sparkle:edSignature="y3s4GuuUKPcpjj75zxwUUo71dAfyLdoozzFPwIpyaUOCnH7NUlLS8exIVyXoNfmZ03f0g/4FSOY/XJkWVCrVDw=="/>
+        </item>
+        <item>
             <title>2026.11.11</title>
             <pubDate>Wed, 11 Nov 2026 12:17:07 +0900</pubDate>
             <link>https://github.com/basicv8vc/YoPDF/releases</link>
@@ -23,18 +32,9 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
             <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.8/YoPDF-2026.11.8-build7-universal.dmg" length="6483660" type="application/octet-stream" sparkle:edSignature="LTlpZdTQxnuzBk90M7Bmj0vQy0TBrEZsUUFHkdbzky07+T+fn7SRCz0IRkNtV8sW8xlAqrH10puMzwqc0LsECQ=="/>
         </item>
-        <item>
-            <title>2026.11.7</title>
-            <pubDate>Sat, 07 Nov 2026 22:17:16 +0900</pubDate>
-            <link>https://github.com/basicv8vc/YoPDF/releases</link>
-            <sparkle:version>6</sparkle:version>
-            <sparkle:shortVersionString>2026.11.7</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.7/YoPDF-2026.11.7-build6-universal.dmg" length="6304682" type="application/octet-stream" sparkle:edSignature="o1qIRRmbT1TglXIlQ5xyU/rUhL471Y55bGR7f8TWPTKpO4hEeDcLVd4Hz5Uyo4hYSEPJ+sTBk25qIrldNL5DCA=="/>
-        </item>
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: nChJM2lyHbrKEyeX13Kb38deqKDHn2QQ1SLGUcqpEW6VH9Si0xw7FS2umA5O66KhL+vn4sRm7lvYit5zmIqOBA==
-length: 2527
+edSignature: lRNhDGr10Z545531ltWE7NiX/snCxHbT8g5sOcJWn8boHJOQWE6uI1jEkq+x2hFze0VIv2dAyZ2kYDTGtHbBCQ==
+length: 2531
 -->
