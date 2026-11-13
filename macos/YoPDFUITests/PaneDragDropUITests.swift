@@ -76,7 +76,9 @@ final class PaneDragDropUITests: XCTestCase {
 
         // Drop into the lower half of the right-hand pane.
         let dropPoint = window.coordinate(withNormalizedOffset: CGVector(dx: 0.72, dy: 0.80))
-        sourceHandle.press(forDuration: 0.15, thenDragTo: dropPoint)
+        sourceHandle
+            .coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.15, thenDragTo: dropPoint)
 
         XCTAssertTrue(
             app.buttons["Horizontal split divider"].waitForExistence(timeout: 10),
@@ -102,7 +104,9 @@ final class PaneDragDropUITests: XCTestCase {
 
         // Release over the tab strip, outside every pane drop target.
         let outsidePoint = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.03))
-        sourceHandle.press(forDuration: 0.15, thenDragTo: outsidePoint)
+        sourceHandle
+            .coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.15, thenDragTo: outsidePoint)
 
         // The layout must be untouched and the panes still interactive.
         XCTAssertTrue(
