@@ -223,6 +223,9 @@ public enum PDFResourceResolution: Equatable, Sendable {
 public enum MarkdownResourceResolution: Equatable, Sendable {
     case resolved(URL, refreshedBookmark: Bool)
     case missing(lastKnownURL: URL)
+    /// The association has no security-scoped bookmark for the Markdown file
+    /// and cannot be safely restored without explicit user relinking.
+    case bookmarkMissing(lastKnownURL: URL)
 }
 
 public struct AssociationResolutionResult: Equatable, Sendable {
@@ -257,6 +260,14 @@ public enum PaperNoteAssociationError: Error, Equatable, Sendable {
     case notebookDirectoryUnavailable(NotebookDirectoryResolution)
     case associationNotFound(UUID)
     case bookmarkCreationFailed(URL)
+    /// The Markdown note file was safely created on disk, but creating a
+    /// security-scoped bookmark for it failed. The file is preserved on disk
+    /// and must be explicitly linked/relinked before restoration can be trusted.
+    case noteCreatedButBookmarkFailed(createdNoteURL: URL, pdfURL: URL, reason: String)
+    /// The Markdown note file was safely created on disk and bookmarked, but
+    /// persisting `associations.json` failed. The file is preserved on disk and
+    /// `associations` in memory was not mutated.
+    case noteCreatedButPersistenceFailed(pendingAssociation: PaperNoteAssociation, reason: String)
     case storageCorrupted
     case storageWriteFailed(String)
     case creationFailed(MarkdownLoadError)
@@ -289,6 +300,10 @@ extension PaperNoteAssociationError: LocalizedError {
             return "The paper-note association could not be found."
         case let .bookmarkCreationFailed(url):
             return "Could not create a security-scoped bookmark for “\(url.lastPathComponent)”."
+        case let .noteCreatedButBookmarkFailed(createdNoteURL, _, reason):
+            return "“\(createdNoteURL.lastPathComponent)” was created, but a security-scoped bookmark could not be saved (\(reason)). Link or relink the note to associate it."
+        case let .noteCreatedButPersistenceFailed(pendingAssociation, reason):
+            return "“\(pendingAssociation.markdownURL.lastPathComponent)” was created, but saving the association failed (\(reason))."
         case .storageCorrupted:
             return "The saved paper-note associations file could not be read and was left untouched."
         case let .storageWriteFailed(reason):
@@ -341,6 +356,7 @@ public final class PaperNoteAssociationStore: ObservableObject {
     private let locationAuthorizer: any NoteLocationAuthorizing
     private let bookmarkDataProvider: @MainActor (URL) throws -> Data
     private let bookmarkResolver: @MainActor (Data) throws -> ResolvedBookmark
+    private let associationsDataWriter: @Sendable (Data, URL) throws -> Void
 
     public init(
         storageURL: URL = PaperNoteAssociationStore.defaultStorageURL,
@@ -349,7 +365,8 @@ public final class PaperNoteAssociationStore: ObservableObject {
         io: any DocumentStoreIO = SystemDocumentStoreIO(),
         locationAuthorizer: (any NoteLocationAuthorizing)? = nil,
         bookmarkDataProvider: (@MainActor (URL) throws -> Data)? = nil,
-        bookmarkResolver: (@MainActor (Data) throws -> ResolvedBookmark)? = nil
+        bookmarkResolver: (@MainActor (Data) throws -> ResolvedBookmark)? = nil,
+        associationsDataWriter: (@Sendable (Data, URL) throws -> Void)? = nil
     ) {
         self.storageURL = storageURL
         self.defaults = defaults
@@ -368,6 +385,9 @@ public final class PaperNoteAssociationStore: ObservableObject {
                 bookmarkDataIsStale: &isStale
             )
             return ResolvedBookmark(url: url, isStale: isStale)
+        }
+        self.associationsDataWriter = associationsDataWriter ?? { data, url in
+            try data.write(to: url, options: [.atomic])
         }
 
         loadAssociations()
@@ -508,7 +528,7 @@ public final class PaperNoteAssociationStore: ObservableObject {
             switch resolved.markdownResolution {
             case let .resolved(markdownURL, _):
                 return .alreadyAssociated(resolved.association, resolvedMarkdownURL: markdownURL)
-            case .missing:
+            case .missing, .bookmarkMissing:
                 return .brokenAssociation(resolved.association)
             }
         }
@@ -590,12 +610,11 @@ public final class PaperNoteAssociationStore: ObservableObject {
         let plan = planDefaultNoteCreation(forPDF: pdfURL, locationPreference: locationPreference)
         switch plan {
         case let .readyToCreate(targetURL):
-            let insideAuthorizedNotebook = isInsideConfiguredNotebookDirectory(targetURL)
             return try createNote(
                 forPDF: pdfURL,
                 at: targetURL,
                 initialContent: initialContent,
-                isUserSelectedDestination: insideAuthorizedNotebook,
+                isUserSelectedDestination: false,
                 pdfResourceID: pdfResourceID,
                 markdownResourceID: markdownResourceID
             )
@@ -617,15 +636,15 @@ public final class PaperNoteAssociationStore: ObservableObject {
     /// Creates a new Markdown note at `noteURL` (never overwriting an existing
     /// file) and associates it with `pdfURL`.
     ///
-    /// Set `isUserSelectedDestination` to `false` when creating automatically in a
-    /// directory that was not chosen via an explicit user save panel; the
-    /// directory must then pass `locationAuthorizer` or be inside the configured
-    /// Research Notebook Directory.
+    /// By default (`isUserSelectedDestination == false`), the target directory
+    /// must pass `locationAuthorizer` or lie inside the configured Research
+    /// Notebook Directory. Callers passing a destination chosen explicitly in an
+    /// `NSSavePanel` set `isUserSelectedDestination` to `true`.
     public func createNote(
         forPDF pdfURL: URL,
         at noteURL: URL,
         initialContent: String = "",
-        isUserSelectedDestination: Bool = true,
+        isUserSelectedDestination: Bool = false,
         pdfResourceID: ResourceID = ResourceID(),
         markdownResourceID: ResourceID = ResourceID()
     ) throws -> (association: PaperNoteAssociation, session: MarkdownResourceSession) {
@@ -682,7 +701,18 @@ public final class PaperNoteAssociationStore: ObservableObject {
             }
         }
 
-        let markdownBookmark = try? bookmarkDataProvider(noteURL)
+        let markdownBookmark: Data
+        do {
+            markdownBookmark = try bookmarkDataProvider(noteURL)
+        } catch {
+            session.close()
+            throw PaperNoteAssociationError.noteCreatedButBookmarkFailed(
+                createdNoteURL: noteURL.standardizedFileURL,
+                pdfURL: pdfURL.standardizedFileURL,
+                reason: error.localizedDescription
+            )
+        }
+
         let existing = association(forPDF: pdfURL)
         let now = Date()
         let association = PaperNoteAssociation(
@@ -698,9 +728,46 @@ public final class PaperNoteAssociationStore: ObservableObject {
             lastModifiedAt: now
         )
 
-        upsertAssociation(association)
-        try persistAssociations()
+        let candidate = upserting(association, into: associations)
+        do {
+            try persistAssociations(candidate)
+        } catch {
+            session.close()
+            throw PaperNoteAssociationError.noteCreatedButPersistenceFailed(
+                pendingAssociation: association,
+                reason: error.localizedDescription
+            )
+        }
+        associations = candidate
         return (association, session)
+    }
+
+    /// Commits a pending association returned by `noteCreatedButPersistenceFailed`
+    /// once association storage is writable again, without touching the created
+    /// Markdown file on disk.
+    @discardableResult
+    public func commitPendingAssociation(_ pending: PaperNoteAssociation) throws -> PaperNoteAssociation {
+        guard !hasUnreadableAssociationsStorage else {
+            throw PaperNoteAssociationError.storageCorrupted
+        }
+        guard pending.markdownBookmarkData != nil else {
+            throw PaperNoteAssociationError.bookmarkCreationFailed(pending.markdownURL)
+        }
+
+        let lease = SecurityScopeLease(url: pending.markdownURL, access: access)
+        let exists = (try? io.status(of: pending.markdownURL))
+            .map { $0.exists && $0.isRegularFile } ?? false
+        lease.release()
+        guard exists else {
+            throw PaperNoteAssociationError.noteFileMissingOrUnreadable(pending.markdownURL)
+        }
+
+        var updated = pending
+        updated.lastModifiedAt = Date()
+        let candidate = upserting(updated, into: associations)
+        try persistAssociations(candidate)
+        associations = candidate
+        return updated
     }
 
     /// Associates `pdfURL` with an existing UTF-8 Markdown file at `markdownURL`
@@ -743,8 +810,9 @@ public final class PaperNoteAssociationStore: ObservableObject {
             lastModifiedAt: now
         )
 
-        upsertAssociation(updated)
-        try persistAssociations()
+        let candidate = upserting(updated, into: associations)
+        try persistAssociations(candidate)
+        associations = candidate
         return updated
     }
 
@@ -836,54 +904,47 @@ public final class PaperNoteAssociationStore: ObservableObject {
 
         // 2. Resolve Markdown (strictly via bookmark; never hash-guessed)
         let markdownResolution: MarkdownResourceResolution
-        if let mdBookmark = updated.markdownBookmarkData,
-           let resolvedMD = try? bookmarkResolver(mdBookmark),
-           resolvedMD.url.isFileURL {
-            let candidateURL = resolvedMD.url.standardizedFileURL
-            let lease = SecurityScopeLease(url: candidateURL, access: access)
-            let exists = (try? io.status(of: candidateURL))
-                .map { $0.exists && $0.isRegularFile } ?? false
-
-            if exists {
-                var refreshed = false
-                if resolvedMD.isStale, let freshData = try? bookmarkDataProvider(candidateURL) {
-                    updated.markdownBookmarkData = freshData
-                    refreshed = true
-                    didRefreshBookmarks = true
-                    didUpdateStoredRecord = true
-                }
-                if candidateURL != updated.markdownURL.standardizedFileURL {
-                    updated.markdownURL = candidateURL
-                    didUpdateStoredRecord = true
-                }
-                lease.release()
-                markdownResolution = .resolved(candidateURL, refreshedBookmark: refreshed)
-            } else {
-                lease.release()
-                markdownResolution = .missing(lastKnownURL: updated.markdownURL)
-            }
-        } else {
-            // Fallback check when no bookmark was stored (e.g. non-bookmarkable test path)
-            if updated.markdownBookmarkData == nil {
-                let lease = SecurityScopeLease(url: updated.markdownURL, access: access)
-                let exists = (try? io.status(of: updated.markdownURL))
+        if let mdBookmark = updated.markdownBookmarkData {
+            if let resolvedMD = try? bookmarkResolver(mdBookmark),
+               resolvedMD.url.isFileURL {
+                let candidateURL = resolvedMD.url.standardizedFileURL
+                let lease = SecurityScopeLease(url: candidateURL, access: access)
+                let exists = (try? io.status(of: candidateURL))
                     .map { $0.exists && $0.isRegularFile } ?? false
-                lease.release()
+
                 if exists {
-                    markdownResolution = .resolved(updated.markdownURL, refreshedBookmark: false)
+                    var refreshed = false
+                    if resolvedMD.isStale, let freshData = try? bookmarkDataProvider(candidateURL) {
+                        updated.markdownBookmarkData = freshData
+                        refreshed = true
+                        didRefreshBookmarks = true
+                        didUpdateStoredRecord = true
+                    }
+                    if candidateURL != updated.markdownURL.standardizedFileURL {
+                        updated.markdownURL = candidateURL
+                        didUpdateStoredRecord = true
+                    }
+                    lease.release()
+                    markdownResolution = .resolved(candidateURL, refreshedBookmark: refreshed)
                 } else {
+                    lease.release()
                     markdownResolution = .missing(lastKnownURL: updated.markdownURL)
                 }
             } else {
                 markdownResolution = .missing(lastKnownURL: updated.markdownURL)
             }
+        } else {
+            markdownResolution = .bookmarkMissing(lastKnownURL: updated.markdownURL)
         }
 
         if didUpdateStoredRecord && !hasUnreadableAssociationsStorage {
             updated.lastModifiedAt = Date()
             if let index = associations.firstIndex(where: { $0.id == updated.id }) {
-                associations[index] = updated
-                try? persistAssociations()
+                var candidate = associations
+                candidate[index] = updated
+                if (try? persistAssociations(candidate)) != nil {
+                    associations = candidate
+                }
             }
         }
 
@@ -916,8 +977,10 @@ public final class PaperNoteAssociationStore: ObservableObject {
         updated.markdownURL = newMarkdownURL.standardizedFileURL
         updated.markdownBookmarkData = bookmark
         updated.lastModifiedAt = Date()
-        associations[index] = updated
-        try persistAssociations()
+        var candidate = associations
+        candidate[index] = updated
+        try persistAssociations(candidate)
+        associations = candidate
         return updated
     }
 
@@ -940,18 +1003,20 @@ public final class PaperNoteAssociationStore: ObservableObject {
         updated.pdfBookmarkData = pdfBookmark
         updated.pdfContentHash = pdfHash
         updated.lastModifiedAt = Date()
-        associations[index] = updated
-        try persistAssociations()
+        var candidate = associations
+        candidate[index] = updated
+        try persistAssociations(candidate)
+        associations = candidate
         return updated
     }
 
     /// Removes the association record without deleting the PDF or Markdown file.
     public func unlinkAssociation(id: UUID) {
         guard !hasUnreadableAssociationsStorage else { return }
-        let before = associations.count
-        associations.removeAll { $0.id == id }
-        if associations.count != before {
-            try? persistAssociations()
+        let candidate = associations.filter { $0.id != id }
+        guard candidate.count != associations.count else { return }
+        if (try? persistAssociations(candidate)) != nil {
+            associations = candidate
         }
     }
 
@@ -1088,12 +1153,17 @@ public final class PaperNoteAssociationStore: ObservableObject {
         return SecurityScopeLease(url: notebookURL, access: access)
     }
 
-    private func upsertAssociation(_ association: PaperNoteAssociation) {
-        if let index = associations.firstIndex(where: { $0.id == association.id }) {
-            associations[index] = association
+    private func upserting(
+        _ association: PaperNoteAssociation,
+        into list: [PaperNoteAssociation]
+    ) -> [PaperNoteAssociation] {
+        var copy = list
+        if let index = copy.firstIndex(where: { $0.id == association.id }) {
+            copy[index] = association
         } else {
-            associations.append(association)
+            copy.append(association)
         }
+        return copy
     }
 
     // MARK: - Persistence
@@ -1115,19 +1185,19 @@ public final class PaperNoteAssociationStore: ObservableObject {
         }
     }
 
-    private func persistAssociations() throws {
+    private func persistAssociations(_ candidate: [PaperNoteAssociation]) throws {
         guard !hasUnreadableAssociationsStorage else {
             throw PaperNoteAssociationError.storageCorrupted
         }
         let directory = storageURL.deletingLastPathComponent()
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let payload = StoredAssociations(version: Self.storageVersion, associations: associations)
+            let payload = StoredAssociations(version: Self.storageVersion, associations: candidate)
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             encoder.dateEncodingStrategy = .iso8601
             let data = try encoder.encode(payload)
-            try data.write(to: storageURL, options: [.atomic])
+            try associationsDataWriter(data, storageURL)
         } catch {
             throw PaperNoteAssociationError.storageWriteFailed(error.localizedDescription)
         }

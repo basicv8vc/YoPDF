@@ -532,4 +532,227 @@ final class MarkdownResourceSessionTests: XCTestCase {
         session = nil
         XCTAssertEqual(spy.stops, [url])
     }
+
+    // MARK: - P1-1: In-Flight Autosave After Reverting Content
+
+    func testInFlightAutosaveAfterRevertingContentNeverReportsCleanWhileDiskDiffers() async throws {
+        let url = try makeMarkdownFile("revert-inflight.md", content: "A")
+        let io = ScriptedDocumentStoreIO()
+        let writeStarted = DispatchSemaphore(value: 0)
+        let allowWriteToFinish = DispatchSemaphore(value: 0)
+        io.beforeCoordinatedWrite = {
+            writeStarted.signal()
+            allowWriteToFinish.wait()
+        }
+
+        let session = MarkdownResourceSession(access: SecurityScopeSpy(), io: io)
+        session.autoSaveDebounceNanoseconds = 20_000_000
+        XCTAssertTrue(session.open(url: url))
+
+        // Step 2: Edit A -> B.
+        session.updateContent("B")
+        XCTAssertTrue(session.hasUnsavedChanges)
+
+        // Step 3: Wait deterministically until autosave starts writing B.
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                writeStarted.wait()
+                continuation.resume()
+            }
+        }
+
+        // Step 4: While B's write is blocked in-flight, revert editor back to A.
+        session.updateContent("A")
+        XCTAssertEqual(session.content, "A")
+        XCTAssertTrue(
+            session.hasUnsavedChanges,
+            "Session must not report clean while an earlier autosave of B is already in flight"
+        )
+
+        // Disable follow-up autosave so we can observe the exact state right after
+        // B commits to disk while the editor still holds A.
+        session.isAutoSaveEnabled = false
+        io.beforeCoordinatedWrite = nil
+
+        await withCheckedContinuation { continuation in
+            var subscription: AnyCancellable?
+            subscription = session.events.sink { event in
+                if case .saved = event {
+                    subscription?.cancel()
+                    continuation.resume()
+                }
+            }
+            if let subscription {
+                cancellables.insert(subscription)
+            }
+            // Step 5: Let the previous write of B finish.
+            allowWriteToFinish.signal()
+        }
+
+        // Step 6: Disk contains B, editor contains A, and session MUST still be dirty.
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "B")
+        XCTAssertEqual(session.content, "A")
+        XCTAssertTrue(
+            session.hasUnsavedChanges,
+            "Session must remain dirty when disk contains B and editor contains A"
+        )
+
+        // Saving now writes A back to disk and reconciles clean.
+        XCTAssertEqual(session.save(), .saved)
+        XCTAssertFalse(session.hasUnsavedChanges)
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "A")
+        session.close()
+    }
+
+    func testInFlightAutosaveAfterRevertingSchedulesFollowUpAndPreservesUncertainState() async throws {
+        // Part 1: With autosave enabled, reverting B -> A while B is writing
+        // automatically schedules a follow-up autosave that restores A on disk.
+        let url = try makeMarkdownFile("revert-followup.md", content: "A")
+        let io = ScriptedDocumentStoreIO()
+        let writeStarted = DispatchSemaphore(value: 0)
+        let allowWriteToFinish = DispatchSemaphore(value: 0)
+        io.beforeCoordinatedWrite = {
+            writeStarted.signal()
+            allowWriteToFinish.wait()
+        }
+
+        let session = MarkdownResourceSession(access: SecurityScopeSpy(), io: io)
+        session.autoSaveDebounceNanoseconds = 20_000_000
+        XCTAssertTrue(session.open(url: url))
+
+        session.updateContent("B")
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                writeStarted.wait()
+                continuation.resume()
+            }
+        }
+
+        session.updateContent("A")
+        XCTAssertTrue(session.hasUnsavedChanges)
+        io.beforeCoordinatedWrite = nil
+
+        var savedCount = 0
+        await withCheckedContinuation { continuation in
+            var subscription: AnyCancellable?
+            subscription = session.events.sink { event in
+                if case .saved = event {
+                    savedCount += 1
+                    if savedCount == 2 {
+                        subscription?.cancel()
+                        continuation.resume()
+                    }
+                }
+            }
+            if let subscription {
+                cancellables.insert(subscription)
+            }
+            allowWriteToFinish.signal()
+        }
+
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "A")
+        XCTAssertEqual(session.content, "A")
+        XCTAssertFalse(session.hasUnsavedChanges)
+        session.close()
+
+        // Part 2: An uncertain in-flight write while reverting B -> A must stay dirty
+        // and preserve A in memory.
+        let uncertainURL = try makeMarkdownFile("revert-uncertain.md", content: "A")
+        let uncertainIO = ScriptedDocumentStoreIO()
+        let uWriteStarted = DispatchSemaphore(value: 0)
+        let uAllowFinish = DispatchSemaphore(value: 0)
+        let backup = directory.url.appendingPathComponent("revert-uncertain-backup.md")
+        uncertainIO.partialCommit = .originalMovedTo(backup)
+        uncertainIO.beforeCoordinatedWrite = {
+            uWriteStarted.signal()
+            uAllowFinish.wait()
+        }
+
+        let uncertainSession = MarkdownResourceSession(access: SecurityScopeSpy(), io: uncertainIO)
+        uncertainSession.autoSaveDebounceNanoseconds = 20_000_000
+        XCTAssertTrue(uncertainSession.open(url: uncertainURL))
+
+        uncertainSession.updateContent("B")
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                uWriteStarted.wait()
+                continuation.resume()
+            }
+        }
+
+        uncertainSession.updateContent("A")
+        XCTAssertTrue(uncertainSession.hasUnsavedChanges)
+
+        await withCheckedContinuation { continuation in
+            var subscription: AnyCancellable?
+            subscription = uncertainSession.$autoSaveFailureRevision
+                .dropFirst()
+                .sink { _ in
+                    subscription?.cancel()
+                    continuation.resume()
+                }
+            if let subscription {
+                cancellables.insert(subscription)
+            }
+            uAllowFinish.signal()
+        }
+
+        XCTAssertEqual(uncertainSession.content, "A")
+        XCTAssertTrue(uncertainSession.hasUnsavedChanges)
+        XCTAssertEqual(uncertainSession.documentSession?.state, .needsRefresh)
+        guard case .failed(.uncertain) = uncertainSession.autoSaveStatus else {
+            return XCTFail("Expected .failed(.uncertain), got \(uncertainSession.autoSaveStatus)")
+        }
+        uncertainSession.close()
+    }
+
+    // MARK: - P1-2: Byte-Accurate Markdown Source Equality
+
+    func testByteAccurateUnicodeComparisonDetectsCanonicalEquivalentChangesInBothDirections() throws {
+        let precomposed = "caf\u{00E9}" // café (NFC: 63 61 66 C3 A9)
+        let decomposed = "cafe\u{0301}"  // café (NFD: 63 61 66 65 CC 81)
+        let precomposedBytes = Data([0x63, 0x61, 0x66, 0xC3, 0xA9])
+        let decomposedBytes = Data([0x63, 0x61, 0x66, 0x65, 0xCC, 0x81])
+        XCTAssertEqual(Data(precomposed.utf8), precomposedBytes)
+        XCTAssertEqual(Data(decomposed.utf8), decomposedBytes)
+        XCTAssertNotEqual(precomposedBytes, decomposedBytes)
+
+        // Direction 1: NFC -> NFD
+        let url = directory.url.appendingPathComponent("unicode-bytes.md")
+        try precomposedBytes.write(to: url)
+
+        let session = MarkdownResourceSession(access: SecurityScopeSpy())
+        session.isAutoSaveEnabled = false
+        XCTAssertTrue(session.open(url: url))
+        let revisionAtOpen = session.editRevision
+
+        session.updateContent(decomposed)
+        XCTAssertTrue(session.hasUnsavedChanges, "Decomposed replacement must be detected as a byte edit")
+        XCTAssertEqual(session.editRevision, revisionAtOpen + 1)
+        XCTAssertEqual(session.save(), .saved)
+        XCTAssertFalse(session.hasUnsavedChanges)
+        XCTAssertEqual(try Data(contentsOf: url), decomposedBytes)
+        session.close()
+
+        // Direction 2: Reopen NFD and replace with NFC
+        let reopened = MarkdownResourceSession(access: SecurityScopeSpy())
+        reopened.isAutoSaveEnabled = false
+        XCTAssertTrue(reopened.open(url: url))
+        XCTAssertEqual(Data(reopened.content.utf8), decomposedBytes)
+        let revisionAfterReopen = reopened.editRevision
+
+        reopened.updateContent(precomposed)
+        XCTAssertTrue(reopened.hasUnsavedChanges, "Precomposed replacement must be detected as a byte edit")
+        XCTAssertEqual(reopened.editRevision, revisionAfterReopen + 1)
+        XCTAssertEqual(reopened.save(), .saved)
+        XCTAssertFalse(reopened.hasUnsavedChanges)
+        XCTAssertEqual(try Data(contentsOf: url), precomposedBytes)
+        reopened.close()
+
+        // Verify exact NFC bytes after second reopen.
+        let finalCheck = MarkdownResourceSession(access: SecurityScopeSpy())
+        XCTAssertTrue(finalCheck.open(url: url))
+        XCTAssertEqual(Data(finalCheck.content.utf8), precomposedBytes)
+        finalCheck.close()
+    }
 }

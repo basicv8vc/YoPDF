@@ -184,12 +184,22 @@ public final class MarkdownResourceSession: ObservableObject, Identifiable {
 
     /// Authoritative disk baseline corresponding to `documentSession.version`.
     private var savedContent: String?
+    private var savedUTF8: Data?
+
+    private struct AutoSaveWorkSnapshot {
+        let text: String
+        let utf8: Data
+        let generation: Int
+        let scheduledRevision: Int
+        let session: DocumentSession
+    }
 
     var autoSaveTask: Task<Void, Never>?
     var autoSaveGeneration: Int = 0
     var autoSaveWorkTask: Task<SaveOutcome, Never>?
     var autoSaveWorkGeneration: Int?
     var autoSaveWorkCompletion: AutoSaveWorkCompletion?
+    private var autoSaveWorkSnapshot: AutoSaveWorkSnapshot?
     var autoSavePauseDepth: Int = 0
     var autoSaveShouldResumeAfterPause: Bool = false
 
@@ -260,6 +270,7 @@ public final class MarkdownResourceSession: ObservableObject, Identifiable {
         }
 
         let candidate: DocumentSession
+        let rawBytes: Data
         let decoded: String
         do {
             candidate = try store.open(url)
@@ -270,6 +281,7 @@ public final class MarkdownResourceSession: ObservableObject, Identifiable {
                     lastError = .invalidUTF8(url)
                     return false
                 }
+                rawBytes = rawData
                 decoded = utf8
             } catch {
                 candidate.close()
@@ -293,7 +305,13 @@ public final class MarkdownResourceSession: ObservableObject, Identifiable {
         documentSession = candidate
         previous?.close()
 
-        applyLoaded(text: decoded, url: url, isReadOnly: !candidate.isWritableAtOpen, event: .opened(url))
+        applyLoaded(
+            text: decoded,
+            rawData: rawBytes,
+            url: url,
+            isReadOnly: !candidate.isWritableAtOpen,
+            event: .opened(url)
+        )
         return true
     }
 
@@ -337,7 +355,13 @@ public final class MarkdownResourceSession: ObservableObject, Identifiable {
         documentSession = candidate
         previous?.close()
 
-        applyLoaded(text: initialContent, url: url, isReadOnly: false, event: .created(url))
+        applyLoaded(
+            text: initialContent,
+            rawData: data,
+            url: url,
+            isReadOnly: false,
+            event: .created(url)
+        )
         return true
     }
 
@@ -357,6 +381,7 @@ public final class MarkdownResourceSession: ObservableObject, Identifiable {
         defer { resumeAutoSave() }
 
         let candidate: DocumentSession
+        let rawBytes: Data
         let decoded: String
         do {
             candidate = try store.open(url)
@@ -367,6 +392,7 @@ public final class MarkdownResourceSession: ObservableObject, Identifiable {
                     lastError = .invalidUTF8(url)
                     return false
                 }
+                rawBytes = rawData
                 decoded = utf8
             } catch {
                 candidate.close()
@@ -387,7 +413,13 @@ public final class MarkdownResourceSession: ObservableObject, Identifiable {
         documentSession = candidate
         previous?.close()
 
-        applyLoaded(text: decoded, url: url, isReadOnly: !candidate.isWritableAtOpen, event: .reloaded(url))
+        applyLoaded(
+            text: decoded,
+            rawData: rawBytes,
+            url: url,
+            isReadOnly: !candidate.isWritableAtOpen,
+            event: .reloaded(url)
+        )
         return true
     }
 
@@ -400,6 +432,7 @@ public final class MarkdownResourceSession: ObservableObject, Identifiable {
         documentSession = nil
         content = ""
         savedContent = nil
+        savedUTF8 = nil
         fileURL = nil
         title = ""
         detectedLineEnding = nil
@@ -439,19 +472,46 @@ public final class MarkdownResourceSession: ObservableObject, Identifiable {
             effectiveContent = newContent
         }
 
-        guard effectiveContent != content else { return }
+        guard !Self.utf8Equal(effectiveContent, content) else { return }
 
         content = effectiveContent
-        hasUnsavedChanges = (effectiveContent != savedContent)
+        let effectiveUTF8 = Data(effectiveContent.utf8)
+        let matchesSavedBaseline = (savedUTF8 == effectiveUTF8)
         editRevision &+= 1
 
-        if hasUnsavedChanges {
+        if !matchesSavedBaseline {
+            hasUnsavedChanges = true
             if isAutoSaveEnabled {
                 scheduleAutoSave()
             }
+        } else if let completion = autoSaveWorkCompletion {
+            // An earlier autosave worker is associated with a previous revision.
+            // If cancellation wins before its disk write starts, disk still holds
+            // the saved baseline; if the write has already started, stay dirty
+            // until that write finishes and we reconcile disk vs editor bytes.
+            if completion.cancelBeforeWrite() {
+                autoSaveWorkTask?.cancel()
+                cancelPendingAutoSave(cancelInFlightWork: false)
+                if documentSession?.state == .needsRefresh {
+                    hasUnsavedChanges = true
+                } else {
+                    hasUnsavedChanges = false
+                    autoSaveStatus = .idle
+                }
+            } else {
+                hasUnsavedChanges = true
+                autoSaveGeneration &+= 1
+                autoSaveTask?.cancel()
+                autoSaveTask = nil
+            }
         } else {
             cancelPendingAutoSave(cancelInFlightWork: false)
-            autoSaveStatus = .idle
+            if documentSession?.state == .needsRefresh {
+                hasUnsavedChanges = true
+            } else {
+                hasUnsavedChanges = false
+                autoSaveStatus = .idle
+            }
         }
 
         events.send(.contentChanged(sourcePaneID: sourcePaneID))
@@ -464,7 +524,7 @@ public final class MarkdownResourceSession: ObservableObject, Identifiable {
         cancelPendingAutoSave(cancelInFlightWork: true)
         _ = waitForAutoSaveWork()
         content = savedContent ?? ""
-        hasUnsavedChanges = false
+        hasUnsavedChanges = (documentSession?.state == .needsRefresh)
         autoSaveStatus = .idle
         lastAutoSaveOutcome = nil
         editRevision &+= 1
@@ -655,20 +715,41 @@ public final class MarkdownResourceSession: ObservableObject, Identifiable {
 
         if let previousWork = autoSaveWorkTask {
             let previousGeneration = autoSaveWorkGeneration
-            _ = await previousWork.value
-            clearAutoSaveWork(ifGeneration: previousGeneration)
+            let previousSnapshot = autoSaveWorkSnapshot
+            let previousOutcome = await previousWork.value
+            if autoSaveWorkGeneration == previousGeneration {
+                clearAutoSaveWork(ifGeneration: previousGeneration)
+                if let previousSnapshot {
+                    reconcileAutoSaveOutcome(
+                        previousOutcome,
+                        snapshot: previousSnapshot,
+                        triggeredByManualInterruption: false
+                    )
+                }
+            }
+            if case .failed = autoSaveStatus {
+                return
+            }
         }
 
         guard autoSaveGeneration == generation,
               editRevision == scheduledRevision,
               hasUnsavedChanges,
               isLoaded,
-              let session = documentSession
+              let session = documentSession,
+              session.state == .open
         else { return }
 
         let textSnapshot = content
         let data = Data(textSnapshot.utf8)
         let completion = AutoSaveWorkCompletion()
+        let snapshot = AutoSaveWorkSnapshot(
+            text: textSnapshot,
+            utf8: data,
+            generation: generation,
+            scheduledRevision: scheduledRevision,
+            session: session
+        )
 
         let worker = Task.detached(priority: .utility) {
             guard completion.beginWriteUnlessCancelled() else {
@@ -684,15 +765,15 @@ public final class MarkdownResourceSession: ObservableObject, Identifiable {
         autoSaveWorkTask = worker
         autoSaveWorkGeneration = generation
         autoSaveWorkCompletion = completion
+        autoSaveWorkSnapshot = snapshot
 
         let outcome = await worker.value
+        guard autoSaveWorkGeneration == generation else { return }
         clearAutoSaveWork(ifGeneration: generation)
-        finishAutomaticSave(
+        reconcileAutoSaveOutcome(
             outcome,
-            savedText: textSnapshot,
-            generation: generation,
-            scheduledRevision: scheduledRevision,
-            session: session
+            snapshot: snapshot,
+            triggeredByManualInterruption: false
         )
     }
 
@@ -731,34 +812,85 @@ public final class MarkdownResourceSession: ObservableObject, Identifiable {
         autoSaveWorkTask = nil
         autoSaveWorkGeneration = nil
         autoSaveWorkCompletion = nil
+        autoSaveWorkSnapshot = nil
     }
 
-    private func finishAutomaticSave(
+    private func reconcileAutoSaveOutcome(
         _ outcome: SaveOutcome,
-        savedText: String,
-        generation: Int,
-        scheduledRevision: Int,
-        session savedSession: DocumentSession
+        snapshot: AutoSaveWorkSnapshot,
+        triggeredByManualInterruption: Bool
     ) {
-        guard autoSaveGeneration == generation,
-              editRevision == scheduledRevision,
-              documentSession === savedSession,
-              hasUnsavedChanges
-        else { return }
+        guard isLoaded, documentSession === snapshot.session else { return }
+        if case .failed(.sessionUnavailable) = outcome {
+            return
+        }
+
+        let currentUTF8 = Data(content.utf8)
+
+        if outcome.editsAreOnDisk {
+            savedContent = snapshot.text
+            savedUTF8 = snapshot.utf8
+            fileURL = snapshot.session.url
+            title = Self.resolvedTitle(for: snapshot.session.url)
+            detectedLineEnding = MarkdownLineEnding.detect(in: snapshot.text)
+            isReadOnlyAtOpen = false
+
+            let matchesEditorContent = (currentUTF8 == snapshot.utf8)
+            hasUnsavedChanges = !matchesEditorContent
+
+            if matchesEditorContent {
+                lastAutoSaveOutcome = outcome
+                if !triggeredByManualInterruption {
+                    autoSaveStatus = .saved
+                    autoSaveTask = nil
+                }
+                editRevision &+= 1
+                events.send(.saved(snapshot.session.url))
+            } else {
+                // Disk now holds `snapshot.utf8`, while the editor has a newer
+                // edit (or a revert back to the prior baseline). Never report clean.
+                lastAutoSaveOutcome = outcome
+                events.send(.saved(snapshot.session.url))
+                if !triggeredByManualInterruption {
+                    if isAutoSaveEnabled && autoSavePauseDepth == 0 {
+                        if autoSaveTask == nil {
+                            scheduleAutoSave()
+                        } else {
+                            autoSaveStatus = .pending
+                        }
+                    } else {
+                        autoSaveStatus = .idle
+                        autoSaveTask = nil
+                    }
+                }
+            }
+            return
+        }
+
+        // The in-flight write did not confirm bytes on disk.
+        let baselineMatchesEditor = (savedUTF8 == currentUTF8)
+        let sessionNeedsRefresh = (snapshot.session.state == .needsRefresh)
+        let isConflict: Bool
+        if case .conflict = outcome {
+            isConflict = true
+        } else {
+            isConflict = false
+        }
+
+        if sessionNeedsRefresh || isConflict {
+            hasUnsavedChanges = true
+        } else {
+            hasUnsavedChanges = !baselineMatchesEditor
+        }
+
+        guard !triggeredByManualInterruption else { return }
 
         lastAutoSaveOutcome = outcome
-        if outcome.editsAreOnDisk {
-            savedContent = savedText
-            fileURL = savedSession.url
-            title = Self.resolvedTitle(for: savedSession.url)
-            detectedLineEnding = MarkdownLineEnding.detect(in: savedText)
-            hasUnsavedChanges = false
-            editRevision &+= 1
-            autoSaveStatus = .saved
-            events.send(.saved(savedSession.url))
-        } else {
+        if hasUnsavedChanges {
             autoSaveStatus = .failed(outcome)
             autoSaveFailureRevision &+= 1
+        } else {
+            autoSaveStatus = .idle
         }
         autoSaveTask = nil
     }
@@ -782,11 +914,20 @@ public final class MarkdownResourceSession: ObservableObject, Identifiable {
     @discardableResult
     func waitForAutoSaveWork() -> SaveOutcome? {
         guard let completion = autoSaveWorkCompletion else { return nil }
+        let snapshot = autoSaveWorkSnapshot
         completion.wait()
         let outcome = completion.outcome
         autoSaveWorkTask = nil
         autoSaveWorkGeneration = nil
         autoSaveWorkCompletion = nil
+        autoSaveWorkSnapshot = nil
+        if let outcome, let snapshot {
+            reconcileAutoSaveOutcome(
+                outcome,
+                snapshot: snapshot,
+                triggeredByManualInterruption: true
+            )
+        }
         return outcome
     }
 
@@ -794,12 +935,14 @@ public final class MarkdownResourceSession: ObservableObject, Identifiable {
 
     private func applyLoaded(
         text: String,
+        rawData: Data,
         url: URL,
         isReadOnly: Bool,
         event: MarkdownResourceEvent
     ) {
         content = text
         savedContent = text
+        savedUTF8 = rawData
         fileURL = url
         title = Self.resolvedTitle(for: url)
         detectedLineEnding = MarkdownLineEnding.detect(in: text)
@@ -820,16 +963,22 @@ public final class MarkdownResourceSession: ObservableObject, Identifiable {
         event: MarkdownResourceEvent
     ) {
         cancelPendingAutoSave(cancelInFlightWork: false)
+        let savedBytes = Data(savedText.utf8)
         savedContent = savedText
+        savedUTF8 = savedBytes
         fileURL = url
         title = Self.resolvedTitle(for: url)
         detectedLineEnding = MarkdownLineEnding.detect(in: savedText)
-        hasUnsavedChanges = (content != savedText)
+        hasUnsavedChanges = !Self.utf8Equal(content, savedText)
         isReadOnlyAtOpen = false
         autoSaveStatus = .idle
         lastAutoSaveOutcome = nil
         editRevision &+= 1
         events.send(event)
+    }
+
+    private static func utf8Equal(_ lhs: String, _ rhs: String) -> Bool {
+        lhs.utf8.elementsEqual(rhs.utf8)
     }
 
     private func resolveSaveFailure(

@@ -477,4 +477,214 @@ final class PaperNoteAssociationTests: XCTestCase {
             .resolved(candidate2.standardizedFileURL, refreshedBookmark: false)
         )
     }
+
+    // MARK: - P2-1: Association Persistence Failure
+
+    func testAssociationPersistenceFailureDoesNotLeaveUnpersistedMemoryStateAndSupportsRecovery() throws {
+        final class ScriptedAssociationWriter: @unchecked Sendable {
+            private let lock = NSLock()
+            var shouldFail = true
+
+            func write(_ data: Data, to url: URL) throws {
+                let fail = lock.withLock { shouldFail }
+                if fail {
+                    throw NSError(
+                        domain: NSCocoaErrorDomain,
+                        code: NSFileWriteNoPermissionError,
+                        userInfo: [NSLocalizedDescriptionKey: "Injected associations.json write failure"]
+                    )
+                }
+                try data.write(to: url, options: [.atomic])
+            }
+        }
+
+        let (pdfURL, _) = try makePDF(named: "PersistenceFailure.pdf")
+        let writer = ScriptedAssociationWriter()
+        let authorizer = ExplicitNoteLocationAuthorizer(authorizedDirectories: [directory.url])
+        let store = PaperNoteAssociationStore(
+            storageURL: storageURL,
+            defaults: defaults,
+            access: SecurityScopeSpy(),
+            locationAuthorizer: authorizer,
+            associationsDataWriter: { data, url in
+                try writer.write(data, to: url)
+            }
+        )
+
+        let expectedNoteURL = directory.url.appendingPathComponent("PersistenceFailure.notes.md")
+        var capturedPending: PaperNoteAssociation?
+        XCTAssertThrowsError(
+            try store.createDefaultNote(forPDF: pdfURL, initialContent: "# Important Draft\n")
+        ) { error in
+            guard case let PaperNoteAssociationError.noteCreatedButPersistenceFailed(pending, _) = error else {
+                return XCTFail("Expected noteCreatedButPersistenceFailed, got \(error)")
+            }
+            capturedPending = pending
+        }
+
+        // Must NOT leave an unpersisted association in memory, and MUST preserve the created file.
+        XCTAssertTrue(store.associations.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storageURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: expectedNoteURL.path))
+        XCTAssertEqual(try String(contentsOf: expectedNoteURL, encoding: .utf8), "# Important Draft\n")
+
+        // linkExistingNote must also keep in-memory state consistent when persistence fails.
+        XCTAssertThrowsError(try store.linkExistingNote(forPDF: pdfURL, markdownURL: expectedNoteURL)) { error in
+            guard case PaperNoteAssociationError.storageWriteFailed = error else {
+                return XCTFail("Expected storageWriteFailed, got \(error)")
+            }
+        }
+        XCTAssertTrue(store.associations.isEmpty)
+
+        // Recovery succeeds once persistence is writable again, without touching the created note.
+        writer.shouldFail = false
+        let pending = try XCTUnwrap(capturedPending)
+        let committed = try store.commitPendingAssociation(pending)
+        XCTAssertEqual(store.associations.count, 1)
+        XCTAssertEqual(committed.markdownURL.standardizedFileURL, expectedNoteURL.standardizedFileURL)
+        XCTAssertEqual(try String(contentsOf: expectedNoteURL, encoding: .utf8), "# Important Draft\n")
+
+        let relaunched = makeStore(authorizer: authorizer)
+        XCTAssertEqual(relaunched.associations.count, 1)
+        XCTAssertEqual(
+            relaunched.association(forPDF: pdfURL)?.markdownURL.standardizedFileURL,
+            expectedNoteURL.standardizedFileURL
+        )
+    }
+
+    // MARK: - P2-2: Bookmark Creation Failure & Default Directory Authorization
+
+    func testFailedMarkdownBookmarkCreationPreservesFileAndRequiresExplicitLink() throws {
+        let (pdfURL, _) = try makePDF(named: "BookmarkFail.pdf")
+        let authorizer = ExplicitNoteLocationAuthorizer(authorizedDirectories: [directory.url])
+        var allowMarkdownBookmark = false
+
+        let store = makeStore(
+            authorizer: authorizer,
+            bookmarkDataProvider: { url in
+                if url.pathExtension.lowercased() == "md" && !allowMarkdownBookmark {
+                    throw NSError(
+                        domain: NSCocoaErrorDomain,
+                        code: NSFileWriteNoPermissionError,
+                        userInfo: [NSLocalizedDescriptionKey: "Injected Markdown bookmark failure"]
+                    )
+                }
+                return try url.bookmarkData(options: [.withSecurityScope])
+            }
+        )
+
+        let expectedNoteURL = directory.url.appendingPathComponent("BookmarkFail.notes.md")
+        XCTAssertThrowsError(
+            try store.createDefaultNote(forPDF: pdfURL, initialContent: "# Preserved Note\n")
+        ) { error in
+            guard case let PaperNoteAssociationError.noteCreatedButBookmarkFailed(createdNoteURL, errPDFURL, _) = error else {
+                return XCTFail("Expected noteCreatedButBookmarkFailed, got \(error)")
+            }
+            XCTAssertEqual(createdNoteURL, expectedNoteURL.standardizedFileURL)
+            XCTAssertEqual(errPDFURL, pdfURL.standardizedFileURL)
+        }
+
+        // No broken association silently stored; created file stays intact on disk.
+        XCTAssertTrue(store.associations.isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: expectedNoteURL.path))
+        XCTAssertEqual(try String(contentsOf: expectedNoteURL, encoding: .utf8), "# Preserved Note\n")
+
+        // Explicit recovery via linkExistingNote succeeds once bookmarking is possible.
+        allowMarkdownBookmark = true
+        let linked = try store.linkExistingNote(forPDF: pdfURL, markdownURL: expectedNoteURL)
+        XCTAssertNotNil(linked.markdownBookmarkData)
+        XCTAssertEqual(store.associations.count, 1)
+        XCTAssertEqual(try String(contentsOf: expectedNoteURL, encoding: .utf8), "# Preserved Note\n")
+    }
+
+    func testResolveAssociationNeverTreatsNilMarkdownBookmarkAsRestorable() throws {
+        let (pdfURL, pdfBytes) = try makePDF(named: "NilBookmark.pdf")
+        let noteURL = try directory.write("NilBookmark.notes.md", Data("# Existing Note\n".utf8))
+        let pdfBookmark = try pdfURL.bookmarkData(options: [.withSecurityScope])
+
+        // Persist a record whose markdownBookmarkData is nil.
+        let unbookmarked = PaperNoteAssociation(
+            pdfResourceID: ResourceID(),
+            pdfURL: pdfURL.standardizedFileURL,
+            pdfBookmarkData: pdfBookmark,
+            pdfContentHash: TestPayload.sha256(pdfBytes),
+            markdownResourceID: ResourceID(),
+            markdownURL: noteURL.standardizedFileURL,
+            markdownBookmarkData: nil
+        )
+        let store = makeStore()
+        XCTAssertThrowsError(try store.commitPendingAssociation(unbookmarked)) { error in
+            XCTAssertEqual(error as? PaperNoteAssociationError, .bookmarkCreationFailed(noteURL.standardizedFileURL))
+        }
+
+        // Also verify a legacy/deserialized association with nil markdownBookmarkData
+        // is reported as .bookmarkMissing rather than .resolved.
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        struct StoredAssociationsFixture: Codable {
+            let version: Int
+            let associations: [PaperNoteAssociation]
+        }
+        try FileManager.default.createDirectory(
+            at: storageURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let json = try encoder.encode(StoredAssociationsFixture(version: 1, associations: [unbookmarked]))
+        try json.write(to: storageURL)
+
+        let reloaded = makeStore()
+        let loaded = try XCTUnwrap(reloaded.associations.first)
+        let resolution = reloaded.resolveAssociation(loaded)
+        XCTAssertEqual(resolution.markdownResolution, .bookmarkMissing(lastKnownURL: noteURL.standardizedFileURL))
+        XCTAssertEqual(reloaded.planDefaultNoteCreation(forPDF: pdfURL), .brokenAssociation(loaded))
+
+        let relinked = try reloaded.relinkMarkdown(for: loaded.id, to: noteURL)
+        XCTAssertNotNil(relinked.markdownBookmarkData)
+        XCTAssertEqual(
+            reloaded.resolveAssociation(relinked).markdownResolution,
+            .resolved(noteURL.standardizedFileURL, refreshedBookmark: false)
+        )
+    }
+
+    func testCreateNoteDefaultsToRequiringLocationAuthorizationWhilePreservingSavePanelAndNotebookWorkflows() throws {
+        let papersDir = directory.url.appendingPathComponent("Papers", isDirectory: true)
+        let (pdfURL, _) = try makePDF(named: "AuthDefault.pdf", in: papersDir)
+        let vaultDir = directory.url.appendingPathComponent("Vault", isDirectory: true)
+        try FileManager.default.createDirectory(at: vaultDir, withIntermediateDirectories: true)
+
+        let strictAuthorizer = ExplicitNoteLocationAuthorizer(authorizedDirectories: [])
+        let store = makeStore(authorizer: strictAuthorizer)
+
+        // Default createNote() without isUserSelectedDestination: true MUST require directory authorization.
+        let unauthorizedNoteURL = papersDir.appendingPathComponent("CustomName.md")
+        XCTAssertThrowsError(
+            try store.createNote(forPDF: pdfURL, at: unauthorizedNoteURL, initialContent: "# Denied")
+        ) { error in
+            XCTAssertEqual(error as? PaperNoteAssociationError, .directoryNotAuthorized(papersDir.standardizedFileURL))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: unauthorizedNoteURL.path))
+
+        // Legitimate Save Panel destination (explicitly confirmed by caller) succeeds.
+        let savePanelURL = papersDir.appendingPathComponent("SavePanelChosen.md")
+        let (savePanelAssoc, savePanelSession) = try store.createNote(
+            forPDF: pdfURL,
+            at: savePanelURL,
+            initialContent: "# From Save Panel",
+            isUserSelectedDestination: true
+        )
+        savePanelSession.close()
+        XCTAssertEqual(savePanelAssoc.markdownURL.standardizedFileURL, savePanelURL.standardizedFileURL)
+
+        // Legitimate Research Notebook Directory workflow succeeds without isUserSelectedDestination: true.
+        let (secondPDF, _) = try makePDF(named: "VaultPaper.pdf", in: papersDir)
+        try store.setNotebookDirectory(vaultDir)
+        let vaultNoteURL = vaultDir.appendingPathComponent("VaultCustom.md")
+        let (vaultAssoc, vaultSession) = try store.createNote(
+            forPDF: secondPDF,
+            at: vaultNoteURL,
+            initialContent: "# In Obsidian Vault"
+        )
+        vaultSession.close()
+        XCTAssertEqual(vaultAssoc.markdownURL.standardizedFileURL, vaultNoteURL.standardizedFileURL)
+    }
 }
