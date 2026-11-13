@@ -27,6 +27,18 @@ if [[ -n "${SPARKLE_PUBLIC_ED_KEY:-}" ]]; then
   SPARKLE_BUILD_SETTINGS+=("SPARKLE_PUBLIC_ED_KEY=$SPARKLE_PUBLIC_ED_KEY")
 fi
 
+# Workaround: with Xcode 27.2 on this machine, swiftc's internal seatbelt
+# sandbox fails to apply ("sandbox-exec: sandbox_apply: Operation not
+# permitted"), which breaks the macro plugin server and makes every SwiftUI
+# macro (@State, etc.) fail with "swift-plugin-server produced malformed
+# response". Disabling the compiler's subprocess sandbox restores macros.
+# Disable this override with DISABLE_SWIFT_SANDBOX_WORKAROUND=1.
+if [[ "${DISABLE_SWIFT_SANDBOX_WORKAROUND:-0}" != "1" ]]; then
+  SWIFT_SANDBOX_WORKAROUND=(OTHER_SWIFT_FLAGS='$(inherited) -disable-sandbox')
+else
+  SWIFT_SANDBOX_WORKAROUND=()
+fi
+
 xcodebuild \
   -project YoPDF.xcodeproj \
   -scheme YoPDF \
@@ -34,4 +46,5 @@ xcodebuild \
   -destination "$DESTINATION" \
   -derivedDataPath "$DERIVED_DATA" \
   "${SPARKLE_BUILD_SETTINGS[@]}" \
+  "${SWIFT_SANDBOX_WORKAROUND[@]}" \
   build

@@ -28,12 +28,20 @@ private struct ReaderPDFDropDestination: ViewModifier {
             .dropDestination(for: URL.self) { urls, _ in
                 guard let url = urls.first, url.isFileURL else { return false }
                 return openPDF(url)
-            } isTargeted: { isTargeted = $0 }
+            } isTargeted: { targeted in
+                isTargeted = targeted
+            }
     }
 }
 
 private struct SinglePaneTabDraggableModifier: ViewModifier {
     let tab: WorkspaceTabSession
+    /// Fired directly for a plain left click that never became a drag. The
+    /// click-to-activate path must be an explicit callback, not a synthesized
+    /// mouse event: forwarding `mouseDown`/`mouseUp` into the SwiftUI content
+    /// underneath does not reliably trigger a SwiftUI Button, which left tabs
+    /// unswitchable by click.
+    let onActivate: () -> Void
     let onDragStarted: (() -> Void)?
     let onDragEnded: (() -> Void)?
 
@@ -42,14 +50,14 @@ private struct SinglePaneTabDraggableModifier: ViewModifier {
             // The capsule is the drag source. The native drag session reports
             // every session end, so a cancelled or rejected tab drag cannot
             // strand the dimmed source pane or hover overlays. Plain clicks
-            // are forwarded to the Buttons underneath.
+            // switch tabs through `onActivate`.
             content.overlay {
                 PaneDragSource(
                     payload: PaneDragPayload(kind: .tab, sourceTabID: tab.id, sourcePaneID: tab.activePaneID),
                     previewTitle: tab.title,
                     onDragStarted: { onDragStarted?() },
                     onDragEnded: { onDragEnded?() },
-                    forwardsUnclaimedClicks: true
+                    onClick: onActivate
                 )
             }
         } else {
@@ -167,6 +175,7 @@ private struct WorkspaceTabStrip: View {
     private func tabView(_ tab: WorkspaceTabSession) -> some View {
         let isActive = tab.id == workspace.activeTabID
         let isDragging = draggingTabID == tab.id
+        let showsCloseButton = workspace.tabs.count > 1
 
         return HStack(spacing: 2) {
             Button {
@@ -176,6 +185,11 @@ private struct WorkspaceTabStrip: View {
                     .lineLimit(1)
                     .frame(maxWidth: 190, alignment: .leading)
                     .padding(.leading, 10)
+                    // The close button supplies the visual spacing on the right
+                    // when it is there. A lone tab has nothing after the label,
+                    // so without this the text would sit hard against the
+                    // capsule's trailing edge and read as left shifted.
+                    .padding(.trailing, showsCloseButton ? 0 : 10)
                     .padding(.vertical, 6)
                     .contentShape(Rectangle())
             }
@@ -183,6 +197,15 @@ private struct WorkspaceTabStrip: View {
             .accessibilityLabel(tab.title)
             .accessibilityIdentifier("workspace-tab-\(tab.id.uuidString)")
             .accessibilityAddTraits(isActive ? .isSelected : [])
+            // The drag overlay rides on the title button only. The close
+            // button stays outside it so a plain click hits its own native
+            // Button, and the drag handle covers the area users actually grab.
+            .modifier(SinglePaneTabDraggableModifier(
+                tab: tab,
+                onActivate: { workspace.activate(tabID: tab.id) },
+                onDragStarted: { onTabDragStarted?(tab) },
+                onDragEnded: { onTabDragEnded?() }
+            ))
 
             if workspace.tabs.count > 1 {
                 Button {
@@ -226,11 +249,6 @@ private struct WorkspaceTabStrip: View {
         .animation(isDragging ? nil : Self.reorderAnimation, value: dropIndex)
         .shadow(color: .black.opacity(isDragging ? 0.16 : 0), radius: 6, y: 2)
         .zIndex(isDragging ? 1 : 0)
-        .modifier(SinglePaneTabDraggableModifier(
-            tab: tab,
-            onDragStarted: { onTabDragStarted?(tab) },
-            onDragEnded: { onTabDragEnded?() }
-        ))
     }
 
     /// Right-click counterpart of the keyboard commands. It moves the tab that
@@ -987,15 +1005,10 @@ struct PDFReaderView: View {
 
     private var toolbar: some View {
         HStack(spacing: 12) {
-            Button {
-                isImporterPresented = true
-            } label: {
-                Label("Open", systemImage: "folder")
-            }
-            .help("Open a PDF (⌘O)")
-
-            Divider().frame(height: 18)
-
+            // No "Open" button here: the empty workspace already offers
+            // "Open PDF…" in the middle of the window, and File › Open (⌘O)
+            // covers the loaded-document case. Repeating it in the toolbar
+            // only costs horizontal room for the reading controls.
             Button {
                 toggleSidebar()
             } label: {
@@ -1522,7 +1535,13 @@ struct PDFReaderView: View {
             let isDraggingThisPane = (activeDraggedPayload?.sourcePaneID == paneID)
 
             VStack(spacing: 0) {
-                PaneHeaderView(
+                // The per-pane header carries the drag handle, title, page
+                // info, and close button needed to manage a split. With a
+                // single pane the tab strip and the toolbar already show the
+                // same title and page info, so rendering the header would
+                // only duplicate them and steal vertical space.
+                if tab.layoutTree.paneCount > 1 {
+                    PaneHeaderView(
                     paneID: paneID,
                     title: resourceSession.fileURL?.lastPathComponent ?? "Document",
                     pageIndicator: resourceSession.pageCount > 0 ? "\(paneModel.currentPageIndex + 1) / \(resourceSession.pageCount)" : "",
@@ -1537,7 +1556,8 @@ struct PDFReaderView: View {
                     onDragEnded: {
                         endActiveDrag()
                     }
-                )
+                    )
+                }
 
                 GeometryReader { paneGeometry in
                     ZStack(alignment: .topTrailing) {
@@ -1602,7 +1622,23 @@ struct PDFReaderView: View {
                             anchorResolver: resolver,
                             onActivatePane: {
                                 activatePane(paneID)
-                            }
+                            },
+                            paneDropSink: PaneDropSink(
+                                validate: { direction in
+                                    validateDrop(on: paneID, direction: direction)
+                                },
+                                onHoverChanged: { hover in
+                                    paneHoverStates[paneID] = hover
+                                },
+                                onPerformDrop: { payload, direction in
+                                    handlePaneDrop(
+                                        payload: payload,
+                                        on: paneID,
+                                        direction: direction,
+                                        in: paneGeometry.size
+                                    )
+                                }
+                            )
                         )
                         .transaction { $0.animation = nil }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1653,20 +1689,6 @@ struct PDFReaderView: View {
                     .onTapGesture {
                         activatePane(paneID)
                     }
-                    .modifier(PaneDropTargetModifier(
-                        targetPaneID: paneID,
-                        containerSize: paneGeometry.size,
-                        currentHoverDirection: paneHoverStates[paneID]?.direction,
-                        validateDrop: { direction in
-                            validateDrop(on: paneID, direction: direction)
-                        },
-                        onHoverChanged: { hover in
-                            paneHoverStates[paneID] = hover
-                        },
-                        onPerformDrop: { payload, direction in
-                            handlePaneDrop(payload: payload, on: paneID, direction: direction, in: paneGeometry.size)
-                        }
-                    ))
                 }
             }
             .accessibilityElement(children: .contain)

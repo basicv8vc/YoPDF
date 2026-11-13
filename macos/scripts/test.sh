@@ -34,6 +34,11 @@ common=(
   -derivedDataPath "$DERIVED_DATA"
 )
 
+# Same macro plugin server workaround as build.sh (see the comment there).
+if [[ "${DISABLE_SWIFT_SANDBOX_WORKAROUND:-0}" != "1" ]]; then
+  common+=(OTHER_SWIFT_FLAGS='$(inherited) -disable-sandbox')
+fi
+
 xcodebuild "${common[@]}" build-for-testing
 
 if [[ "${XCODEBUILD_TEST:-0}" == "1" ]]; then

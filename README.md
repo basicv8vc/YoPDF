@@ -42,6 +42,29 @@ in [the P0-B split-pane requirements](Docs/P0-B-DRAG-DROP-REQUIREMENTS.md).
   and is never required to render a document.
 - **Untrusted input.** PDFs are data, never instructions.
 
+## Windows support policy
+
+YoPDF for Windows is a product requirement with an explicit support matrix:
+
+| Requirement | Policy |
+|---|---|
+| Minimum supported OS | Windows 10 22H2 (Build 19045), x64 |
+| Recommended OS | Windows 11 x64 (Build 22000 or later) |
+| CPU architecture | x64 / AMD64 |
+| Native ARM64 | Not committed for the initial release |
+| Windows Server | Not an officially supported desktop target |
+| Windows 10 earlier than 22H2 | Not officially supported |
+| Windows 10 vs Windows 11 | Same product UI and feature behavior |
+
+Windows 10 and Windows 11 must deliver the same YoPDF experience and are
+verified as two separate acceptance tracks (see the Windows acceptance gate
+plan maintained with the Windows PoC). Do not introduce Windows 11-only APIs
+without a verified Windows 10 compatibility path.
+
+Note: Microsoft's regular support for Windows 10 ended on October 14, 2025.
+YoPDF application compatibility with Windows 10 22H2 is independent of
+Microsoft's OS security-support lifecycle and is stated as a product policy.
+
 ## Repository layout
 
 ```

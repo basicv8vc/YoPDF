@@ -908,6 +908,62 @@ final class PaneDragDropTests: XCTestCase {
         XCTAssertEqual(forbiddenNeither, .forbidden)
     }
 
+
+    // MARK: - 14b. AppKit destination: payload-to-drag-operation mapping
+
+    /// The AppKit-level drop destination maps internal pane/tab payloads to a
+    /// move and Finder file payloads to a copy, mirroring the SwiftUI delegate
+    /// rules in test 14 so both destinations stay in agreement.
+    func testPaneDropSinkOperationSelectionForInternalMovesAndExternalCopies() {
+        let sink = PaneDropSink(
+            validate: { _ in (true, "") },
+            onHoverChanged: { _ in },
+            onPerformDrop: { _, _ in true }
+        )
+
+        XCTAssertEqual(
+            sink.dropOperation(for: .pane(PaneDragPayload(kind: .pane, sourceTabID: UUID()))),
+            .move
+        )
+        XCTAssertEqual(
+            sink.dropOperation(for: .pane(PaneDragPayload(kind: .tab, sourceTabID: UUID()))),
+            .move
+        )
+        XCTAssertEqual(
+            sink.dropOperation(for: .fileURL(URL(fileURLWithPath: "/tmp/fake.pdf"))),
+            .copy
+        )
+    }
+
+    /// CTO P1 (PR #55 review): the hover preview must be cleared on every
+    /// session-end path. The destination clears through `concludePaneDrop`;
+    /// model-side, the sink contract is that `onHoverChanged(nil)` is the
+    /// reset signal, so assert the callback wiring survives a nil reset round
+    /// trip without retaining a stale hover.
+    func testPaneDropSinkHoverResetRoundTrip() {
+        final class StateBox: @unchecked Sendable {
+            var states: [PaneDropHoverState?] = []
+        }
+        let box = StateBox()
+        let sink = PaneDropSink(
+            validate: { _ in (false, "limit reached") },
+            onHoverChanged: { box.states.append($0) },
+            onPerformDrop: { _, _ in false }
+        )
+
+        // Hover in (invalid → red preview), then the cleanup path.
+        sink.onHoverChanged(PaneDropHoverState(
+            direction: .left,
+            isValid: false,
+            feedbackMessage: "limit reached"
+        ))
+        sink.onHoverChanged(nil)
+
+        XCTAssertEqual(box.states.count, 2)
+        XCTAssertFalse(box.states[0]!.isValid)
+        XCTAssertNil(box.states[1])
+    }
+
     // MARK: - 15. Regression: Resource Cleanup on Failed Insertion (CTO P2)
 
     func testResourceCleanupOnFailedInsertionDoesNotCloseSharedResource() throws {
