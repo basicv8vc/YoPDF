@@ -122,6 +122,8 @@ targets:
       - path: YoPDF/Reader/ReaderNavigationState.swift
       - path: YoPDF/Reader/ReaderSidebarItems.swift
       - path: YoPDF/Reader/WorkspaceLayoutView.swift
+      - path: YoPDF/Markdown/MarkdownEditorView.swift
+      - path: YoPDF/Markdown/MarkdownEditorDemoView.swift
       # The preview provider is unit tested because its lifecycle rules (what
       # may be written back, what a prune must remove) guard sensitive data.
       - path: YoPDF/Reader/RecentDocumentThumbnailProvider.swift
