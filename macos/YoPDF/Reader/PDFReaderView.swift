@@ -34,6 +34,12 @@ private struct ReaderPDFDropDestination: ViewModifier {
 
 private struct SinglePaneTabDraggableModifier: ViewModifier {
     let tab: WorkspaceTabSession
+    /// Fired directly for a plain left click that never became a drag. The
+    /// click-to-activate path must be an explicit callback, not a synthesized
+    /// mouse event: forwarding `mouseDown`/`mouseUp` into the SwiftUI content
+    /// underneath does not reliably trigger a SwiftUI Button, which left tabs
+    /// unswitchable by click.
+    let onActivate: () -> Void
     let onDragStarted: (() -> Void)?
     let onDragEnded: (() -> Void)?
 
@@ -42,14 +48,14 @@ private struct SinglePaneTabDraggableModifier: ViewModifier {
             // The capsule is the drag source. The native drag session reports
             // every session end, so a cancelled or rejected tab drag cannot
             // strand the dimmed source pane or hover overlays. Plain clicks
-            // are forwarded to the Buttons underneath.
+            // switch tabs through `onActivate`.
             content.overlay {
                 PaneDragSource(
                     payload: PaneDragPayload(kind: .tab, sourceTabID: tab.id, sourcePaneID: tab.activePaneID),
                     previewTitle: tab.title,
                     onDragStarted: { onDragStarted?() },
                     onDragEnded: { onDragEnded?() },
-                    forwardsUnclaimedClicks: true
+                    onClick: onActivate
                 )
             }
         } else {
@@ -189,6 +195,15 @@ private struct WorkspaceTabStrip: View {
             .accessibilityLabel(tab.title)
             .accessibilityIdentifier("workspace-tab-\(tab.id.uuidString)")
             .accessibilityAddTraits(isActive ? .isSelected : [])
+            // The drag overlay rides on the title button only. The close
+            // button stays outside it so a plain click hits its own native
+            // Button, and the drag handle covers the area users actually grab.
+            .modifier(SinglePaneTabDraggableModifier(
+                tab: tab,
+                onActivate: { workspace.activate(tabID: tab.id) },
+                onDragStarted: { onTabDragStarted?(tab) },
+                onDragEnded: { onTabDragEnded?() }
+            ))
 
             if workspace.tabs.count > 1 {
                 Button {
@@ -232,11 +247,6 @@ private struct WorkspaceTabStrip: View {
         .animation(isDragging ? nil : Self.reorderAnimation, value: dropIndex)
         .shadow(color: .black.opacity(isDragging ? 0.16 : 0), radius: 6, y: 2)
         .zIndex(isDragging ? 1 : 0)
-        .modifier(SinglePaneTabDraggableModifier(
-            tab: tab,
-            onDragStarted: { onTabDragStarted?(tab) },
-            onDragEnded: { onTabDragEnded?() }
-        ))
     }
 
     /// Right-click counterpart of the keyboard commands. It moves the tab that
@@ -1528,7 +1538,13 @@ struct PDFReaderView: View {
             let isDraggingThisPane = (activeDraggedPayload?.sourcePaneID == paneID)
 
             VStack(spacing: 0) {
-                PaneHeaderView(
+                // The per-pane header carries the drag handle, title, page
+                // info, and close button needed to manage a split. With a
+                // single pane the tab strip and the toolbar already show the
+                // same title and page info, so rendering the header would
+                // only duplicate them and steal vertical space.
+                if tab.layoutTree.paneCount > 1 {
+                    PaneHeaderView(
                     paneID: paneID,
                     title: resourceSession.fileURL?.lastPathComponent ?? "Document",
                     pageIndicator: resourceSession.pageCount > 0 ? "\(paneModel.currentPageIndex + 1) / \(resourceSession.pageCount)" : "",
@@ -1543,7 +1559,8 @@ struct PDFReaderView: View {
                     onDragEnded: {
                         endActiveDrag()
                     }
-                )
+                    )
+                }
 
                 GeometryReader { paneGeometry in
                     ZStack(alignment: .topTrailing) {
