@@ -32,6 +32,7 @@ final class WorkspaceTabSession: Identifiable, ObservableObject {
         navigationState = ReaderNavigationState()
 
         setupObserving(for: initialSession)
+        setupNavigationObserving()
     }
 
     init(
@@ -50,6 +51,7 @@ final class WorkspaceTabSession: Identifiable, ObservableObject {
         self.navigationState = ReaderNavigationState()
 
         setupObserving(for: initialSession)
+        setupNavigationObserving()
     }
 
     // MARK: - Active Pane Accessors
@@ -303,6 +305,16 @@ final class WorkspaceTabSession: Identifiable, ObservableObject {
             .store(in: &cancellables)
 
         session.resourceSession.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+    }
+
+    /// The sidebar visibility and section live on `navigationState`, and the
+    /// reader's conditional layout reads it. Without this forwarding the
+    /// toggle only takes effect when an unrelated model change re-renders
+    /// the reader, which the user sees as a delayed sidebar toggle.
+    func setupNavigationObserving() {
+        navigationState.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
     }
