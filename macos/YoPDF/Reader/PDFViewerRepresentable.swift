@@ -1,7 +1,22 @@
 import AppKit
 import PDFKit
 import SwiftUI
+import UniformTypeIdentifiers
 import YoPDFCore
+
+/// TEMP-DEBUG: callbacks wiring the AppKit-level drop destination installed on
+/// `MarkupPDFView` into the SwiftUI pane model.
+///
+/// The SwiftUI `.onDrop` receivers never received drag events over a pane,
+/// because a full-bleed `NSViewRepresentable` (PDFView) owns the pointer there
+/// and the outer content-level `.dropDestination` claimed every drop first.
+/// The AppKit destination below is registered on the view the pointer actually
+/// hits, so it cannot be bypassed.
+struct PaneDropSink {
+    let validate: (LayoutInsertionDirection) -> (isValid: Bool, feedback: String)
+    let onHoverChanged: (PaneDropHoverState?) -> Void
+    let onPerformDrop: (DropPayload, LayoutInsertionDirection) -> Bool
+}
 
 /// Everything a context-menu builder needs to know about the click.
 ///
@@ -62,6 +77,8 @@ struct PDFViewerRepresentable: NSViewRepresentable {
     /// Lets the SwiftUI layer turn a page rectangle into an anchor rectangle.
     let anchorResolver: PageAnchorResolver
     var onActivatePane: (() -> Void)? = nil
+    /// TEMP-DEBUG: AppKit drop destination callbacks for the pane split flow.
+    var paneDropSink: PaneDropSink? = nil
 
     func makeNSView(context: Context) -> MarkupPDFView {
         let view = MarkupPDFView(frame: .zero)
@@ -80,6 +97,7 @@ struct PDFViewerRepresentable: NSViewRepresentable {
         view.noteMarkers = noteMarkers
         view.isPlacingNote = isPlacingNote
         view.onActivatePane = onActivatePane
+        view.installPaneDropSink(paneDropSink)
         context.coordinator.attach(to: view)
         context.coordinator.updateHandlers(on: view, parent: self)
         anchorResolver.pdfView = view
@@ -90,6 +108,7 @@ struct PDFViewerRepresentable: NSViewRepresentable {
         context.coordinator.parent = self
         context.coordinator.updateHandlers(on: view, parent: self)
         view.onActivatePane = onActivatePane
+        view.installPaneDropSink(paneDropSink)
         anchorResolver.pdfView = view
 
         let documentChanged = view.document !== document
@@ -363,6 +382,9 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
     var onActivatePane: (() -> Void)?
     let magnificationController = PDFViewMagnificationController()
     var makeMenuItems: ((PageMenuContext) -> [NSMenuItem])?
+    // MARK: Pane drag & drop destination state (TEMP-DEBUG)
+    fileprivate var paneDropSink: PaneDropSink?
+    fileprivate var activePaneDropDirection: LayoutInsertionDirection?
 
     private var mouseDownPoint: CGPoint?
     private var mouseDidDrag = false
@@ -418,6 +440,113 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         magnificationController.attach(to: self)
+    }
+
+    // MARK: - Pane drag & drop destination
+    //
+    // AppKit routes mouse events to the deepest view under the pointer (the
+    // PDFKit content, so selection and scrolling keep working) while dragging
+    // destination lookup walks UP from that view to the nearest ancestor
+    // registered for dragged types — this view. That makes it immune to the
+    // SwiftUI `.onDrop` routing problem where a full-bleed AppKit representable
+    // and an outer `.dropDestination` swallow every drag before the per-pane
+    // receiver sees it.
+
+    /// Registers the pane drop types without discarding PDFKit's own
+    /// registrations.
+    func installPaneDropSink(_ sink: PaneDropSink?) {
+        paneDropSink = sink
+        guard sink != nil else { return }
+        let types = Set(registeredDraggedTypes).union([
+            NSPasteboard.PasteboardType(UTType.yoPDFPaneDrag.identifier),
+            NSPasteboard.PasteboardType(UTType.fileURL.identifier),
+            NSPasteboard.PasteboardType(UTType.pdf.identifier)
+        ])
+        registerForDraggedTypes(Array(types))
+    }
+
+    private func dropPayload(for pasteboard: NSPasteboard) -> DropPayload? {
+        // In-app pane and tab drags carry the dedicated JSON UTI.
+        if let data = pasteboard.data(
+            forType: NSPasteboard.PasteboardType(UTType.yoPDFPaneDrag.identifier)
+        ), let payload = try? JSONDecoder().decode(PaneDragPayload.self, from: data) {
+            return .pane(payload)
+        }
+        // Finder and other external sources provide file URLs.
+        if let urls = pasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL], let url = urls.first, url.isFileURL {
+            return .fileURL(url)
+        }
+        return nil
+    }
+
+    /// Direction and hover state follow the SwiftUI convention: top-left
+    /// origin, container size = this view's bounds.
+    @discardableResult
+    private func updatePaneDropHover(_ draggingInfo: NSDraggingInfo) -> NSDragOperation {
+        guard let sink = paneDropSink,
+              let payload = dropPayload(for: draggingInfo.draggingPasteboard)
+        else { return [] }
+
+        let point = convert(draggingInfo.draggingLocation, from: nil)
+        let flippedPoint = CGPoint(x: point.x, y: bounds.height - point.y)
+        let direction = LayoutInsertionDirection.direction(
+            for: flippedPoint,
+            in: bounds.size,
+            previousDirection: activePaneDropDirection,
+            hysteresis: 0.05
+        )
+        activePaneDropDirection = direction
+        let check = sink.validate(direction)
+        sink.onHoverChanged(PaneDropHoverState(
+            direction: direction,
+            isValid: check.isValid,
+            feedbackMessage: check.feedback
+        ))
+        switch payload {
+        case .pane:
+            return check.isValid ? [.move] : []
+        case .fileURL:
+            return check.isValid ? [.copy] : []
+        }
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        return updatePaneDropHover(sender)
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        return updatePaneDropHover(sender)
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        activePaneDropDirection = nil
+        paneDropSink?.onHoverChanged(nil)
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        defer {
+            activePaneDropDirection = nil
+            paneDropSink?.onHoverChanged(nil)
+        }
+        guard let sink = paneDropSink,
+              let payload = dropPayload(for: sender.draggingPasteboard)
+        else { return false }
+
+        let point = convert(sender.draggingLocation, from: nil)
+        let flippedPoint = CGPoint(x: point.x, y: bounds.height - point.y)
+        let direction = activePaneDropDirection ?? LayoutInsertionDirection.direction(
+            for: flippedPoint,
+            in: bounds.size
+        )
+        return sink.onPerformDrop(payload, direction)
+    }
+
+    override func concludeDragOperation(_ sender: NSDraggingInfo?) {
+        activePaneDropDirection = nil
+        paneDropSink?.onHoverChanged(nil)
     }
 
     /// Every path that opens a note popover funnels through here, including the

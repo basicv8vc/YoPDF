@@ -28,7 +28,9 @@ private struct ReaderPDFDropDestination: ViewModifier {
             .dropDestination(for: URL.self) { urls, _ in
                 guard let url = urls.first, url.isFileURL else { return false }
                 return openPDF(url)
-            } isTargeted: { isTargeted = $0 }
+            } isTargeted: { targeted in
+                isTargeted = targeted
+            }
     }
 }
 
@@ -1625,7 +1627,23 @@ struct PDFReaderView: View {
                             anchorResolver: resolver,
                             onActivatePane: {
                                 activatePane(paneID)
-                            }
+                            },
+                            paneDropSink: PaneDropSink(
+                                validate: { direction in
+                                    validateDrop(on: paneID, direction: direction)
+                                },
+                                onHoverChanged: { hover in
+                                    paneHoverStates[paneID] = hover
+                                },
+                                onPerformDrop: { payload, direction in
+                                    handlePaneDrop(
+                                        payload: payload,
+                                        on: paneID,
+                                        direction: direction,
+                                        in: paneGeometry.size
+                                    )
+                                }
+                            )
                         )
                         .transaction { $0.animation = nil }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1676,20 +1694,6 @@ struct PDFReaderView: View {
                     .onTapGesture {
                         activatePane(paneID)
                     }
-                    .modifier(PaneDropTargetModifier(
-                        targetPaneID: paneID,
-                        containerSize: paneGeometry.size,
-                        currentHoverDirection: paneHoverStates[paneID]?.direction,
-                        validateDrop: { direction in
-                            validateDrop(on: paneID, direction: direction)
-                        },
-                        onHoverChanged: { hover in
-                            paneHoverStates[paneID] = hover
-                        },
-                        onPerformDrop: { payload, direction in
-                            handlePaneDrop(payload: payload, on: paneID, direction: direction, in: paneGeometry.size)
-                        }
-                    ))
                 }
             }
             .accessibilityElement(children: .contain)
