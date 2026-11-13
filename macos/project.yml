@@ -55,8 +55,8 @@ targets:
       base:
         PRODUCT_NAME: YoPDF
         PRODUCT_BUNDLE_IDENTIFIER: app.yopdf
-        MARKETING_VERSION: "2026.11.11"
-        CURRENT_PROJECT_VERSION: "8"
+        MARKETING_VERSION: "2026.11.13"
+        CURRENT_PROJECT_VERSION: "9"
         # Public Sparkle settings. The feed is the signed appcast committed to
         # the repository root; the key is the EdDSA public key whose private
         # half lives in the release machine's login Keychain. Both may be
