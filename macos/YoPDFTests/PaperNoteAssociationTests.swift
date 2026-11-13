@@ -317,7 +317,7 @@ final class PaperNoteAssociationTests: XCTestCase {
         XCTAssertEqual(restored.markdownURL.standardizedFileURL, noteURL.standardizedFileURL)
 
         // Unlinking removes metadata only; files stay on disk.
-        relaunched.unlinkAssociation(id: restored.id)
+        try relaunched.unlinkAssociation(id: restored.id)
         XCTAssertTrue(relaunched.associations.isEmpty)
         XCTAssertTrue(FileManager.default.fileExists(atPath: pdfURL.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: noteURL.path))
@@ -686,5 +686,115 @@ final class PaperNoteAssociationTests: XCTestCase {
         )
         vaultSession.close()
         XCTAssertEqual(vaultAssoc.markdownURL.standardizedFileURL, vaultNoteURL.standardizedFileURL)
+    }
+
+    // MARK: - Final CTO Review P2-2: Failure-Safe clearAllAssociations & Observable unlinkAssociation
+
+    func testClearAllAssociationsFailurePreservesUnreadableStorageAndBlocksOverwrite() throws {
+        try FileManager.default.createDirectory(
+            at: storageURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let garbage = Data("{ unreadable corrupted associations".utf8)
+        try garbage.write(to: storageURL)
+
+        let (pdfURL, _) = try makePDF(named: "RecoverFail.pdf")
+        let noteURL = try directory.write("RecoverFail.notes.md", Data("# Keep Safe".utf8))
+
+        let store = PaperNoteAssociationStore(
+            storageURL: storageURL,
+            defaults: defaults,
+            access: SecurityScopeSpy(),
+            associationsRemover: { _ in
+                throw NSError(
+                    domain: NSCocoaErrorDomain,
+                    code: NSFileWriteNoPermissionError,
+                    userInfo: [NSLocalizedDescriptionKey: "Injected deletion failure"]
+                )
+            }
+        )
+        XCTAssertTrue(store.hasUnreadableAssociationsStorage)
+
+        // Failed clearAllAssociations must throw and keep hasUnreadableAssociationsStorage == true.
+        XCTAssertThrowsError(try store.clearAllAssociations()) { error in
+            guard case PaperNoteAssociationError.storageWriteFailed = error else {
+                return XCTFail("Expected storageWriteFailed, got \(error)")
+            }
+        }
+        XCTAssertTrue(store.hasUnreadableAssociationsStorage)
+        XCTAssertEqual(try Data(contentsOf: storageURL), garbage)
+
+        // Subsequent persistence attempts must remain blocked and never overwrite unreadable storage.
+        XCTAssertThrowsError(try store.linkExistingNote(forPDF: pdfURL, markdownURL: noteURL)) { error in
+            XCTAssertEqual(error as? PaperNoteAssociationError, .storageCorrupted)
+        }
+        XCTAssertThrowsError(try store.unlinkAssociation(id: UUID())) { error in
+            XCTAssertEqual(error as? PaperNoteAssociationError, .storageCorrupted)
+        }
+        XCTAssertEqual(try Data(contentsOf: storageURL), garbage)
+
+        // When deletion succeeds on a recoverable store, state resets cleanly and new links persist.
+        let recoverableStore = makeStore()
+        try recoverableStore.clearAllAssociations()
+        XCTAssertFalse(recoverableStore.hasUnreadableAssociationsStorage)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storageURL.path))
+        let linked = try recoverableStore.linkExistingNote(forPDF: pdfURL, markdownURL: noteURL)
+        XCTAssertEqual(recoverableStore.associations.count, 1)
+        XCTAssertEqual(linked.markdownURL.standardizedFileURL, noteURL.standardizedFileURL)
+    }
+
+    func testUnlinkAssociationPersistenceFailureIsObservableAndPreservesState() throws {
+        final class ToggleableWriter: @unchecked Sendable {
+            private let lock = NSLock()
+            var shouldFail = false
+
+            func write(_ data: Data, to url: URL) throws {
+                if lock.withLock({ shouldFail }) {
+                    throw NSError(
+                        domain: NSCocoaErrorDomain,
+                        code: NSFileWriteNoPermissionError,
+                        userInfo: [NSLocalizedDescriptionKey: "Injected unlink persistence failure"]
+                    )
+                }
+                try data.write(to: url, options: [.atomic])
+            }
+        }
+
+        let (pdfURL, _) = try makePDF(named: "UnlinkFail.pdf")
+        let noteURL = try directory.write("UnlinkFail.notes.md", Data("# Note".utf8))
+        let writer = ToggleableWriter()
+
+        let store = PaperNoteAssociationStore(
+            storageURL: storageURL,
+            defaults: defaults,
+            access: SecurityScopeSpy(),
+            associationsDataWriter: { data, url in
+                try writer.write(data, to: url)
+            }
+        )
+
+        let assoc = try store.linkExistingNote(forPDF: pdfURL, markdownURL: noteURL)
+        XCTAssertEqual(store.associations.count, 1)
+
+        // Unlink fails when storage write fails, leaving in-memory & disk state consistent.
+        writer.shouldFail = true
+        XCTAssertThrowsError(try store.unlinkAssociation(id: assoc.id)) { error in
+            guard case PaperNoteAssociationError.storageWriteFailed = error else {
+                return XCTFail("Expected storageWriteFailed, got \(error)")
+            }
+        }
+        XCTAssertEqual(store.associations.count, 1)
+
+        // Unlinking an unknown ID surfaces associationNotFound.
+        writer.shouldFail = false
+        let missingID = UUID()
+        XCTAssertThrowsError(try store.unlinkAssociation(id: missingID)) { error in
+            XCTAssertEqual(error as? PaperNoteAssociationError, .associationNotFound(missingID))
+        }
+
+        // Valid unlink succeeds once persistence works.
+        try store.unlinkAssociation(id: assoc.id)
+        XCTAssertTrue(store.associations.isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: noteURL.path))
     }
 }

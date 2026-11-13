@@ -755,4 +755,269 @@ final class MarkdownResourceSessionTests: XCTestCase {
         XCTAssertEqual(Data(finalCheck.content.utf8), precomposedBytes)
         finalCheck.close()
     }
+
+    // MARK: - Final CTO Review P1-1: Stale Candidate During Reload / Open
+
+    func testReloadDuringInFlightAutosaveRefreshesCandidateAndAllowsSubsequentSave() async throws {
+        final class CountingRaceIO: DocumentStoreIO, @unchecked Sendable {
+            private let inner = ScriptedDocumentStoreIO()
+            private let lock = NSLock()
+            private var reads = 0
+            var onRead: (@Sendable (Int) -> Void)?
+
+            var readCount: Int { lock.withLock { reads } }
+            var beforeCoordinatedWrite: (@Sendable () -> Void)? {
+                get { inner.beforeCoordinatedWrite }
+                set { inner.beforeCoordinatedWrite = newValue }
+            }
+
+            func status(of url: URL) throws -> FileStatus { try inner.status(of: url) }
+            func version(of url: URL) throws -> DocumentVersion { try inner.version(of: url) }
+            func readContents(of url: URL) throws -> Data {
+                let data = try inner.readContents(of: url)
+                let count = lock.withLock {
+                    reads += 1
+                    return reads
+                }
+                onRead?(count)
+                return data
+            }
+            func createStagingFile(nextTo url: URL, contents: Data) throws -> StagedFile {
+                try inner.createStagingFile(nextTo: url, contents: contents)
+            }
+            func withCoordinatedWrite(at url: URL, _ body: (URL) throws -> URL) throws -> URL {
+                try inner.withCoordinatedWrite(at: url, body)
+            }
+            func replaceItem(at url: URL, with staged: StagedFile, expecting expected: DocumentVersion) throws -> URL {
+                try inner.replaceItem(at: url, with: staged, expecting: expected)
+            }
+            func moveItem(at url: URL, to destination: URL) throws { try inner.moveItem(at: url, to: destination) }
+            func setPermissions(_ mode: Int, at url: URL) throws { try inner.setPermissions(mode, at: url) }
+            func removeItemIfExists(at url: URL) throws { try inner.removeItemIfExists(at: url) }
+        }
+
+        let url = try makeMarkdownFile("reload-race.md", content: "Initial")
+        let io = CountingRaceIO()
+        let writeStarted = DispatchSemaphore(value: 0)
+        let allowWriteToFinish = DispatchSemaphore(value: 0)
+        io.beforeCoordinatedWrite = {
+            writeStarted.signal()
+            allowWriteToFinish.wait()
+        }
+
+        let session = MarkdownResourceSession(access: SecurityScopeSpy(), io: io)
+        session.autoSaveDebounceNanoseconds = 20_000_000
+        XCTAssertTrue(session.open(url: url))
+        XCTAssertEqual(io.readCount, 1)
+
+        // Trigger autosave of "Autosaved Edit" and wait deterministically for write to start.
+        session.updateContent("Autosaved Edit")
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                writeStarted.wait()
+                continuation.resume()
+            }
+        }
+
+        // Release the blocked in-flight write right after reload() performs its initial stale read (read #2).
+        io.beforeCoordinatedWrite = nil
+        io.onRead = { count in
+            if count == 2 {
+                allowWriteToFinish.signal()
+            }
+        }
+
+        XCTAssertTrue(session.reload(discardingUnsavedChanges: true))
+        XCTAssertEqual(io.readCount, 3, "Must close stale candidate (#2) and reopen/re-read (#3) after write finishes")
+        XCTAssertEqual(session.content, "Autosaved Edit")
+        XCTAssertFalse(session.hasUnsavedChanges)
+        XCTAssertEqual(
+            session.documentSession?.version.contentHash,
+            TestPayload.sha256(Data("Autosaved Edit".utf8))
+        )
+
+        // Subsequent edit and save must succeed without stale-version conflict.
+        session.isAutoSaveEnabled = false
+        session.updateContent("Follow-up Edit")
+        XCTAssertEqual(session.save(), .saved)
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "Follow-up Edit")
+        session.close()
+    }
+
+    func testSameFileOpenDuringInFlightAutosaveRefreshesCandidateAndPreservesCancelBeforeWrite() async throws {
+        final class CountingRaceIO: DocumentStoreIO, @unchecked Sendable {
+            private let inner = ScriptedDocumentStoreIO()
+            private let lock = NSLock()
+            private var reads = 0
+            var onRead: (@Sendable (Int) -> Void)?
+            var failOnReadNumber: Int?
+
+            var readCount: Int { lock.withLock { reads } }
+            var beforeCoordinatedWrite: (@Sendable () -> Void)? {
+                get { inner.beforeCoordinatedWrite }
+                set { inner.beforeCoordinatedWrite = newValue }
+            }
+
+            func status(of url: URL) throws -> FileStatus { try inner.status(of: url) }
+            func version(of url: URL) throws -> DocumentVersion { try inner.version(of: url) }
+            func readContents(of url: URL) throws -> Data {
+                let count = lock.withLock {
+                    reads += 1
+                    return reads
+                }
+                if count == failOnReadNumber {
+                    throw DocumentStoreError.notReadable(url, "Injected refresh read failure")
+                }
+                let data = try inner.readContents(of: url)
+                onRead?(count)
+                return data
+            }
+            func createStagingFile(nextTo url: URL, contents: Data) throws -> StagedFile {
+                try inner.createStagingFile(nextTo: url, contents: contents)
+            }
+            func withCoordinatedWrite(at url: URL, _ body: (URL) throws -> URL) throws -> URL {
+                try inner.withCoordinatedWrite(at: url, body)
+            }
+            func replaceItem(at url: URL, with staged: StagedFile, expecting expected: DocumentVersion) throws -> URL {
+                try inner.replaceItem(at: url, with: staged, expecting: expected)
+            }
+            func moveItem(at url: URL, to destination: URL) throws { try inner.moveItem(at: url, to: destination) }
+            func setPermissions(_ mode: Int, at url: URL) throws { try inner.setPermissions(mode, at: url) }
+            func removeItemIfExists(at url: URL) throws { try inner.removeItemIfExists(at: url) }
+        }
+
+        // Part A: Same-file open(discardingUnsavedChanges: true) during in-flight write refreshes candidate.
+        let url = try makeMarkdownFile("open-race.md", content: "Initial")
+        let io = CountingRaceIO()
+        let writeStarted = DispatchSemaphore(value: 0)
+        let allowWriteToFinish = DispatchSemaphore(value: 0)
+        io.beforeCoordinatedWrite = {
+            writeStarted.signal()
+            allowWriteToFinish.wait()
+        }
+
+        let session = MarkdownResourceSession(access: SecurityScopeSpy(), io: io)
+        session.autoSaveDebounceNanoseconds = 20_000_000
+        XCTAssertTrue(session.open(url: url))
+
+        session.updateContent("Committed During Open")
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                writeStarted.wait()
+                continuation.resume()
+            }
+        }
+
+        io.beforeCoordinatedWrite = nil
+        io.onRead = { count in
+            if count == 2 {
+                allowWriteToFinish.signal()
+            }
+        }
+
+        XCTAssertTrue(session.open(url: url, discardingUnsavedChanges: true))
+        XCTAssertEqual(io.readCount, 3)
+        XCTAssertEqual(session.content, "Committed During Open")
+        XCTAssertFalse(session.hasUnsavedChanges)
+
+        session.isAutoSaveEnabled = false
+        session.updateContent("Post-Open Edit")
+        XCTAssertEqual(session.save(), .saved)
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "Post-Open Edit")
+
+        // Part B: Pending autosave (not yet started writing) is cancelled before write and does NOT re-read twice.
+        let readsBeforePendingReload = io.readCount
+        session.isAutoSaveEnabled = true
+        session.autoSaveDebounceNanoseconds = 5_000_000_000
+        session.updateContent("Cancelled Before Write")
+        XCTAssertTrue(session.reload(discardingUnsavedChanges: true))
+        XCTAssertEqual(io.readCount, readsBeforePendingReload + 1)
+        XCTAssertEqual(session.content, "Post-Open Edit")
+        XCTAssertFalse(session.hasUnsavedChanges)
+
+        // Part C: If refreshing the candidate after an in-flight write fails, the existing active session stays intact.
+        let activeSessionBeforeFail = try XCTUnwrap(session.documentSession)
+        let failWriteStarted = DispatchSemaphore(value: 0)
+        let failAllowFinish = DispatchSemaphore(value: 0)
+        io.onRead = { count in
+            if count == readsBeforePendingReload + 2 {
+                failAllowFinish.signal()
+            }
+        }
+        io.failOnReadNumber = readsBeforePendingReload + 3
+        io.beforeCoordinatedWrite = {
+            failWriteStarted.signal()
+            failAllowFinish.wait()
+        }
+        session.autoSaveDebounceNanoseconds = 20_000_000
+        session.updateContent("Written Before Refresh Fail")
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                failWriteStarted.wait()
+                continuation.resume()
+            }
+        }
+        io.beforeCoordinatedWrite = nil
+
+        XCTAssertFalse(session.reload(discardingUnsavedChanges: true))
+        XCTAssertNotNil(session.lastError)
+        XCTAssertTrue(session.documentSession === activeSessionBeforeFail)
+        XCTAssertFalse(activeSessionBeforeFail.isClosed)
+        session.close()
+    }
+
+    // MARK: - Final CTO Review P2-1: DocumentStore.create Race Classification
+
+    func testCreateRefusesExternalIdenticalTargetCreatedAfterLiveStatusCheckBeforeMove() throws {
+        let targetURL = directory.url.appendingPathComponent("move-race.notes.md")
+        let identicalText = "Identical Markdown Payload"
+        let identicalBytes = Data(identicalText.utf8)
+
+        final class InodeCapture: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value: UInt64?
+            func set(_ inode: UInt64?) { lock.withLock { value = inode } }
+            func get() -> UInt64? { lock.withLock { value } }
+        }
+
+        let io = ScriptedDocumentStoreIO()
+        let externalInode = InodeCapture()
+        io.beforeMoveItem = { _, destination in
+            try? identicalBytes.write(to: destination)
+            let num = (try? FileManager.default.attributesOfItem(atPath: destination.path)[.systemFileNumber]) as? NSNumber
+            externalInode.set(num?.uint64Value)
+        }
+
+        let spy = SecurityScopeSpy()
+        let store = DocumentStore(access: spy, io: io)
+        XCTAssertThrowsError(try store.create(targetURL, contents: identicalBytes)) { error in
+            XCTAssertEqual(error as? DocumentStoreError, .targetAppearedDuringSave(targetURL))
+        }
+
+        // External file must remain untouched with its original inode and bytes, and no staging leftovers.
+        let survivingInode = ((try? FileManager.default.attributesOfItem(atPath: targetURL.path)[.systemFileNumber]) as? NSNumber)?.uint64Value
+        XCTAssertNotNil(externalInode.get())
+        XCTAssertEqual(survivingInode, externalInode.get())
+        XCTAssertEqual(try Data(contentsOf: targetURL), identicalBytes)
+        XCTAssertEqual(directory.stagingLeftovers(), [])
+        XCTAssertEqual(spy.starts, [targetURL])
+        XCTAssertEqual(spy.stops, [targetURL])
+
+        // Also verify MarkdownResourceSession.create refuses the raced external file.
+        let target2 = directory.url.appendingPathComponent("move-race-session.notes.md")
+        let session = MarkdownResourceSession(access: SecurityScopeSpy(), io: io)
+        XCTAssertFalse(session.create(at: target2, initialContent: identicalText))
+        XCTAssertFalse(session.isLoaded)
+        XCTAssertEqual(try Data(contentsOf: target2), identicalBytes)
+        XCTAssertEqual(directory.stagingLeftovers(), [])
+
+        // Contrast: when moveItem genuinely consumed the staging file and coordination fails afterwards, create succeeds.
+        let target3 = directory.url.appendingPathComponent("coord-after-move.notes.md")
+        let coordIO = ScriptedDocumentStoreIO()
+        coordIO.coordinationFailsAfterWrite = true
+        let createdSession = try DocumentStore(access: SecurityScopeSpy(), io: coordIO)
+            .create(target3, contents: identicalBytes)
+        XCTAssertEqual(try createdSession.read(), identicalBytes)
+        createdSession.close()
+    }
 }

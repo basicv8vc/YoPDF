@@ -357,6 +357,7 @@ public final class PaperNoteAssociationStore: ObservableObject {
     private let bookmarkDataProvider: @MainActor (URL) throws -> Data
     private let bookmarkResolver: @MainActor (Data) throws -> ResolvedBookmark
     private let associationsDataWriter: @Sendable (Data, URL) throws -> Void
+    private let associationsRemover: @Sendable (URL) throws -> Void
 
     public init(
         storageURL: URL = PaperNoteAssociationStore.defaultStorageURL,
@@ -366,7 +367,8 @@ public final class PaperNoteAssociationStore: ObservableObject {
         locationAuthorizer: (any NoteLocationAuthorizing)? = nil,
         bookmarkDataProvider: (@MainActor (URL) throws -> Data)? = nil,
         bookmarkResolver: (@MainActor (Data) throws -> ResolvedBookmark)? = nil,
-        associationsDataWriter: (@Sendable (Data, URL) throws -> Void)? = nil
+        associationsDataWriter: (@Sendable (Data, URL) throws -> Void)? = nil,
+        associationsRemover: (@Sendable (URL) throws -> Void)? = nil
     ) {
         self.storageURL = storageURL
         self.defaults = defaults
@@ -388,6 +390,10 @@ public final class PaperNoteAssociationStore: ObservableObject {
         }
         self.associationsDataWriter = associationsDataWriter ?? { data, url in
             try data.write(to: url, options: [.atomic])
+        }
+        self.associationsRemover = associationsRemover ?? { url in
+            guard FileManager.default.fileExists(atPath: url.path) else { return }
+            try FileManager.default.removeItem(at: url)
         }
 
         loadAssociations()
@@ -1011,20 +1017,29 @@ public final class PaperNoteAssociationStore: ObservableObject {
     }
 
     /// Removes the association record without deleting the PDF or Markdown file.
-    public func unlinkAssociation(id: UUID) {
-        guard !hasUnreadableAssociationsStorage else { return }
-        let candidate = associations.filter { $0.id != id }
-        guard candidate.count != associations.count else { return }
-        if (try? persistAssociations(candidate)) != nil {
-            associations = candidate
+    public func unlinkAssociation(id: UUID) throws {
+        guard !hasUnreadableAssociationsStorage else {
+            throw PaperNoteAssociationError.storageCorrupted
         }
+        let candidate = associations.filter { $0.id != id }
+        guard candidate.count != associations.count else {
+            throw PaperNoteAssociationError.associationNotFound(id)
+        }
+        try persistAssociations(candidate)
+        associations = candidate
     }
 
-    /// Explicitly resets unreadable association storage when the user chooses to recover.
-    public func clearAllAssociations() {
+    /// Explicitly resets association storage (including unreadable storage) when
+    /// the user chooses to recover. Deletes persisted storage before clearing
+    /// in-memory state or `hasUnreadableAssociationsStorage`.
+    public func clearAllAssociations() throws {
+        do {
+            try associationsRemover(storageURL)
+        } catch {
+            throw PaperNoteAssociationError.storageWriteFailed(error.localizedDescription)
+        }
         associations.removeAll()
         hasUnreadableAssociationsStorage = false
-        try? FileManager.default.removeItem(at: storageURL)
     }
 
     // MARK: - Private Helpers

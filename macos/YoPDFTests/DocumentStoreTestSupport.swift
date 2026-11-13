@@ -83,6 +83,7 @@ final class ScriptedDocumentStoreIO: DocumentStoreIO, @unchecked Sendable {
     private var coordinationFailureAfterWrite = false
     private var partial: PartialCommit?
     private var hook: (@Sendable () -> Void)?
+    private var moveHook: (@Sendable (URL, URL) -> Void)?
 
     var failAt: Failure? {
         get { lock.withLock { failure } }
@@ -94,6 +95,12 @@ final class ScriptedDocumentStoreIO: DocumentStoreIO, @unchecked Sendable {
     var beforeCoordinatedWrite: (@Sendable () -> Void)? {
         get { lock.withLock { hook } }
         set { lock.withLock { hook = newValue } }
+    }
+
+    /// Runs immediately before `moveItem(at:to:)` after the coordinated live-status check.
+    var beforeMoveItem: (@Sendable (URL, URL) -> Void)? {
+        get { lock.withLock { moveHook } }
+        set { lock.withLock { moveHook = newValue } }
     }
 
     var partialCommit: PartialCommit? {
@@ -208,6 +215,7 @@ final class ScriptedDocumentStoreIO: DocumentStoreIO, @unchecked Sendable {
     }
 
     func moveItem(at url: URL, to destination: URL) throws {
+        beforeMoveItem?(url, destination)
         try base.moveItem(at: url, to: destination)
         lock.withLock { commits += 1 }
     }

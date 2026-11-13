@@ -259,7 +259,7 @@ public final class MarkdownResourceSession: ObservableObject, Identifiable {
             return false
         }
 
-        let reopeningCurrentFile = fileURL?.standardizedFileURL == url.standardizedFileURL
+        let reopeningCurrentFile = isSameFileAsOpenSession(url)
         if reopeningCurrentFile {
             pauseAutoSave()
         }
@@ -269,47 +269,31 @@ public final class MarkdownResourceSession: ObservableObject, Identifiable {
             }
         }
 
-        let candidate: DocumentSession
-        let rawBytes: Data
-        let decoded: String
-        do {
-            candidate = try store.open(url)
-            do {
-                let rawData = try candidate.read()
-                guard let utf8 = String(data: rawData, encoding: .utf8) else {
-                    candidate.close()
-                    lastError = .invalidUTF8(url)
-                    return false
-                }
-                rawBytes = rawData
-                decoded = utf8
-            } catch {
-                candidate.close()
-                throw error
-            }
-        } catch let error as DocumentStoreError {
-            lastError = Self.loadError(from: error)
-            return false
-        } catch let error as MarkdownLoadError {
-            lastError = error
-            return false
-        } catch {
-            lastError = .unreadable(error.localizedDescription)
+        guard var loaded = loadValidatedCandidate(at: url) else {
             return false
         }
 
-        cancelPendingAutoSave(cancelInFlightWork: discardingUnsavedChanges)
+        _ = cancelPendingAutoSave(cancelInFlightWork: discardingUnsavedChanges)
+        let automaticWriteWasStarted = autoSaveWorkCompletion?.didStartWrite ?? false
         _ = waitForAutoSaveWork()
 
+        if reopeningCurrentFile, automaticWriteWasStarted {
+            loaded.session.close()
+            guard let refreshed = loadValidatedCandidate(at: url) else {
+                return false
+            }
+            loaded = refreshed
+        }
+
         let previous = documentSession
-        documentSession = candidate
+        documentSession = loaded.session
         previous?.close()
 
         applyLoaded(
-            text: decoded,
-            rawData: rawBytes,
+            text: loaded.text,
+            rawData: loaded.rawBytes,
             url: url,
-            isReadOnly: !candidate.isWritableAtOpen,
+            isReadOnly: !loaded.session.isWritableAtOpen,
             event: .opened(url)
         )
         return true
@@ -380,47 +364,69 @@ public final class MarkdownResourceSession: ObservableObject, Identifiable {
         pauseAutoSave()
         defer { resumeAutoSave() }
 
-        let candidate: DocumentSession
-        let rawBytes: Data
-        let decoded: String
+        guard var loaded = loadValidatedCandidate(at: url) else {
+            return false
+        }
+
+        _ = cancelPendingAutoSave(cancelInFlightWork: true)
+        let automaticWriteWasStarted = autoSaveWorkCompletion?.didStartWrite ?? false
+        _ = waitForAutoSaveWork()
+
+        if automaticWriteWasStarted {
+            loaded.session.close()
+            guard let refreshed = loadValidatedCandidate(at: url) else {
+                return false
+            }
+            loaded = refreshed
+        }
+
+        let previous = documentSession
+        documentSession = loaded.session
+        previous?.close()
+
+        applyLoaded(
+            text: loaded.text,
+            rawData: loaded.rawBytes,
+            url: url,
+            isReadOnly: !loaded.session.isWritableAtOpen,
+            event: .reloaded(url)
+        )
+        return true
+    }
+
+    private func isSameFileAsOpenSession(_ url: URL) -> Bool {
+        guard let currentURL = fileURL else { return false }
+        return currentURL.resolvingSymlinksInPath().standardizedFileURL
+            == url.resolvingSymlinksInPath().standardizedFileURL
+    }
+
+    private func loadValidatedCandidate(
+        at url: URL
+    ) -> (session: DocumentSession, text: String, rawBytes: Data)? {
         do {
-            candidate = try store.open(url)
+            let candidate = try store.open(url)
             do {
                 let rawData = try candidate.read()
                 guard let utf8 = String(data: rawData, encoding: .utf8) else {
                     candidate.close()
                     lastError = .invalidUTF8(url)
-                    return false
+                    return nil
                 }
-                rawBytes = rawData
-                decoded = utf8
+                return (candidate, utf8, rawData)
             } catch {
                 candidate.close()
                 throw error
             }
         } catch let error as DocumentStoreError {
             lastError = Self.loadError(from: error)
-            return false
+            return nil
+        } catch let error as MarkdownLoadError {
+            lastError = error
+            return nil
         } catch {
             lastError = .unreadable(error.localizedDescription)
-            return false
+            return nil
         }
-
-        cancelPendingAutoSave(cancelInFlightWork: true)
-        _ = waitForAutoSaveWork()
-
-        let previous = documentSession
-        documentSession = candidate
-        previous?.close()
-
-        applyLoaded(
-            text: decoded,
-            rawData: rawBytes,
-            url: url,
-            isReadOnly: !candidate.isWritableAtOpen,
-            event: .reloaded(url)
-        )
-        return true
     }
 
     public func close() {

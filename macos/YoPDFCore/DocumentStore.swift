@@ -93,10 +93,17 @@ public final class DocumentStore: Sendable {
                     do {
                         try io.moveItem(at: staged.url, to: coordinatedURL)
                     } catch {
-                        if let created = try? io.version(of: coordinatedURL),
+                        let stagingStillExists = (try? io.status(of: staged.url).exists) ?? true
+                        if !stagingStillExists,
+                           let created = try? io.version(of: coordinatedURL),
                            created.contentHash == staged.contentHash {
                             try? io.setPermissions(0o644, at: coordinatedURL)
                             return coordinatedURL
+                        }
+                        if stagingStillExists,
+                           let targetStatus = try? io.status(of: coordinatedURL),
+                           targetStatus.exists || targetStatus.isSymbolicLink {
+                            throw DocumentStoreError.targetAppearedDuringSave(coordinatedURL)
                         }
                         throw error
                     }
@@ -112,7 +119,9 @@ public final class DocumentStore: Sendable {
                         break
                     }
                 }
-                if (try? io.version(of: url))?.contentHash == staged.contentHash {
+                let stagingStillExists = (try? io.status(of: staged.url).exists) ?? true
+                if !stagingStillExists,
+                   (try? io.version(of: url))?.contentHash == staged.contentHash {
                     committed = true
                     return try DocumentSession.makeCreatedSession(
                         at: url,
@@ -120,6 +129,11 @@ public final class DocumentStore: Sendable {
                         io: io,
                         access: access
                     )
+                }
+                if stagingStillExists,
+                   let targetStatus = try? io.status(of: url),
+                   targetStatus.exists || targetStatus.isSymbolicLink {
+                    throw DocumentStoreError.targetAppearedDuringSave(url)
                 }
                 if let storeError = error as? DocumentStoreError,
                    case .replacementStateUncertain = storeError {
