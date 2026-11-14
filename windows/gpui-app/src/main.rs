@@ -18,7 +18,7 @@ mod persistence;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use config::{hex_to_rgba_u32, parse_hex_rgb, rgb_to_rgba_u32, AppConfig, PRESET_MARKUP_COLORS};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -306,6 +306,11 @@ impl Viewer {
 
         let doc_id = tab.doc_id.clone();
         let label = tab.label();
+        let body = if tab.save_ctrl.has_pending() {
+            "A save is already writing to disk and will finish safely; uncommitted changes will be discarded if you choose Don't Save."
+        } else {
+            "Your changes will be lost if you don't save them."
+        };
         let entity = cx.entity().clone();
         window.open_dialog(cx, move |dialog, _, _| {
             let entity_save = entity.clone();
@@ -316,11 +321,7 @@ impl Viewer {
                 .title(format!("Save changes to “{label}” before closing?"))
                 .centered()
                 .overlay_closable(false)
-                .child(
-                    div()
-                        .text_size(px(13.0))
-                        .child("Your changes will be lost if you don't save them."),
-                )
+                .child(div().text_size(px(13.0)).child(body))
                 .footer(
                     DialogFooter::new()
                         .child(
@@ -430,10 +431,15 @@ impl Viewer {
         }
         let dirty_count = self.tabs.iter().filter(|t| t.dirty).count();
         let pending_saves = self.save_registry.has_pending();
-        let body = if dirty_count > 0 {
+        let body = if dirty_count > 0 && pending_saves {
+            format!(
+                "{dirty_count} open document(s) have unsaved annotations. Any save already writing to disk will finish safely; Don't Save discards unwritten changes."
+            )
+        } else if dirty_count > 0 {
             format!("{dirty_count} open document(s) have unsaved annotations.")
         } else if pending_saves {
-            "A background save is still in progress.".to_string()
+            "A save is currently writing to disk and will finish safely before closing."
+                .to_string()
         } else {
             "Close window?".to_string()
         };
@@ -475,12 +481,15 @@ impl Viewer {
                                         this.set_status("waiting for in-flight save to finish before closing…");
                                         cx.notify();
                                         let registry = this.save_registry.clone();
+                                        let (tx, rx) = background_channel();
+                                        cx.background_executor()
+                                            .spawn(async move {
+                                                registry.drain_all();
+                                                tx.send(());
+                                            })
+                                            .detach();
                                         cx.spawn_in(window, async move |this, cx| {
-                                            cx.background_executor()
-                                                .spawn(async move {
-                                                    registry.drain_all();
-                                                })
-                                                .await;
+                                            let _ = rx.await;
                                             this.update_in(cx, |this, window, _| {
                                                 this.allow_window_close = true;
                                                 window.remove_window();
@@ -544,47 +553,28 @@ impl Viewer {
             })
             .collect();
 
+        // Enqueue every dirty tab and detach the background worker SYNCHRONOUSLY
+        // before returning from the UI handler so `on_app_quit`'s synchronous
+        // `drain_all()` sees all requested saves and never deadlocks waiting on
+        // a foreground `spawn_in` task.
+        let rx = dispatch_save_all_for_window(&engine, &registry, ctrls, cx.background_executor());
+
         cx.spawn_in(window, async move |this, cx| {
-            let results: Vec<(String, Result<(), String>)> = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut out = Vec::new();
-                    for (doc_id, path, ctrl) in ctrls {
-                        let job = SaveJob {
-                            doc_id: doc_id.clone(),
-                            path,
-                            opts: SaveOptions::default(),
-                            doc_gen: ctrl.doc_gen(),
-                            is_autosave: false,
-                            close_after: false,
-                        };
-                        match ctrl.enqueue(job.clone()) {
-                            EnqueueResult::StartNow => {
-                                let mut err_msg = None;
-                                run_save_chain(&engine, &ctrl, job, |_, res| {
-                                    if let Err(e) = res {
-                                        err_msg = Some(e.message);
-                                    }
-                                });
-                                out.push((doc_id, err_msg.map_or(Ok(()), Err)));
-                            }
-                            EnqueueResult::Queued { .. } => {
-                                ctrl.wait_until_idle();
-                                match ctrl.snapshot() {
-                                    SaveState::Succeeded(_) => out.push((doc_id, Ok(()))),
-                                    SaveState::Failed { failure, .. } => {
-                                        out.push((doc_id, Err(failure.message)))
-                                    }
-                                    _ => out.push((doc_id, Err("save did not finish".into()))),
-                                }
-                            }
-                            EnqueueResult::StaleGeneration => out.push((doc_id, Ok(()))),
-                        }
-                    }
-                    registry.drain_all();
-                    out
+            let Some(results) = rx.await else {
+                this.update_in(cx, |this, window, cx| {
+                    this.closing_window = false;
+                    this.push_error(
+                        "Save & Close refused",
+                        "background save worker exited unexpectedly",
+                        window,
+                        cx,
+                    );
+                    cx.notify();
+                    window.refresh();
                 })
-                .await;
+                .ok();
+                return;
+            };
 
             this.update_in(cx, |this, window, cx| {
                 let mut any_error: Option<String> = None;
@@ -1421,38 +1411,28 @@ impl Viewer {
             is_autosave,
             close_after,
         };
-        match save_ctrl.enqueue(job.clone()) {
-            EnqueueResult::StaleGeneration => return,
-            EnqueueResult::Queued { .. } => {
+        let rx = match dispatch_save_job(&self.engine, &save_ctrl, job, cx.background_executor()) {
+            DispatchedDocSave::StaleGeneration => return,
+            DispatchedDocSave::Queued => {
                 if !is_autosave {
                     self.set_status(format!("save queued: {path}"));
                 }
                 cx.notify();
                 return;
             }
-            EnqueueResult::StartNow => {}
-        }
+            DispatchedDocSave::Started(rx) => rx,
+        };
 
         if !is_autosave {
             self.set_status(format!("saving {path}…"));
         }
         cx.notify();
 
-        let engine = self.engine.clone();
         let config = self.config.clone();
         let doc_id_owned = doc_id.to_string();
 
         cx.spawn_in(window, async move |this, cx| {
-            let steps: Vec<(SaveJob, Result<pdfcore::SaveReport, persistence::SaveFailure>)> = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut out = Vec::new();
-                    run_save_chain(&engine, &save_ctrl, job, |step, res| {
-                        out.push((step.clone(), res));
-                    });
-                    out
-                })
-                .await;
+            let Some(steps) = rx.await else { return };
 
             this.update_in(cx, |this, window, cx| {
                 let mut last_ok = false;
@@ -2938,6 +2918,167 @@ fn separator(theme: &Theme) -> impl IntoElement {
 }
 
 // ---------------------------------------------------------------------------
+// Background save dispatch helpers (UI-thread enqueue -> detached bg worker)
+// ---------------------------------------------------------------------------
+
+struct BackgroundSlotInner<T> {
+    value: Option<T>,
+    waker: Option<std::task::Waker>,
+    closed: bool,
+}
+
+struct BackgroundSender<T>(Arc<Mutex<BackgroundSlotInner<T>>>);
+struct BackgroundReceiver<T>(Arc<Mutex<BackgroundSlotInner<T>>>);
+
+fn background_channel<T>() -> (BackgroundSender<T>, BackgroundReceiver<T>) {
+    let inner = Arc::new(Mutex::new(BackgroundSlotInner {
+        value: None,
+        waker: None,
+        closed: false,
+    }));
+    (BackgroundSender(Arc::clone(&inner)), BackgroundReceiver(inner))
+}
+
+impl<T> BackgroundSender<T> {
+    fn send(self, value: T) {
+        let mut g = self.0.lock().unwrap();
+        g.value = Some(value);
+        if let Some(w) = g.waker.take() {
+            w.wake();
+        }
+    }
+}
+
+impl<T> Drop for BackgroundSender<T> {
+    fn drop(&mut self) {
+        let mut g = self.0.lock().unwrap();
+        g.closed = true;
+        if let Some(w) = g.waker.take() {
+            w.wake();
+        }
+    }
+}
+
+impl<T> std::future::Future for BackgroundReceiver<T> {
+    type Output = Option<T>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let mut g = self.0.lock().unwrap();
+        if let Some(v) = g.value.take() {
+            std::task::Poll::Ready(Some(v))
+        } else if g.closed {
+            std::task::Poll::Ready(None)
+        } else {
+            g.waker = Some(cx.waker().clone());
+            std::task::Poll::Pending
+        }
+    }
+}
+
+type SaveChainSteps = Vec<(SaveJob, Result<pdfcore::SaveReport, persistence::SaveFailure>)>;
+
+enum DispatchedDocSave {
+    StaleGeneration,
+    Queued,
+    Started(BackgroundReceiver<SaveChainSteps>),
+}
+
+/// Synchronously enqueues `job` on `save_ctrl` and, when it starts a new save
+/// chain, immediately spawns and detaches `run_save_chain` directly on GPUI's
+/// `BackgroundExecutor` BEFORE returning to the UI handler.
+///
+/// Must NEVER be nested inside a foreground `cx.spawn_in` future: `on_app_quit`
+/// blocks the main thread in `SaveRegistry::drain_all()`, which would deadlock
+/// if the background save had not yet been submitted to `BackgroundExecutor`.
+fn dispatch_save_job(
+    engine: &Arc<PdfCore>,
+    save_ctrl: &SaveController,
+    job: SaveJob,
+    bg: &gpui_kit::BackgroundExecutor,
+) -> DispatchedDocSave {
+    match save_ctrl.enqueue(job.clone()) {
+        EnqueueResult::StaleGeneration => DispatchedDocSave::StaleGeneration,
+        EnqueueResult::Queued { .. } => DispatchedDocSave::Queued,
+        EnqueueResult::StartNow => {
+            let (tx, rx) = background_channel();
+            let engine = Arc::clone(engine);
+            let ctrl = save_ctrl.clone();
+            bg.spawn(async move {
+                let mut out = Vec::new();
+                run_save_chain(&engine, &ctrl, job, |step, res| {
+                    out.push((step.clone(), res));
+                });
+                tx.send(out);
+            })
+            .detach();
+            DispatchedDocSave::Started(rx)
+        }
+    }
+}
+
+/// Synchronously enqueues Save jobs for every `(doc_id, path, ctrl)` in a
+/// closing window BEFORE returning, and spawns + detaches the execution/drain
+/// worker directly on `BackgroundExecutor` so an immediate `on_app_quit` cannot
+/// bypass pending saves or deadlock on unpolled foreground tasks.
+fn dispatch_save_all_for_window(
+    engine: &Arc<PdfCore>,
+    registry: &SaveRegistry,
+    ctrls: Vec<(String, String, SaveController)>,
+    bg: &gpui_kit::BackgroundExecutor,
+) -> BackgroundReceiver<Vec<(String, Result<(), String>)>> {
+    let mut enqueued = Vec::with_capacity(ctrls.len());
+    for (doc_id, path, ctrl) in ctrls {
+        let job = SaveJob {
+            doc_id: doc_id.clone(),
+            path,
+            opts: SaveOptions::default(),
+            doc_gen: ctrl.doc_gen(),
+            is_autosave: false,
+            close_after: false,
+        };
+        let outcome = ctrl.enqueue(job.clone());
+        enqueued.push((doc_id, job, ctrl, outcome));
+    }
+
+    let (tx, rx) = background_channel();
+    let engine = Arc::clone(engine);
+    let registry = registry.clone();
+    bg.spawn(async move {
+        let mut out = Vec::with_capacity(enqueued.len());
+        for (doc_id, job, ctrl, outcome) in enqueued {
+            match outcome {
+                EnqueueResult::StartNow => {
+                    let mut err_msg = None;
+                    run_save_chain(&engine, &ctrl, job, |_, res| {
+                        if let Err(e) = res {
+                            err_msg = Some(e.message);
+                        }
+                    });
+                    out.push((doc_id, err_msg.map_or(Ok(()), Err)));
+                }
+                EnqueueResult::Queued { .. } => {
+                    ctrl.wait_until_idle();
+                    match ctrl.snapshot() {
+                        SaveState::Succeeded(_) => out.push((doc_id, Ok(()))),
+                        SaveState::Failed { failure, .. } => out.push((doc_id, Err(failure.message))),
+                        _ => out.push((doc_id, Err("save did not finish".into()))),
+                    }
+                }
+                EnqueueResult::StaleGeneration => out.push((doc_id, Ok(()))),
+            }
+        }
+        registry.drain_all();
+        tx.send(out);
+    })
+    .detach();
+
+    rx
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -3107,4 +3248,283 @@ fn main() {
 
     // Belt-and-suspenders drain after the event loop returns before exiting main.
     save_registry.drain_all();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    static MAIN_TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_pdf(label: &str) -> PathBuf {
+        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../fixtures/simple-text.pdf")
+            .canonicalize()
+            .expect("simple-text fixture");
+        let n = MAIN_TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "yopdf-gpui-main-{}-{n}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join(format!("{label}.pdf"));
+        fs::copy(src, &dst).unwrap();
+        dst
+    }
+
+    /// Dispatcher replicating GPUI's desktop scheduling semantics during
+    /// `on_app_quit`: `BackgroundExecutor` runs tasks on OS worker threads,
+    /// while main-thread foreground tasks (`cx.spawn_in`) are queued and NEVER
+    /// polled once the main thread blocks in `SaveRegistry::drain_all()`.
+    struct BlockedForegroundDispatcher {
+        main_thread: std::thread::ThreadId,
+        deferred_foreground: Mutex<Vec<gpui_kit::RunnableVariant>>,
+    }
+
+    impl BlockedForegroundDispatcher {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                main_thread: std::thread::current().id(),
+                deferred_foreground: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn deferred_foreground_len(&self) -> usize {
+            self.deferred_foreground.lock().unwrap().len()
+        }
+    }
+
+    impl gpui_kit::PlatformDispatcher for BlockedForegroundDispatcher {
+        fn is_main_thread(&self) -> bool {
+            std::thread::current().id() == self.main_thread
+        }
+
+        fn dispatch(&self, runnable: gpui_kit::RunnableVariant, _priority: gpui_kit::Priority) {
+            std::thread::spawn(move || {
+                runnable.run();
+            });
+        }
+
+        fn dispatch_on_main_thread(
+            &self,
+            runnable: gpui_kit::RunnableVariant,
+            _priority: gpui_kit::Priority,
+        ) {
+            self.deferred_foreground.lock().unwrap().push(runnable);
+        }
+
+        fn dispatch_after(&self, duration: Duration, runnable: gpui_kit::RunnableVariant) {
+            std::thread::spawn(move || {
+                std::thread::sleep(duration);
+                runnable.run();
+            });
+        }
+
+        fn spawn_realtime(&self, f: Box<dyn FnOnce() + Send>) {
+            std::thread::spawn(move || f());
+        }
+    }
+
+    #[test]
+    fn save_enqueue_then_immediate_quit_completes_without_polling_foreground() {
+        let path = temp_pdf("immediate-quit-single");
+        let path_s = path.to_string_lossy().into_owned();
+        let engine = Arc::new(PdfCore::new());
+        let info = engine.open_document(&path_s).unwrap();
+        engine
+            .add_sticky_note(
+                &info.id,
+                0,
+                24.0,
+                24.0,
+                "bg-save-survives-immediate-quit",
+                &|| false,
+            )
+            .unwrap();
+
+        let registry = SaveRegistry::new();
+        let ctrl = SaveController::new();
+        registry.register(ctrl.clone());
+
+        let dispatcher = BlockedForegroundDispatcher::new();
+        let bg = gpui_kit::BackgroundExecutor::new(dispatcher.clone());
+        let fg = gpui_kit::ForegroundExecutor::new(dispatcher.clone());
+
+        let job = SaveJob {
+            doc_id: info.id.clone(),
+            path: path_s.clone(),
+            opts: SaveOptions::default(),
+            doc_gen: ctrl.doc_gen(),
+            is_autosave: false,
+            close_after: false,
+        };
+
+        // 1. UI handler synchronously enqueues and detaches directly on `bg`.
+        let rx = match dispatch_save_job(&engine, &ctrl, job, &bg) {
+            DispatchedDocSave::Started(rx) => rx,
+            other => panic!("expected Started, got {}", match other {
+                DispatchedDocSave::StaleGeneration => "StaleGeneration",
+                DispatchedDocSave::Queued => "Queued",
+                DispatchedDocSave::Started(_) => unreachable!(),
+            }),
+        };
+
+        // 2. Foreground `spawn_in`-style continuation is submitted to `fg`, which
+        // is completely frozen by BlockedForegroundDispatcher.
+        let ui_updated = Arc::new(AtomicBool::new(false));
+        let ui_updated_fg = Arc::clone(&ui_updated);
+        fg.spawn(async move {
+            let _ = rx.await;
+            ui_updated_fg.store(true, Ordering::SeqCst);
+        })
+        .detach();
+
+        // 3. Immediate quit (`on_app_quit`) blocks main thread in `drain_all()`.
+        // Run with a watchdog thread to fail loudly if it ever deadlocks.
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            if done_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+                eprintln!("DEADLOCK: drain_all blocked waiting on unpolled foreground task");
+                std::process::abort();
+            }
+        });
+
+        registry.drain_all();
+        let _ = done_tx.send(());
+
+        // Foreground was never polled while drain_all ran, yet background finished!
+        assert!(
+            !ui_updated.load(Ordering::SeqCst),
+            "foreground UI task should not have run while main loop was blocked"
+        );
+        assert!(
+            dispatcher.deferred_foreground_len() >= 1,
+            "expected deferred foreground runnable proving main thread stayed frozen"
+        );
+        assert!(!registry.has_pending());
+
+        // Verify persisted annotation on disk.
+        let _ = engine.close_document(&info.id);
+        let verify = PdfCore::new();
+        let reopened = verify.open_document(&path_s).unwrap();
+        let anns = verify.list_annotations(&reopened.id, 0).unwrap();
+        assert_eq!(anns.len(), 1);
+        assert_eq!(anns[0].contents, "bg-save-survives-immediate-quit");
+    }
+
+    #[test]
+    fn save_all_window_close_then_immediate_quit_drains_all_tabs_without_deadlock() {
+        let path_a = temp_pdf("win-close-quit-a");
+        let path_b = temp_pdf("win-close-quit-b");
+        let path_a_s = path_a.to_string_lossy().into_owned();
+        let path_b_s = path_b.to_string_lossy().into_owned();
+
+        let engine = Arc::new(PdfCore::new());
+        let info_a = engine.open_document(&path_a_s).unwrap();
+        let info_b = engine.open_document(&path_b_s).unwrap();
+        engine
+            .add_sticky_note(&info_a.id, 0, 20.0, 20.0, "tab-a-window-close", &|| false)
+            .unwrap();
+        engine
+            .add_sticky_note(&info_b.id, 0, 20.0, 20.0, "tab-b-window-close", &|| false)
+            .unwrap();
+
+        let registry = SaveRegistry::new();
+        let ctrl_a = SaveController::new();
+        let ctrl_b = SaveController::new();
+        registry.register(ctrl_a.clone());
+        registry.register(ctrl_b.clone());
+
+        let dispatcher = BlockedForegroundDispatcher::new();
+        let bg = gpui_kit::BackgroundExecutor::new(dispatcher.clone());
+        let fg = gpui_kit::ForegroundExecutor::new(dispatcher.clone());
+
+        // Put Tab B into an in-flight autosave gated so Save & Close Window sees
+        // `EnqueueResult::Queued` on Tab B and `EnqueueResult::StartNow` on Tab A.
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let autosave_b = SaveJob {
+            doc_id: info_b.id.clone(),
+            path: path_b_s.clone(),
+            opts: SaveOptions::default(),
+            doc_gen: ctrl_b.doc_gen(),
+            is_autosave: true,
+            close_after: false,
+        };
+        assert_eq!(ctrl_b.enqueue(autosave_b.clone()), EnqueueResult::StartNow);
+        {
+            let engine_b = Arc::clone(&engine);
+            let ctrl_b_bg = ctrl_b.clone();
+            bg.spawn(async move {
+                let _ = gate_rx.recv();
+                run_save_chain(&engine_b, &ctrl_b_bg, autosave_b, |_, _| {});
+            })
+            .detach();
+        }
+
+        // 1. User clicks "Save & Close" on window close dialog.
+        let rx = dispatch_save_all_for_window(
+            &engine,
+            &registry,
+            vec![
+                (info_a.id.clone(), path_a_s.clone(), ctrl_a.clone()),
+                (info_b.id.clone(), path_b_s.clone(), ctrl_b.clone()),
+            ],
+            &bg,
+        );
+
+        // Immediately upon returning from UI handler, BOTH controllers must
+        // already be pending in `registry` so immediate quit cannot skip them.
+        assert!(ctrl_a.has_pending(), "Tab A must be registered before handler returns");
+        assert!(ctrl_b.has_pending(), "Tab B must stay registered while queued");
+        assert!(registry.has_pending());
+
+        // Freeze foreground continuation just like GPUI `cx.spawn_in`.
+        let ui_closed = Arc::new(AtomicBool::new(false));
+        let ui_closed_fg = Arc::clone(&ui_closed);
+        fg.spawn(async move {
+            let _ = rx.await;
+            ui_closed_fg.store(true, Ordering::SeqCst);
+        })
+        .detach();
+
+        // Release Tab B's gate after 150ms to verify `drain_all` genuinely waits.
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = gate_tx.send(());
+        });
+
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            if done_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+                eprintln!("DEADLOCK: Save & Close + Quit barrier timed out");
+                std::process::abort();
+            }
+        });
+
+        // 2. Immediate `on_app_quit` synchronous drain with foreground frozen.
+        registry.drain_all();
+        let _ = done_tx.send(());
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(140),
+            "drain_all returned early before gated Tab B save completed: {:?}",
+            started.elapsed()
+        );
+        assert!(!ui_closed.load(Ordering::SeqCst));
+        assert!(!registry.has_pending());
+
+        let _ = engine.close_document(&info_a.id);
+        let _ = engine.close_document(&info_b.id);
+        let verify = PdfCore::new();
+        let ra = verify.open_document(&path_a_s).unwrap();
+        let rb = verify.open_document(&path_b_s).unwrap();
+        assert_eq!(verify.list_annotations(&ra.id, 0).unwrap()[0].contents, "tab-a-window-close");
+        assert_eq!(verify.list_annotations(&rb.id, 0).unwrap()[0].contents, "tab-b-window-close");
+    }
 }
