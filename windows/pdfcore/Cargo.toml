@@ -1,0 +1,17 @@
+[package]
+name = "pdfcore"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+description = "PdfCraft-backed PDF engine facade"
+
+[dependencies]
+pdfcraft-engine = { path = "../third_party/pdfcraft/crates/engine" }
+pdfcraft-render = { path = "../third_party/pdfcraft/crates/render" }
+pdfcraft-annot = { path = "../third_party/pdfcraft/crates/annot" }
+pdfcraft-cos = { path = "../third_party/pdfcraft/crates/cos" }
+sha2 = "0.11"
+
+[dev-dependencies]
+# none: fixtures are plain bytes on disk, so the tests stay hermetic.

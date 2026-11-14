@@ -1,0 +1,66 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [8 0 R 10 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Title (YoPDF PoC synthetic fixture) /Producer (YoPDF-Windows-PoC fixture generator) >>
+endobj
+5 0 obj
+<< /Type /Annot /Subtype /Text /Rect [72 700 92 720] /F 0 /C [1 1 0] /Name /Comment /T (A Previous Reader) /Contents (Pre-existing sticky note) >>
+endobj
+6 0 obj
+<< /Type /Annot /Subtype /Highlight /Rect [72 660 320 678] /QuadPoints [72 678 320 678 72 660 320 660] /C [1 1 0] /CA 0.4 /T (A Previous Reader) /Contents (Pre-existing highlight) >>
+endobj
+7 0 obj
+<< /Length 184 >>
+stream
+BT /F1 12 Tf 14 TL
+1 0 0 1 72 720 Tm
+(Pre-existing annotations must survive every edit.) Tj T*
+(Highlight this sentence: GAMMA DELTA EPSILON.) Tj T*
+(ALPHA appears here too.) Tj T*
+ET
+
+endstream
+endobj
+8 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 7 0 R /Annots [5 0 R 6 0 R] >>
+endobj
+9 0 obj
+<< /Length 80 >>
+stream
+BT /F1 12 Tf 14 TL
+1 0 0 1 72 720 Tm
+(Second page has no annotations.) Tj T*
+ET
+
+endstream
+endobj
+10 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 9 0 R >>
+endobj
+xref
+0 11
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000128 00000 n 
+0000000225 00000 n 
+0000000331 00000 n 
+0000000493 00000 n 
+0000000691 00000 n 
+0000000926 00000 n 
+0000001074 00000 n 
+0000001204 00000 n 
+trailer
+<< /Size 11 /Root 1 0 R /Info 4 0 R >>
+startxref
+1331
+%%EOF

@@ -1,0 +1,13 @@
+# Some developer machines replace crates.io with the now-retired SJTU git
+# mirror in ~/.cargo/config. Cargo does not let a project config *remove*
+# `source.crates-io.replace-with`, so we repoint that named source at a live
+# sparse mirror instead. On a clean machine (CI) the `sjtu` source is simply
+# unused. No credentials or private registries are involved.
+[source.sjtu]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[registries.crates-io]
+protocol = "sparse"
+
+[net]
+git-fetch-with-cli = true
