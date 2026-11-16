@@ -172,6 +172,9 @@ public struct MarkdownEditorDemoView: View {
     }
 }
 
+// The #Preview macro is not expandable by the Release archive toolchain
+// (swift-plugin-server fails outside Xcode), so keep the previews Debug-only.
+#if DEBUG
 #Preview("Light") {
     MarkdownEditorDemoView(initialTheme: .light)
 }
@@ -180,3 +183,4 @@ public struct MarkdownEditorDemoView: View {
     MarkdownEditorDemoView(initialTheme: .dark)
         .preferredColorScheme(.dark)
 }
+#endif
