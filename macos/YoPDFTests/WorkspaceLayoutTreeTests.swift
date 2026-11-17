@@ -1011,4 +1011,85 @@ final class WorkspaceLayoutTreeTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - 18. Multi-Column Horizontal Split Rebalancing & In-Place Replace
+
+    func testHorizontalSplitAllowedInMultiColumnWindowViaDefaultPolicyAndRebalance() throws {
+        let p1 = PaneID()
+        let p2 = PaneID()
+        let p3 = PaneID()
+        let p4 = PaneID()
+
+        // Typical default reader content size (1100 x 780)
+        let workspaceSize = CGSize(width: 1100, height: 780)
+
+        var tree = WorkspaceLayoutTree(leaf: p1)
+        try tree.insert(p2, adjacentTo: p1, direction: .right, availableSize: workspaceSize)
+
+        // With 2 columns open (~550pt each), splitting either column side-by-side must succeed.
+        XCTAssertTrue(tree.canInsert(p3, adjacentTo: p2, direction: .right, availableSize: workspaceSize))
+        try tree.insert(p3, adjacentTo: p2, direction: .right, availableSize: workspaceSize)
+
+        // Splitting a 3rd column into a 4th column side-by-side must also succeed when total
+        // width (4 * 200 + 3 = 803pt) fits in 1100pt, rebalancing parent ratios automatically.
+        XCTAssertTrue(tree.canInsert(p4, adjacentTo: p3, direction: .left, availableSize: workspaceSize))
+        try tree.insert(p4, adjacentTo: p3, direction: .left, availableSize: workspaceSize)
+
+        let frames = tree.paneFrames(in: workspaceSize)
+        XCTAssertEqual(frames.count, 4)
+        for (_, frame) in frames {
+            XCTAssertGreaterThanOrEqual(frame.width, LayoutPolicy.default.minimumLeafWidth - 0.001)
+            XCTAssertGreaterThanOrEqual(frame.height, LayoutPolicy.default.minimumLeafHeight - 0.001)
+        }
+
+        // Asymmetric 2-column split [p1: ~880pt | p2: ~219pt] -> splitting narrow p2 horizontally
+        // must still succeed because parent split rebalances p1 down so p2 can split into 200+200.
+        var asymmetric = WorkspaceLayoutTree(leaf: p1)
+        try asymmetric.insert(p2, adjacentTo: p1, direction: .right, ratio: 0.80, availableSize: workspaceSize)
+        let asymmetricFrames = asymmetric.paneFrames(in: workspaceSize)
+        XCTAssertLessThan(try XCTUnwrap(asymmetricFrames[p2]).width, 401)
+        XCTAssertTrue(asymmetric.canInsert(p3, adjacentTo: p2, direction: .right, availableSize: workspaceSize))
+        try asymmetric.insert(p3, adjacentTo: p2, direction: .right, availableSize: workspaceSize)
+
+        let rebalancedFrames = asymmetric.paneFrames(in: workspaceSize)
+        XCTAssertEqual(rebalancedFrames.count, 3)
+        for (_, frame) in rebalancedFrames {
+            XCTAssertGreaterThanOrEqual(frame.width, LayoutPolicy.default.minimumLeafWidth - 0.001)
+        }
+    }
+
+    func testReplacingAndMovingReplacingPreserveStructureAndValidateErrors() throws {
+        let p1 = PaneID()
+        let p2 = PaneID()
+        let p3 = PaneID()
+        let p4 = PaneID()
+
+        var tree = WorkspaceLayoutTree(leaf: p1)
+        try tree.insert(p2, adjacentTo: p1, direction: .right, ratio: 0.4)
+        try tree.insert(p3, adjacentTo: p2, direction: .bottom, ratio: 0.6)
+
+        // Replace p2 in place with p4
+        let replaced = try tree.replacing(p2, with: p4)
+        XCTAssertEqual(replaced.paneCount, 3)
+        XCTAssertFalse(replaced.contains(p2))
+        XCTAssertTrue(replaced.contains(p4))
+        XCTAssertEqual(replaced.leafIDs, [p1, p4, p3])
+
+        // Moving p1 onto p3 in place collapses p1's parent split and replaces p3 with p1
+        let movedReplacing = try replaced.moving(p1, replacing: p3)
+        XCTAssertEqual(movedReplacing.paneCount, 2)
+        XCTAssertEqual(movedReplacing.leafIDs, [p4, p1])
+
+        // Error cases
+        let missingID = PaneID()
+        XCTAssertThrowsError(try replaced.replacing(missingID, with: PaneID())) { error in
+            XCTAssertEqual(error as? LayoutMutationError, .targetPaneNotFound(missingID))
+        }
+        XCTAssertThrowsError(try replaced.replacing(p4, with: p1)) { error in
+            XCTAssertEqual(error as? LayoutMutationError, .duplicatePaneID(p1))
+        }
+        XCTAssertThrowsError(try replaced.moving(p1, replacing: p1)) { error in
+            XCTAssertEqual(error as? LayoutMutationError, .duplicatePaneID(p1))
+        }
+    }
 }

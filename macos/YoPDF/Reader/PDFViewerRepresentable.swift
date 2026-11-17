@@ -374,7 +374,7 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
     var makeMenuItems: ((PageMenuContext) -> [NSMenuItem])?
     // MARK: Pane drag & drop destination state
     fileprivate var paneDropSink: PaneDropSink?
-    fileprivate var activePaneDropDirection: LayoutInsertionDirection?
+    fileprivate var activePaneDropZone: PaneDropZone?
 
     private var mouseDownPoint: CGPoint?
     private var mouseDidDrag = false
@@ -472,7 +472,7 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
         return nil
     }
 
-    /// Direction and hover state follow the SwiftUI convention: top-left
+    /// Drop zone and hover state follow the SwiftUI convention: top-left
     /// origin, container size = this view's bounds. Callers resolve the sink
     /// and the payload first; drags YoPDF cannot interpret never reach here
     /// and stay on PDFKit's own destination path.
@@ -484,18 +484,18 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
     ) -> NSDragOperation {
         let point = convert(draggingInfo.draggingLocation, from: nil)
         let flippedPoint = CGPoint(x: point.x, y: bounds.height - point.y)
-        let direction = LayoutInsertionDirection.direction(
+        let zone = PaneDropZone.zone(
             for: flippedPoint,
             in: bounds.size,
-            previousDirection: activePaneDropDirection,
+            previousZone: activePaneDropZone,
             hysteresis: 0.05
         )
-        activePaneDropDirection = direction
-        let check = sink.validate(direction)
+        activePaneDropZone = zone
+        let check = sink.validate(payload, zone)
         // The invalid state renders as a red "cannot drop here" preview;
         // concludePaneDrop clears it on every session-end path.
         sink.onHoverChanged(PaneDropHoverState(
-            direction: direction,
+            zone: zone,
             isValid: check.isValid,
             feedbackMessage: check.feedback
         ))
@@ -510,7 +510,7 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
     /// cancelled sessions, so draggingEnded must also clean up or a stale
     /// hover preview would remain on screen.
     private func concludePaneDrop() {
-        activePaneDropDirection = nil
+        activePaneDropZone = nil
         paneDropSink?.onHoverChanged(nil)
     }
 
@@ -551,11 +551,11 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
 
         let point = convert(sender.draggingLocation, from: nil)
         let flippedPoint = CGPoint(x: point.x, y: bounds.height - point.y)
-        let direction = activePaneDropDirection ?? LayoutInsertionDirection.direction(
+        let zone = activePaneDropZone ?? PaneDropZone.zone(
             for: flippedPoint,
             in: bounds.size
         )
-        return sink.onPerformDrop(payload, direction)
+        return sink.onPerformDrop(payload, zone)
     }
 
     override func concludeDragOperation(_ sender: NSDraggingInfo?) {

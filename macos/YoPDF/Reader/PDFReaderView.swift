@@ -1624,17 +1624,17 @@ struct PDFReaderView: View {
                                 activatePane(paneID)
                             },
                             paneDropSink: PaneDropSink(
-                                validate: { direction in
-                                    validateDrop(on: paneID, direction: direction)
+                                validate: { payload, zone in
+                                    validateDrop(on: paneID, payload: payload, zone: zone)
                                 },
                                 onHoverChanged: { hover in
                                     paneHoverStates[paneID] = hover
                                 },
-                                onPerformDrop: { payload, direction in
+                                onPerformDrop: { payload, zone in
                                     handlePaneDrop(
                                         payload: payload,
                                         on: paneID,
-                                        direction: direction,
+                                        zone: zone,
                                         in: paneGeometry.size
                                     )
                                 }
@@ -1676,7 +1676,7 @@ struct PDFReaderView: View {
 
                         if let hoverState = paneHoverStates[paneID] {
                             PaneDropPreviewOverlay(
-                                direction: hoverState.direction,
+                                zone: hoverState.zone,
                                 isValid: hoverState.isValid,
                                 feedbackMessage: hoverState.feedbackMessage
                             )
@@ -1711,69 +1711,26 @@ struct PDFReaderView: View {
     ///
     /// All layout geometry is evaluated against the root Workspace content
     /// size (`currentContentSize`), never the target Pane's local dimensions.
-    /// `WorkspaceLayoutTree.canMove` / `canInsert` interpret `availableSize` as
+    /// `WorkspaceLayoutTree.canMove` / `inserting` interpret `availableSize` as
     /// the root container, so passing a pane's local size would reject valid
-    /// four-pane reorders. The commit calls (`movePane`, `openPDFInSplit`)
-    /// already validate with `currentContentSize`; this keeps the preview
-    /// consistent with them.
-    private func validateDrop(on targetPaneID: PaneID, direction: LayoutInsertionDirection) -> (isValid: Bool, feedback: String) {
-        guard let rootSize = currentContentSize else {
-            return (false, "Workspace layout is not ready")
-        }
-
-        let isIntraTabMove: Bool
-        if let payload = activeDraggedPayload,
-           payload.sourceTabID == tab.id,
-           let sourceID = payload.sourcePaneID {
-            if sourceID == targetPaneID {
-                return (false, "Cannot drop a pane onto itself")
-            }
-            isIntraTabMove = true
-        } else {
-            isIntraTabMove = false
-        }
-
-        if isIntraTabMove {
-            guard let sourceID = activeDraggedPayload?.sourcePaneID else {
-                return (false, "Invalid drag source")
-            }
-            guard tab.layoutTree.canMove(sourceID, adjacentTo: targetPaneID, direction: direction, policy: .default, availableSize: rootSize) else {
-                return (false, "Pane is too small to split \(direction.rawValue)")
-            }
-            return (true, "")
-        } else {
-            // Mirror `WorkspaceLayoutTree.canInsert`, which is the exact check
-            // the commit path runs before mutating the layout.
-            if tab.layoutTree.paneCount >= LayoutPolicy.default.maxPanes {
-                return (false, "Maximum \(LayoutPolicy.default.maxPanes) panes limit reached")
-            }
-            let frames = tab.layoutTree.paneFrames(in: rootSize, policy: .default)
-            guard let targetFrame = frames[targetPaneID] else {
-                return (false, "Invalid drop target")
-            }
-            switch direction.axis {
-            case .horizontal:
-                let requiredWidth = LayoutPolicy.default.minimumLeafWidth * 2 + LayoutPolicy.default.dividerThickness
-                if targetFrame.width < requiredWidth {
-                    return (false, "Width too narrow to split")
-                }
-                if targetFrame.height < LayoutPolicy.default.minimumLeafHeight {
-                    return (false, "Height too short to split")
-                }
-            case .vertical:
-                let requiredHeight = LayoutPolicy.default.minimumLeafHeight * 2 + LayoutPolicy.default.dividerThickness
-                if targetFrame.height < requiredHeight {
-                    return (false, "Height too short to split")
-                }
-                if targetFrame.width < LayoutPolicy.default.minimumLeafWidth {
-                    return (false, "Width too narrow to split")
-                }
-            }
-            return (true, "")
-        }
+    /// multi-pane splits and reorders. The commit calls (`movePane`,
+    /// `openPDFInSplit`) validate with `currentContentSize`; this keeps the
+    /// preview consistent with them.
+    private func validateDrop(
+        on targetPaneID: PaneID,
+        payload: DropPayload,
+        zone: PaneDropZone
+    ) -> (isValid: Bool, feedback: String) {
+        workspace.validateDrop(
+            on: targetPaneID,
+            in: tab.id,
+            payload: payload,
+            zone: zone,
+            availableSize: currentContentSize
+        )
     }
 
-    private func handlePaneDrop(payload: DropPayload, on targetPaneID: PaneID, direction: LayoutInsertionDirection, in size: CGSize) -> Bool {
+    private func handlePaneDrop(payload: DropPayload, on targetPaneID: PaneID, zone: PaneDropZone, in size: CGSize) -> Bool {
         activeDraggedPayload = nil
         paneHoverStates.removeAll()
 
@@ -1796,15 +1753,24 @@ struct PDFReaderView: View {
 
             do {
                 try withAnimation(.easeOut(duration: 0.16)) {
-                    _ = try workspace.movePane(
-                        sourceTabID: sourceTabID,
-                        paneID: sourcePaneID,
-                        toDestinationTabID: tab.id,
-                        adjacentTo: targetPaneID,
-                        direction: direction,
-                        policy: .default,
-                        availableSize: currentContentSize
-                    )
+                    if let direction = zone.insertionDirection {
+                        _ = try workspace.movePane(
+                            sourceTabID: sourceTabID,
+                            paneID: sourcePaneID,
+                            toDestinationTabID: tab.id,
+                            adjacentTo: targetPaneID,
+                            direction: direction,
+                            policy: .default,
+                            availableSize: currentContentSize
+                        )
+                    } else {
+                        _ = try workspace.movePaneReplacing(
+                            sourceTabID: sourceTabID,
+                            paneID: sourcePaneID,
+                            toDestinationTabID: tab.id,
+                            replacing: targetPaneID
+                        )
+                    }
                 }
                 return true
             } catch {
@@ -1812,15 +1778,23 @@ struct PDFReaderView: View {
             }
 
         case let .fileURL(url):
-            let result = withAnimation(.easeOut(duration: 0.16)) {
-                workspace.openPDFInSplit(
-                    url: url,
-                    in: tab.id,
-                    adjacentTo: targetPaneID,
-                    direction: direction,
-                    policy: .default,
-                    availableSize: currentContentSize
-                )
+            let result: Result<PaneID, Error> = withAnimation(.easeOut(duration: 0.16)) {
+                if let direction = zone.insertionDirection {
+                    return workspace.openPDFInSplit(
+                        url: url,
+                        in: tab.id,
+                        adjacentTo: targetPaneID,
+                        direction: direction,
+                        policy: .default,
+                        availableSize: currentContentSize
+                    )
+                } else {
+                    return workspace.openPDFReplacingPane(
+                        url: url,
+                        in: tab.id,
+                        replacing: targetPaneID
+                    )
+                }
             }
             switch result {
             case .success:
