@@ -25,7 +25,12 @@ final class WorkspaceTabSession: Identifiable, ObservableObject {
     let navigationState: ReaderNavigationState
 
     private var documentModels: [PaneID: PDFDocumentModel] = [:]
+    private var paneCancellables: [PaneID: [AnyCancellable]] = [:]
     private var cancellables = Set<AnyCancellable>()
+
+    var observedPaneIDs: Set<PaneID> {
+        Set(paneCancellables.keys)
+    }
 
     init(
         identity: WorkspaceTabIdentity = WorkspaceTabIdentity(),
@@ -240,6 +245,7 @@ final class WorkspaceTabSession: Identifiable, ObservableObject {
         let newTree = try layoutTree.removing(paneID)
         layoutTree = newTree
 
+        cancelObserving(for: paneID)
         sessionToClose.paneModel.close()
         paneSessions.removeValue(forKey: paneID)
         documentModels.removeValue(forKey: paneID)
@@ -266,6 +272,7 @@ final class WorkspaceTabSession: Identifiable, ObservableObject {
                 }
             }
         }
+        cancelObserving(for: paneID)
         paneSessions.removeValue(forKey: paneID)
         documentModels.removeValue(forKey: paneID)
         objectWillChange.send()
@@ -319,6 +326,7 @@ final class WorkspaceTabSession: Identifiable, ObservableObject {
         preservingResource incomingResource: PDFResourceSession? = nil
     ) {
         guard let oldSession = paneSessions.removeValue(forKey: paneID) else { return }
+        cancelObserving(for: paneID)
         documentModels.removeValue(forKey: paneID)
         let oldResource = oldSession.resourceSession
         oldSession.paneModel.close()
@@ -386,13 +394,25 @@ final class WorkspaceTabSession: Identifiable, ObservableObject {
     }
 
     func setupObserving(for session: PDFPaneSession) {
-        session.paneModel.objectWillChange
+        cancelObserving(for: session.id)
+        let paneSubscription = session.paneModel.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
-            .store(in: &cancellables)
+        let resourceSubscription = session.resourceSession.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+        paneCancellables[session.id] = [paneSubscription, resourceSubscription]
+    }
 
-        session.resourceSession.objectWillChange
-            .sink { [weak self] _ in self?.objectWillChange.send() }
-            .store(in: &cancellables)
+    private func cancelObserving(for paneID: PaneID) {
+        if let subscriptions = paneCancellables.removeValue(forKey: paneID) {
+            subscriptions.forEach { $0.cancel() }
+        }
+    }
+
+    func cancelAllPaneObserving() {
+        for subscriptions in paneCancellables.values {
+            subscriptions.forEach { $0.cancel() }
+        }
+        paneCancellables.removeAll()
     }
 
     /// The sidebar visibility and section live on `navigationState`, and the
@@ -851,6 +871,119 @@ final class WorkspaceWindowModel: ObservableObject {
         return .success(candidatePaneID)
     }
 
+    /// Validates whether dropping `payload` onto `targetPaneID` at `zone` in `tabID` can commit,
+    /// matching the commit-time safety and rebalanced layout checks.
+    func validateDrop(
+        on targetPaneID: PaneID,
+        in tabID: UUID,
+        payload: DropPayload?,
+        zone: PaneDropZone,
+        availableSize: CGSize?
+    ) -> (isValid: Bool, feedback: String) {
+        guard let tab = sessions[tabID],
+              tab.paneSessions[targetPaneID] != nil else {
+            return (false, "Invalid drop target")
+        }
+
+        let dragPayload: PaneDragPayload?
+        let fileURL: URL?
+        switch payload {
+        case let .pane(panePayload):
+            dragPayload = panePayload
+            fileURL = nil
+        case let .fileURL(url):
+            dragPayload = nil
+            fileURL = url
+        case nil:
+            dragPayload = nil
+            fileURL = nil
+        }
+
+        let resolvedSourcePaneID: PaneID? = dragPayload.flatMap { payload in
+            payload.sourcePaneID ?? sessions[payload.sourceTabID]?.layoutTree.leafIDs.first
+        }
+
+        if let dragPayload,
+           dragPayload.sourceTabID == tabID,
+           resolvedSourcePaneID == targetPaneID {
+            return (false, "Cannot drop a pane onto itself")
+        }
+
+        if let fileURL, !fileURL.isFileURL {
+            return (false, "Invalid drop target")
+        }
+
+        guard let direction = zone.insertionDirection else {
+            let incomingResource: PDFResourceSession?
+            if let fileURL {
+                incomingResource = findResourceSession(for: fileURL)
+            } else if let dragPayload, let sourceID = resolvedSourcePaneID {
+                incomingResource = sessions[dragPayload.sourceTabID]?.paneSessions[sourceID]?.resourceSession
+            } else {
+                incomingResource = nil
+            }
+            return tab.canReplacePane(targetPaneID, incomingResourceSession: incomingResource)
+        }
+
+        guard let rootSize = availableSize else {
+            return (false, "Workspace layout is not ready")
+        }
+
+        let isIntraTabMove = (dragPayload?.sourceTabID == tabID && resolvedSourcePaneID != nil)
+        if isIntraTabMove {
+            guard let sourceID = resolvedSourcePaneID else {
+                return (false, "Invalid drag source")
+            }
+            guard tab.layoutTree.canMove(
+                sourceID,
+                adjacentTo: targetPaneID,
+                direction: direction,
+                policy: .default,
+                availableSize: rootSize
+            ) else {
+                return (false, "Pane is too small to split \(direction.rawValue)")
+            }
+            return (true, "")
+        }
+
+        do {
+            _ = try tab.layoutTree.inserting(
+                PaneID(),
+                adjacentTo: targetPaneID,
+                direction: direction,
+                policy: .default,
+                availableSize: rootSize
+            )
+            return (true, "")
+        } catch let error as LayoutMutationError {
+            switch error {
+            case .maximumPaneLimitReached(let limit):
+                return (false, "Maximum \(limit) panes limit reached")
+            case .targetPaneNotFound, .duplicatePaneID, .cannotCloseOnlyPane:
+                return (false, "Invalid drop target")
+            case .insufficientSpace:
+                if let unconstrainedTree = try? tab.layoutTree.inserting(
+                    PaneID(),
+                    adjacentTo: targetPaneID,
+                    direction: direction,
+                    policy: .default,
+                    availableSize: nil
+                ) {
+                    let required = unconstrainedTree.minimumRequiredSize(policy: .default)
+                    if required.width > rootSize.width {
+                        return (false, "Width too narrow to split")
+                    }
+                    if required.height > rootSize.height {
+                        return (false, "Height too short to split")
+                    }
+                }
+                return (false, direction.axis == .horizontal ? "Width too narrow to split" : "Height too short to split")
+            }
+        } catch {
+            return (false, "Invalid drop target")
+        }
+    }
+
     /// Updates layout tree for the tab with observable publication.
     func updateLayoutTree(_ newTree: WorkspaceLayoutTree, in tabID: UUID? = nil) {
         let targetTabID = tabID ?? activeTabID
@@ -988,6 +1121,7 @@ final class WorkspaceWindowModel: ObservableObject {
 
         sessions[tabID] = nil
         tabObservingCancellables.removeValue(forKey: tabID)
+        session.cancelAllPaneObserving()
         for paneSession in session.paneSessions.values {
             paneSession.paneModel.close()
         }
@@ -1049,6 +1183,7 @@ final class WorkspaceWindowModel: ObservableObject {
 
     func closeAllSessions() {
         for session in sessions.values {
+            session.cancelAllPaneObserving()
             for paneSession in session.paneSessions.values {
                 paneSession.paneModel.close()
             }

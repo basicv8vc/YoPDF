@@ -1624,8 +1624,8 @@ struct PDFReaderView: View {
                                 activatePane(paneID)
                             },
                             paneDropSink: PaneDropSink(
-                                validate: { zone in
-                                    validateDrop(on: paneID, zone: zone)
+                                validate: { payload, zone in
+                                    validateDrop(on: paneID, payload: payload, zone: zone)
                                 },
                                 onHoverChanged: { hover in
                                     paneHoverStates[paneID] = hover
@@ -1716,66 +1716,18 @@ struct PDFReaderView: View {
     /// multi-pane splits and reorders. The commit calls (`movePane`,
     /// `openPDFInSplit`) validate with `currentContentSize`; this keeps the
     /// preview consistent with them.
-    private func validateDrop(on targetPaneID: PaneID, zone: PaneDropZone) -> (isValid: Bool, feedback: String) {
-        if let payload = activeDraggedPayload,
-           payload.sourceTabID == tab.id,
-           payload.sourcePaneID == targetPaneID {
-            return (false, "Cannot drop a pane onto itself")
-        }
-
-        guard let direction = zone.insertionDirection else {
-            return tab.canReplacePane(targetPaneID)
-        }
-
-        guard let rootSize = currentContentSize else {
-            return (false, "Workspace layout is not ready")
-        }
-
-        let isIntraTabMove: Bool
-        if let payload = activeDraggedPayload,
-           payload.sourceTabID == tab.id,
-           payload.sourcePaneID != nil {
-            isIntraTabMove = true
-        } else {
-            isIntraTabMove = false
-        }
-
-        if isIntraTabMove {
-            guard let sourceID = activeDraggedPayload?.sourcePaneID else {
-                return (false, "Invalid drag source")
-            }
-            guard tab.layoutTree.canMove(sourceID, adjacentTo: targetPaneID, direction: direction, policy: .default, availableSize: rootSize) else {
-                return (false, "Pane is too small to split \(direction.rawValue)")
-            }
-            return (true, "")
-        } else {
-            // Mirror `WorkspaceLayoutTree.inserting`, checking the resulting tree's
-            // rebalanced minimum size against the root workspace size.
-            do {
-                _ = try tab.layoutTree.inserting(
-                    PaneID(),
-                    adjacentTo: targetPaneID,
-                    direction: direction,
-                    policy: .default,
-                    availableSize: rootSize
-                )
-                return (true, "")
-            } catch let error as LayoutMutationError {
-                switch error {
-                case .maximumPaneLimitReached(let limit):
-                    return (false, "Maximum \(limit) panes limit reached")
-                case .targetPaneNotFound, .duplicatePaneID, .cannotCloseOnlyPane:
-                    return (false, "Invalid drop target")
-                case let .insufficientSpace(_, available):
-                    let widthFailed = direction.axis == .horizontal
-                        ? available == rootSize.width
-                        : available != rootSize.height
-                    return (false, widthFailed ? "Width too narrow to split" : "Height too short to split")
-                }
-            } catch {
-                return (false, "Invalid drop target")
-            }
-        }
+    private func validateDrop(
+        on targetPaneID: PaneID,
+        payload: DropPayload,
+        zone: PaneDropZone
+    ) -> (isValid: Bool, feedback: String) {
+        workspace.validateDrop(
+            on: targetPaneID,
+            in: tab.id,
+            payload: payload,
+            zone: zone,
+            availableSize: currentContentSize
+        )
     }
 
     private func handlePaneDrop(payload: DropPayload, on targetPaneID: PaneID, zone: PaneDropZone, in size: CGSize) -> Bool {

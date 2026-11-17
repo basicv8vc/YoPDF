@@ -168,14 +168,14 @@ public struct PaneDropHoverState: Equatable, Sendable {
 /// layout model, so the destination layer only decides *where* and *what*,
 /// while the layout rules stay here.
 public struct PaneDropSink: Sendable {
-    public let validate: @Sendable (PaneDropZone) -> (isValid: Bool, feedback: String)
-    public let onHoverChanged: @Sendable (PaneDropHoverState?) -> Void
-    public let onPerformDrop: @Sendable (DropPayload, PaneDropZone) -> Bool
+    public let validate: @MainActor @Sendable (DropPayload, PaneDropZone) -> (isValid: Bool, feedback: String)
+    public let onHoverChanged: @MainActor @Sendable (PaneDropHoverState?) -> Void
+    public let onPerformDrop: @MainActor @Sendable (DropPayload, PaneDropZone) -> Bool
 
     public init(
-        validate: @escaping @Sendable (PaneDropZone) -> (isValid: Bool, feedback: String),
-        onHoverChanged: @escaping @Sendable (PaneDropHoverState?) -> Void,
-        onPerformDrop: @escaping @Sendable (DropPayload, PaneDropZone) -> Bool
+        validate: @escaping @MainActor @Sendable (DropPayload, PaneDropZone) -> (isValid: Bool, feedback: String),
+        onHoverChanged: @escaping @MainActor @Sendable (PaneDropHoverState?) -> Void,
+        onPerformDrop: @escaping @MainActor @Sendable (DropPayload, PaneDropZone) -> Bool
     ) {
         self.validate = validate
         self.onHoverChanged = onHoverChanged

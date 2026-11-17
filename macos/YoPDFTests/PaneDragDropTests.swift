@@ -916,7 +916,7 @@ final class PaneDragDropTests: XCTestCase {
     /// rules in test 14 so both destinations stay in agreement.
     func testPaneDropSinkOperationSelectionForInternalMovesAndExternalCopies() {
         let sink = PaneDropSink(
-            validate: { _ in (true, "") },
+            validate: { _, _ in (true, "") },
             onHoverChanged: { _ in },
             onPerformDrop: { _, _ in true }
         )
@@ -946,7 +946,7 @@ final class PaneDragDropTests: XCTestCase {
         }
         let box = StateBox()
         let sink = PaneDropSink(
-            validate: { _ in (false, "limit reached") },
+            validate: { _, _ in (false, "limit reached") },
             onHoverChanged: { box.states.append($0) },
             onPerformDrop: { _, _ in false }
         )
@@ -1625,5 +1625,187 @@ final class PaneDragDropTests: XCTestCase {
         XCTAssertEqual(resourceB.activeLeaseCount, 0)
 
         workspace.closeAllSessions()
+    }
+
+    func testCenterDropPreviewValidationMatchesCommitForSameAndDifferentDirtyPDF() throws {
+        let urlA = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 4, named: "preview-dirty-a")
+        let urlB = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 4, named: "preview-dirty-b")
+        defer {
+            try? FileManager.default.removeItem(at: urlA.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: urlB.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        guard case let .opened(tabID) = workspace.open(urlA) else {
+            return XCTFail("Failed to open urlA")
+        }
+        let tab = try XCTUnwrap(workspace.session(tabID: tabID))
+        let paneA = tab.activePaneID
+        let sessionA = try XCTUnwrap(tab.paneSessions[paneA])
+        let resourceA = sessionA.resourceSession
+        let docA = try XCTUnwrap(resourceA.document)
+        let pageA0 = try XCTUnwrap(docA.page(at: 0))
+        let docModelA = tab.model(for: sessionA)
+
+        // Produce unsaved annotation edits while paneA holds the sole surviving lease.
+        let selection = try XCTUnwrap(docA.selection(from: pageA0, atCharacterIndex: 0, to: pageA0, atCharacterIndex: 4))
+        sessionA.paneModel.updateSelection(selection)
+        XCTAssertNotNil(docModelA.addMarkup(.highlight))
+        XCTAssertTrue(resourceA.hasUnsavedChanges)
+        XCTAssertEqual(resourceA.activeLeaseCount, 1)
+
+        let workspaceSize = CGSize(width: 1100, height: 800)
+        let sink = PaneDropSink(
+            validate: { payload, zone in
+                workspace.validateDrop(
+                    on: paneA,
+                    in: tabID,
+                    payload: payload,
+                    zone: zone,
+                    availableSize: workspaceSize
+                )
+            },
+            onHoverChanged: { _ in },
+            onPerformDrop: { _, _ in true }
+        )
+
+        // Dropping a *different* PDF onto center of sole dirty pane must be rejected in BOTH preview and commit.
+        let differentCheck = sink.validate(.fileURL(urlB), .center)
+        XCTAssertFalse(differentCheck.isValid)
+        XCTAssertEqual(differentCheck.feedback, PaneReplaceError.targetHasUnsavedDocumentChanges.localizedDescription)
+        if case let .failure(err) = workspace.openPDFReplacingPane(url: urlB, in: tabID, replacing: paneA) {
+            XCTAssertEqual(err as? PaneReplaceError, .targetHasUnsavedDocumentChanges)
+        } else {
+            return XCTFail("Expected replacing dirty sole-lease pane with a different PDF to fail")
+        }
+
+        // Dropping the *same* dirty PDF onto center must pass BOTH preview validation and commit, reusing resourceA.
+        let sameCheck = sink.validate(.fileURL(urlA), .center)
+        XCTAssertTrue(sameCheck.isValid, "Preview should allow center drop when incoming PDF reuses the same dirty resource")
+        XCTAssertEqual(sameCheck.feedback, "")
+        guard case let .success(replacedPaneID) = workspace.openPDFReplacingPane(url: urlA, in: tabID, replacing: paneA) else {
+            return XCTFail("Expected center replacement with the same dirty PDF to succeed")
+        }
+        XCTAssertTrue(tab.paneSessions[replacedPaneID]?.resourceSession === resourceA)
+        XCTAssertTrue(resourceA.hasUnsavedChanges)
+
+        // Even for the same dirty PDF, an uncommitted note composer draft still blocks both preview and commit.
+        let replacedSession = try XCTUnwrap(tab.paneSessions[replacedPaneID])
+        let draft = try XCTUnwrap(tab.model(for: replacedSession).pageNoteDraft(at: CGPoint(x: 60, y: 100), on: pageA0))
+        XCTAssertTrue(replacedSession.paneModel.noteComposerStore.begin(
+            mode: .create(draft),
+            anchorRect: CGRect(x: 60, y: 100, width: 1, height: 1),
+            pageLabel: "1",
+            excerpt: nil,
+            contents: "",
+            paper: .honey
+        ))
+        replacedSession.paneModel.noteComposerStore.session?.contents = "Uncommitted note"
+
+        let draftSinkCheck = workspace.validateDrop(
+            on: replacedPaneID,
+            in: tabID,
+            payload: .fileURL(urlA),
+            zone: .center,
+            availableSize: workspaceSize
+        )
+        XCTAssertFalse(draftSinkCheck.isValid)
+        XCTAssertEqual(draftSinkCheck.feedback, PaneReplaceError.targetHasUncommittedDraft.localizedDescription)
+
+        workspace.closeAllSessions()
+    }
+
+    func testReplacingClosingAndDetachingPaneCancelsObsoleteCombineSubscriptions() throws {
+        let urlA = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 5, named: "obs-a")
+        let urlB = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 5, named: "obs-b")
+        let urlC = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 5, named: "obs-c")
+        defer {
+            try? FileManager.default.removeItem(at: urlA.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: urlB.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: urlC.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        guard case let .opened(tab1ID) = workspace.open(urlA) else {
+            return XCTFail("Failed to open urlA")
+        }
+        let tab1 = try XCTUnwrap(workspace.session(tabID: tab1ID))
+        var tab1CurrentPaneID = tab1.activePaneID
+        let sharedResourceA = try XCTUnwrap(tab1.paneSessions[tab1CurrentPaneID]?.resourceSession)
+
+        // Keep sharedResourceA alive in tab2 by splitting in tab1 and moving the sibling pane to tab2.
+        let siblingAForTab2 = try workspace.splitPane(paneID: tab1CurrentPaneID, in: tab1ID, direction: .right)
+        let tab2ID = workspace.createTab()
+        let tab2 = try XCTUnwrap(workspace.session(tabID: tab2ID))
+        let initialTab2Pane = tab2.activePaneID
+        _ = try workspace.movePaneReplacing(
+            sourceTabID: tab1ID,
+            paneID: siblingAForTab2,
+            toDestinationTabID: tab2ID,
+            replacing: initialTab2Pane
+        )
+        XCTAssertTrue(tab2.paneSessions[siblingAForTab2]?.resourceSession === sharedResourceA)
+        XCTAssertEqual(tab1.observedPaneIDs, Set(tab1.paneSessions.keys))
+        XCTAssertEqual(tab2.observedPaneIDs, Set(tab2.paneSessions.keys))
+
+        // Repeatedly replace tab1's pane with other documents: subscriptions must not accumulate,
+        // and mutating sharedResourceA (still open in tab2) must NOT trigger tab1.objectWillChange.
+        for index in 0..<5 {
+            let nextURL = (index % 2 == 0) ? urlB : urlC
+            guard case let .success(newPaneID) = workspace.openPDFReplacingPane(
+                url: nextURL,
+                in: tab1ID,
+                replacing: tab1CurrentPaneID
+            ) else {
+                return XCTFail("Replacement iteration \(index) failed")
+            }
+            tab1CurrentPaneID = newPaneID
+            XCTAssertEqual(tab1.observedPaneIDs, Set(tab1.paneSessions.keys))
+        }
+
+        var tab1EmitCount = 0
+        let tab1Cancellable = tab1.objectWillChange.sink { tab1EmitCount += 1 }
+        defer { tab1Cancellable.cancel() }
+
+        sharedResourceA.objectWillChange.send()
+        XCTAssertEqual(tab1EmitCount, 0, "Replaced resource held by another tab must no longer notify tab1")
+
+        // Splitting, closing one pane, and moving a pane to tab2 must keep observedPaneIDs exact and detach old observers.
+        let splitPane = try workspace.splitPane(paneID: tab1CurrentPaneID, in: tab1ID, direction: .right)
+        XCTAssertEqual(tab1.observedPaneIDs, Set(tab1.paneSessions.keys))
+        XCTAssertTrue(try workspace.closePane(tabID: tab1ID, paneID: splitPane))
+        XCTAssertEqual(tab1.observedPaneIDs, Set(tab1.paneSessions.keys))
+
+        guard case let .success(urlCPane) = workspace.openPDFInSplit(
+            url: urlC,
+            in: tab1ID,
+            adjacentTo: tab1CurrentPaneID,
+            direction: .right
+        ) else {
+            return XCTFail("Failed to split urlC")
+        }
+        let movedSession = try XCTUnwrap(tab1.paneSessions[urlCPane])
+        _ = try workspace.movePane(
+            sourceTabID: tab1ID,
+            paneID: urlCPane,
+            toDestinationTabID: tab2ID,
+            adjacentTo: siblingAForTab2,
+            direction: .bottom
+        )
+        XCTAssertEqual(tab1.observedPaneIDs, Set(tab1.paneSessions.keys))
+        XCTAssertEqual(tab2.observedPaneIDs, Set(tab2.paneSessions.keys))
+
+        tab1EmitCount = 0
+        var tab2EmitCount = 0
+        let tab2Cancellable = tab2.objectWillChange.sink { tab2EmitCount += 1 }
+        defer { tab2Cancellable.cancel() }
+
+        movedSession.paneModel.goToPage(2)
+        XCTAssertEqual(tab1EmitCount, 0, "Detached pane model must no longer notify source tab")
+        XCTAssertGreaterThan(tab2EmitCount, 0, "Destination tab must observe the transferred pane")
+
+        workspace.closeAllSessions()
+        XCTAssertTrue(tab1.observedPaneIDs.isEmpty)
+        XCTAssertTrue(tab2.observedPaneIDs.isEmpty)
     }
 }

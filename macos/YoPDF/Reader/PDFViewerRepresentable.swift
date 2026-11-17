@@ -491,7 +491,7 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
             hysteresis: 0.05
         )
         activePaneDropZone = zone
-        let check = sink.validate(zone)
+        let check = sink.validate(payload, zone)
         // The invalid state renders as a red "cannot drop here" preview;
         // concludePaneDrop clears it on every session-end path.
         sink.onHoverChanged(PaneDropHoverState(
