@@ -660,6 +660,17 @@ public struct PaneDropTargetModifier: ViewModifier {
 
 // MARK: - Native Drag Source
 
+/// Callbacks letting a tab-strip `PaneDragSourceView` reorder tabs while
+/// dragging within the strip and tear out into a native pane-drag session once
+/// the pointer leaves the strip vertically.
+@MainActor
+struct TabStripDragCallbacks {
+    var canReorder: () -> Bool
+    var onReorderChanged: (_ localStartX: CGFloat, _ translationX: CGFloat) -> Void
+    var onReorderEnded: (_ localStartX: CGFloat, _ translationX: CGFloat) -> Void
+    var onReorderCancelled: () -> Void
+}
+
 /// AppKit drag source for pane and tab payloads.
 ///
 /// SwiftUI's `onDrag` never reports when a drag session ends, so a drag that
@@ -684,14 +695,26 @@ final class PaneDragSourceView: NSView, NSDraggingSource {
     /// SwiftUI content underneath instead (tab capsules with Buttons).
     var onClick: (() -> Void)?
     var forwardsUnclaimedClicks = false
+    /// When set (on single-pane tabs in the tab strip), dragging within the
+    /// strip reorders tabs; dragging vertically out of the strip cancels the
+    /// reorder preview and begins a native pane-drag session.
+    var tabReorder: TabStripDragCallbacks?
 
     /// Movement in points before a press turns into a drag, matching the
     /// feel of SwiftUI's `onDrag` threshold.
     private static let dragThreshold: CGFloat = 3
     private static let previewOffset = CGPoint(x: 12, y: 4)
+    private static let tabTearOutBelowMargin: CGFloat = 16
+    private static let tabTearOutAboveMargin: CGFloat = 24
 
-    private var pendingMouseDown: NSEvent?
-    private var didBeginSession = false
+    private enum DragInteractionPhase {
+        case idle
+        case pending(mouseDown: NSEvent, startInWindow: NSPoint, localStartX: CGFloat)
+        case reordering(startInWindow: NSPoint, localStartX: CGFloat)
+        case nativeSession
+    }
+
+    private var phase: DragInteractionPhase = .idle
     private var isForwardingClick = false
 
     // MARK: Hit Testing
@@ -713,33 +736,85 @@ final class PaneDragSourceView: NSView, NSDraggingSource {
 
     override var mouseDownCanMoveWindow: Bool { false }
 
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if newWindow == nil, case .reordering = phase {
+            phase = .idle
+            tabReorder?.onReorderCancelled()
+        }
+    }
+
+    /// Returns true once the pointer has moved vertically far enough outside the
+    /// tab capsule to signal tearing the tab out into a pane drag.
+    func shouldTearOutTabDrag(atLocalPoint localPoint: NSPoint) -> Bool {
+        localPoint.y < -Self.tabTearOutBelowMargin
+            || localPoint.y > bounds.height + Self.tabTearOutAboveMargin
+    }
+
     // MARK: Mouse Tracking
 
     override func mouseDown(with event: NSEvent) {
-        pendingMouseDown = event
-        didBeginSession = false
+        let localStart = convert(event.locationInWindow, from: nil)
+        phase = .pending(
+            mouseDown: event,
+            startInWindow: event.locationInWindow,
+            localStartX: localStart.x
+        )
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard !didBeginSession, let mouseDown = pendingMouseDown else { return }
-        let start = convert(mouseDown.locationInWindow, from: nil)
-        let current = convert(event.locationInWindow, from: nil)
-        guard hypot(current.x - start.x, current.y - start.y) >= Self.dragThreshold else { return }
-        didBeginSession = true
-        beginPayloadSession(with: event, dragPoint: current)
+        switch phase {
+        case .idle, .nativeSession:
+            return
+
+        case let .pending(_, startInWindow, localStartX):
+            let dx = event.locationInWindow.x - startInWindow.x
+            let dy = event.locationInWindow.y - startInWindow.y
+            guard hypot(dx, dy) >= Self.dragThreshold else { return }
+
+            let currentLocal = convert(event.locationInWindow, from: nil)
+            if let tabReorder, tabReorder.canReorder(), !shouldTearOutTabDrag(atLocalPoint: currentLocal) {
+                phase = .reordering(startInWindow: startInWindow, localStartX: localStartX)
+                tabReorder.onReorderChanged(localStartX, dx)
+            } else {
+                phase = .nativeSession
+                beginPayloadSession(with: event, dragPoint: currentLocal)
+            }
+
+        case let .reordering(startInWindow, localStartX):
+            let dx = event.locationInWindow.x - startInWindow.x
+            let currentLocal = convert(event.locationInWindow, from: nil)
+            if shouldTearOutTabDrag(atLocalPoint: currentLocal) {
+                // Compute `currentLocal` before cancelling reorder so the floating
+                // pill spawns at the cursor's current screen position.
+                phase = .nativeSession
+                tabReorder?.onReorderCancelled()
+                beginPayloadSession(with: event, dragPoint: currentLocal)
+            } else {
+                tabReorder?.onReorderChanged(localStartX, dx)
+            }
+        }
     }
 
     override func mouseUp(with event: NSEvent) {
-        guard let mouseDown = pendingMouseDown, !didBeginSession else {
-            pendingMouseDown = nil
+        let currentPhase = phase
+        phase = .idle
+
+        switch currentPhase {
+        case .idle, .nativeSession:
             return
-        }
-        pendingMouseDown = nil
-        guard bounds.contains(convert(event.locationInWindow, from: nil)) else { return }
-        if let onClick {
-            onClick()
-        } else if forwardsUnclaimedClicks {
-            deliverSyntheticClick(down: mouseDown, up: event)
+
+        case let .pending(mouseDown, _, _):
+            guard bounds.contains(convert(event.locationInWindow, from: nil)) else { return }
+            if let onClick {
+                onClick()
+            } else if forwardsUnclaimedClicks {
+                deliverSyntheticClick(down: mouseDown, up: event)
+            }
+
+        case let .reordering(startInWindow, localStartX):
+            let dx = event.locationInWindow.x - startInWindow.x
+            tabReorder?.onReorderEnded(localStartX, dx)
         }
     }
 
@@ -791,8 +866,7 @@ final class PaneDragSourceView: NSView, NSDraggingSource {
     /// Restores visual state after any drag session end. Also invoked by
     /// `draggingSession(_:endedAt:operation:)`; exposed for model-level tests.
     func dragSessionDidEnd() {
-        pendingMouseDown = nil
-        didBeginSession = false
+        phase = .idle
         onDragEnded()
     }
 
@@ -881,6 +955,7 @@ struct PaneDragSource: NSViewRepresentable {
     let onDragEnded: () -> Void
     var onClick: (() -> Void)? = nil
     var forwardsUnclaimedClicks = false
+    var tabReorder: TabStripDragCallbacks? = nil
 
     func makeNSView(context: Context) -> PaneDragSourceView {
         PaneDragSourceView()
@@ -893,5 +968,6 @@ struct PaneDragSource: NSViewRepresentable {
         nsView.onDragEnded = onDragEnded
         nsView.onClick = onClick
         nsView.forwardsUnclaimedClicks = forwardsUnclaimedClicks
+        nsView.tabReorder = tabReorder
     }
 }

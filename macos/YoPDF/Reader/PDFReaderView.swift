@@ -44,20 +44,22 @@ private struct SinglePaneTabDraggableModifier: ViewModifier {
     let onActivate: () -> Void
     let onDragStarted: (() -> Void)?
     let onDragEnded: (() -> Void)?
+    let tabReorder: TabStripDragCallbacks?
 
     func body(content: Content) -> some View {
         if tab.layoutTree.paneCount == 1 {
-            // The capsule is the drag source. The native drag session reports
-            // every session end, so a cancelled or rejected tab drag cannot
-            // strand the dimmed source pane or hover overlays. Plain clicks
-            // switch tabs through `onActivate`.
+            // The title button hosts the AppKit drag source: horizontal drags
+            // inside the strip reorder tabs with live reflow, while dragging
+            // vertically out of the strip tears into a native pane-drag
+            // session. Plain clicks switch tabs through `onActivate`.
             content.overlay {
                 PaneDragSource(
                     payload: PaneDragPayload(kind: .tab, sourceTabID: tab.id, sourcePaneID: tab.activePaneID),
                     previewTitle: tab.title,
                     onDragStarted: { onDragStarted?() },
                     onDragEnded: { onDragEnded?() },
-                    onClick: onActivate
+                    onClick: onActivate,
+                    tabReorder: tabReorder
                 )
             }
         } else {
@@ -204,7 +206,36 @@ private struct WorkspaceTabStrip: View {
                 tab: tab,
                 onActivate: { workspace.activate(tabID: tab.id) },
                 onDragStarted: { onTabDragStarted?(tab) },
-                onDragEnded: { onTabDragEnded?() }
+                onDragEnded: { onTabDragEnded?() },
+                tabReorder: TabStripDragCallbacks(
+                    canReorder: { workspace.tabs.count > 1 },
+                    onReorderChanged: { localStartX, translationX in
+                        guard let pointerX = tabReorderPointerX(
+                            tabID: tab.id,
+                            localStartX: localStartX,
+                            translationX: translationX
+                        ) else { return }
+                        updateTabReorder(
+                            tabID: tab.id,
+                            pointerX: pointerX,
+                            translationX: translationX
+                        )
+                    },
+                    onReorderEnded: { localStartX, translationX in
+                        guard let pointerX = tabReorderPointerX(
+                            tabID: tab.id,
+                            localStartX: localStartX,
+                            translationX: translationX
+                        ) else {
+                            cancelTabReorder(tabID: tab.id)
+                            return
+                        }
+                        commitTabReorder(tabID: tab.id, pointerX: pointerX)
+                    },
+                    onReorderCancelled: {
+                        cancelTabReorder(tabID: tab.id)
+                    }
+                )
             ))
 
             if workspace.tabs.count > 1 {
@@ -272,41 +303,80 @@ private struct WorkspaceTabStrip: View {
                 state = true
             }
             .onChanged { value in
-                guard workspace.tabs.count > 1 else { return }
-                if draggingTabID != tab.id || dragSnapshot == nil {
-                    // Freeze the geometry before any reflow starts. Without a
-                    // complete measurement the drag simply never begins.
-                    guard let snapshot = makeSnapshot(dragging: tab.id) else { return }
-                    dragSnapshot = snapshot
-                    draggingTabID = tab.id
-                }
-                guard let snapshot = dragSnapshot else { return }
-                dragTranslation = value.translation.width
-                dropIndex = insertionIndex(forPointerX: value.location.x, in: snapshot)
+                updateTabReorder(
+                    tabID: tab.id,
+                    pointerX: value.location.x,
+                    translationX: value.translation.width
+                )
             }
             .onEnded { value in
-                guard draggingTabID == tab.id, let snapshot = dragSnapshot else { return }
-                let target = insertionIndex(forPointerX: value.location.x, in: snapshot)
-                let currentIndex = workspace.tabs.firstIndex { $0.id == tab.id }
-                // Unwinding the offsets and committing the order in the same
-                // transaction makes the two movements cancel out exactly: the
-                // stationary tabs never move while the lifted one glides into
-                // its slot. Splitting the unwind and the relayout across
-                // transactions is what made the swapped tabs bounce on
-                // release, so this block must stay atomic.
-                withAnimation(Self.reorderAnimation) {
-                    draggingTabID = nil
-                    dragTranslation = 0
-                    dropIndex = 0
-                    dragSnapshot = nil
-                    if currentIndex != target {
-                        workspace.moveTab(tabID: tab.id, toInsertionIndex: target)
-                    }
-                    // A non-active tab is selected only on release, so the PDF
-                    // being read does not change underneath a drag in progress.
-                    workspace.activate(tabID: tab.id)
-                }
+                commitTabReorder(tabID: tab.id, pointerX: value.location.x)
             }
+    }
+
+    private func tabReorderPointerX(
+        tabID: UUID,
+        localStartX: CGFloat,
+        translationX: CGFloat
+    ) -> CGFloat? {
+        if let snapshot = dragSnapshot, let slot = snapshot.slots[tabID] {
+            return CGFloat(slot.minX) + localStartX + translationX
+        }
+        if let frame = tabFrames[tabID] {
+            return frame.minX + localStartX + translationX
+        }
+        return nil
+    }
+
+    private func updateTabReorder(tabID: UUID, pointerX: CGFloat, translationX: CGFloat) {
+        guard workspace.tabs.count > 1 else { return }
+        if draggingTabID != tabID || dragSnapshot == nil {
+            // Freeze the geometry before any reflow starts. Without a
+            // complete measurement the drag simply never begins.
+            guard let snapshot = makeSnapshot(dragging: tabID) else { return }
+            dragSnapshot = snapshot
+            draggingTabID = tabID
+        }
+        guard let snapshot = dragSnapshot else { return }
+        dragTranslation = translationX
+        dropIndex = insertionIndex(forPointerX: pointerX, in: snapshot)
+    }
+
+    private func commitTabReorder(tabID: UUID, pointerX: CGFloat) {
+        guard draggingTabID == tabID, let snapshot = dragSnapshot else {
+            cancelTabReorder(tabID: tabID)
+            return
+        }
+        let target = insertionIndex(forPointerX: pointerX, in: snapshot)
+        let currentIndex = workspace.tabs.firstIndex { $0.id == tabID }
+        // Unwinding the offsets and committing the order in the same
+        // transaction makes the two movements cancel out exactly: the
+        // stationary tabs never move while the lifted one glides into
+        // its slot. Splitting the unwind and the relayout across
+        // transactions is what made the swapped tabs bounce on
+        // release, so this block must stay atomic.
+        withAnimation(Self.reorderAnimation) {
+            draggingTabID = nil
+            dragTranslation = 0
+            dropIndex = 0
+            dragSnapshot = nil
+            if currentIndex != target {
+                workspace.moveTab(tabID: tabID, toInsertionIndex: target)
+            }
+            // A non-active tab is selected only on release, so the PDF
+            // being read does not change underneath a drag in progress.
+            workspace.activate(tabID: tabID)
+        }
+    }
+
+    private func cancelTabReorder(tabID: UUID) {
+        guard draggingTabID == tabID else { return }
+        withAnimation(Self.reorderAnimation) {
+            draggingTabID = nil
+            dragTranslation = 0
+            dropIndex = 0
+            dragSnapshot = nil
+        }
     }
 
     // MARK: - Drop placement

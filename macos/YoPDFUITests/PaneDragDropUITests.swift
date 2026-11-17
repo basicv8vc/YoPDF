@@ -125,4 +125,101 @@ final class PaneDragDropUITests: XCTestCase {
             "The pane still navigates after a cancelled drag."
         )
     }
+
+    /// Real-app regression: dragging a single-pane PDF tab filename
+    /// horizontally along the tab strip must reorder the tabs.
+    func testDraggingSinglePaneTabFilenameReordersTabs() throws {
+        let runID = UUID().uuidString
+        let firstURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 2, named: "tab-alpha-\(runID)")
+        let secondURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 2, named: "tab-beta-\(runID)")
+        defer {
+            try? FileManager.default.removeItem(at: firstURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: secondURL.deletingLastPathComponent())
+        }
+
+        let app = XCUIApplication()
+        app.launchArguments = ["-ApplePersistenceIgnoreState", "YES"]
+        app.launchEnvironment["YOPDF_SCREENSHOT_PDF"] = firstURL.path
+        app.launch()
+        defer { app.terminate() }
+        app.activate()
+
+        let firstTab = app.buttons[firstURL.lastPathComponent]
+        XCTAssertTrue(firstTab.waitForExistence(timeout: 20), "First PDF tab must appear.")
+
+        app.open(secondURL)
+        let secondTab = app.buttons[secondURL.lastPathComponent]
+        XCTAssertTrue(secondTab.waitForExistence(timeout: 15), "Second PDF tab must appear.")
+        XCTAssertLessThan(firstTab.frame.minX, secondTab.frame.minX)
+
+        // Drag the second tab's filename to the left of the first tab.
+        let beforeFirst = firstTab.coordinate(withNormalizedOffset: CGVector(dx: 0.1, dy: 0.5))
+        secondTab
+            .coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.15, thenDragTo: beforeFirst)
+
+        let movedLeft = waitUntil {
+            secondTab.exists && firstTab.exists && secondTab.frame.minX < firstTab.frame.minX
+        }
+        XCTAssertTrue(movedLeft, "Dragging a tab filename left must reorder it before the first tab.")
+        XCTAssertTrue(secondTab.isSelected, "The dragged tab must become active on release.")
+
+        // Drag the same tab back to the right of the other tab.
+        let afterFirst = firstTab.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5))
+        secondTab
+            .coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.15, thenDragTo: afterFirst)
+
+        let movedBack = waitUntil {
+            secondTab.exists && firstTab.exists && firstTab.frame.minX < secondTab.frame.minX
+        }
+        XCTAssertTrue(movedBack, "Dragging a tab filename right must reorder it after the other tab.")
+    }
+
+    /// Real-app regression: dragging a single-pane tab vertically out of the tab
+    /// strip into the reader content must still tear out into a split pane.
+    func testDraggingSinglePaneTabDownIntoPaneCommitsSplit() throws {
+        let runID = UUID().uuidString
+        let firstURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 2, named: "tear-alpha-\(runID)")
+        let secondURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 2, named: "tear-beta-\(runID)")
+        defer {
+            try? FileManager.default.removeItem(at: firstURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: secondURL.deletingLastPathComponent())
+        }
+
+        let app = XCUIApplication()
+        app.launchArguments = ["-ApplePersistenceIgnoreState", "YES"]
+        app.launchEnvironment["YOPDF_SCREENSHOT_PDF"] = firstURL.path
+        app.launch()
+        defer { app.terminate() }
+        app.activate()
+
+        let window = app.windows.firstMatch
+        let firstTab = app.buttons[firstURL.lastPathComponent]
+        XCTAssertTrue(firstTab.waitForExistence(timeout: 20))
+
+        app.open(secondURL)
+        let secondTab = app.buttons[secondURL.lastPathComponent]
+        XCTAssertTrue(secondTab.waitForExistence(timeout: 15))
+
+        // Drag the inactive first tab downward onto the right edge of the active pane.
+        let rightDropPoint = window.coordinate(withNormalizedOffset: CGVector(dx: 0.88, dy: 0.55))
+        firstTab
+            .coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.15, thenDragTo: rightDropPoint)
+
+        XCTAssertTrue(
+            app.buttons["Vertical split divider"].waitForExistence(timeout: 10),
+            "Dragging a single-pane tab vertically onto a pane must split it side-by-side."
+        )
+    }
+
+    private func waitUntil(_ condition: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            if condition() { return true }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+        return false
+    }
 }
