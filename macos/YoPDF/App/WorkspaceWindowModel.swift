@@ -2,6 +2,20 @@ import Combine
 import Foundation
 import YoPDFCore
 
+enum PaneReplaceError: Error, Equatable, LocalizedError, Sendable {
+    case targetHasUncommittedDraft
+    case targetHasUnsavedDocumentChanges
+
+    var errorDescription: String? {
+        switch self {
+        case .targetHasUncommittedDraft:
+            return "Target pane has uncommitted note draft"
+        case .targetHasUnsavedDocumentChanges:
+            return "Target pane has unsaved document changes"
+        }
+    }
+}
+
 @MainActor
 final class WorkspaceTabSession: Identifiable, ObservableObject {
     let id: UUID
@@ -156,25 +170,13 @@ final class WorkspaceTabSession: Identifiable, ObservableObject {
     ) -> Bool {
         let targetID = paneID ?? activePaneID
         guard paneSessions[targetID] != nil else { return false }
-        guard layoutTree.paneCount < policy.maxPanes else { return false }
-
-        if let availableSize {
-            let existingFrames = layoutTree.paneFrames(in: availableSize, policy: policy)
-            guard let targetFrame = existingFrames[targetID] else { return false }
-            switch direction.axis {
-            case .horizontal:
-                let requiredWidth = policy.minimumLeafWidth * 2 + policy.dividerThickness
-                if targetFrame.width < requiredWidth || targetFrame.height < policy.minimumLeafHeight {
-                    return false
-                }
-            case .vertical:
-                let requiredHeight = policy.minimumLeafHeight * 2 + policy.dividerThickness
-                if targetFrame.height < requiredHeight || targetFrame.width < policy.minimumLeafWidth {
-                    return false
-                }
-            }
-        }
-        return true
+        return layoutTree.canInsert(
+            PaneID(),
+            adjacentTo: targetID,
+            direction: direction,
+            policy: policy,
+            availableSize: availableSize
+        )
     }
 
     @discardableResult
@@ -275,6 +277,90 @@ final class WorkspaceTabSession: Identifiable, ObservableObject {
         paneSessions[session.id] = session
         activePaneID = session.id
         setupObserving(for: session)
+        objectWillChange.send()
+    }
+
+    /// Returns an error if replacing `targetPaneID` would silently discard an uncommitted
+    /// note draft or the sole surviving lease on a dirty `PDFResourceSession`.
+    func replacementError(
+        for targetPaneID: PaneID,
+        incomingResourceSession: PDFResourceSession? = nil
+    ) -> PaneReplaceError? {
+        guard let targetSession = paneSessions[targetPaneID] else { return nil }
+        if targetSession.paneModel.noteComposerStore.hasUncommittedChanges {
+            return .targetHasUncommittedDraft
+        }
+        let targetResource = targetSession.resourceSession
+        if targetResource.hasUnsavedChanges {
+            let sameResourceReused = (incomingResourceSession === targetResource)
+            let otherLeaseExists = !targetResource.activePaneIDs.subtracting([targetPaneID]).isEmpty
+            if !sameResourceReused && !otherLeaseExists {
+                return .targetHasUnsavedDocumentChanges
+            }
+        }
+        return nil
+    }
+
+    func canReplacePane(
+        _ targetPaneID: PaneID,
+        incomingResourceSession: PDFResourceSession? = nil
+    ) -> (isValid: Bool, feedback: String) {
+        guard paneSessions[targetPaneID] != nil else {
+            return (false, "Invalid drop target")
+        }
+        if let error = replacementError(for: targetPaneID, incomingResourceSession: incomingResourceSession) {
+            return (false, error.localizedDescription)
+        }
+        return (true, "")
+    }
+
+    private func releaseClosedPaneSession(
+        _ paneID: PaneID,
+        preservingResource incomingResource: PDFResourceSession? = nil
+    ) {
+        guard let oldSession = paneSessions.removeValue(forKey: paneID) else { return }
+        documentModels.removeValue(forKey: paneID)
+        let oldResource = oldSession.resourceSession
+        oldSession.paneModel.close()
+        if oldResource !== incomingResource && oldResource.activeLeaseCount == 0 {
+            oldResource.close()
+        }
+    }
+
+    func replacePaneSession(
+        _ targetPaneID: PaneID,
+        with incomingSession: PDFPaneSession,
+        newLayoutTree: WorkspaceLayoutTree
+    ) {
+        releaseClosedPaneSession(targetPaneID, preservingResource: incomingSession.resourceSession)
+        layoutTree = newLayoutTree
+        paneSessions[incomingSession.id] = incomingSession
+        activePaneID = incomingSession.id
+        setupObserving(for: incomingSession)
+        objectWillChange.send()
+    }
+
+    func movePaneWithinTabReplacing(
+        paneID: PaneID,
+        replacing targetPaneID: PaneID
+    ) throws {
+        guard paneID != targetPaneID else {
+            throw LayoutMutationError.duplicatePaneID(paneID)
+        }
+        guard let sourceSession = paneSessions[paneID] else {
+            throw LayoutMutationError.targetPaneNotFound(paneID)
+        }
+        guard paneSessions[targetPaneID] != nil else {
+            throw LayoutMutationError.targetPaneNotFound(targetPaneID)
+        }
+        if let error = replacementError(for: targetPaneID, incomingResourceSession: sourceSession.resourceSession) {
+            throw error
+        }
+
+        let newTree = try layoutTree.moving(paneID, replacing: targetPaneID)
+        releaseClosedPaneSession(targetPaneID, preservingResource: sourceSession.resourceSession)
+        layoutTree = newTree
+        activePaneID = paneID
         objectWillChange.send()
     }
 
@@ -584,6 +670,75 @@ final class WorkspaceWindowModel: ObservableObject {
         return paneID
     }
 
+    /// Moves an existing pane to occupy/replace `targetPaneID` across or within tabs,
+    /// closing the replaced pane if it has no unsaved work while keeping the moved
+    /// pane's state and resource session intact.
+    @discardableResult
+    func movePaneReplacing(
+        sourceTabID: UUID,
+        paneID: PaneID,
+        toDestinationTabID destinationTabID: UUID,
+        replacing targetPaneID: PaneID
+    ) throws -> PaneID {
+        if sourceTabID == destinationTabID {
+            guard let tab = sessions[sourceTabID] else {
+                throw LayoutMutationError.targetPaneNotFound(targetPaneID)
+            }
+            try tab.movePaneWithinTabReplacing(paneID: paneID, replacing: targetPaneID)
+            objectWillChange.send()
+            return paneID
+        }
+
+        guard let sourceTab = sessions[sourceTabID],
+              let sourceSession = sourceTab.paneSessions[paneID] else {
+            throw LayoutMutationError.targetPaneNotFound(paneID)
+        }
+        guard let destinationTab = sessions[destinationTabID],
+              destinationTab.paneSessions[targetPaneID] != nil else {
+            throw LayoutMutationError.targetPaneNotFound(targetPaneID)
+        }
+
+        if let error = destinationTab.replacementError(
+            for: targetPaneID,
+            incomingResourceSession: sourceSession.resourceSession
+        ) {
+            throw error
+        }
+
+        let newTree = try destinationTab.layoutTree.replacing(targetPaneID, with: paneID)
+        let isSourceTabEmptying = (sourceTab.layoutTree.paneCount <= 1)
+
+        guard let transferredSession = sourceTab.detachPaneSession(paneID) else {
+            throw LayoutMutationError.targetPaneNotFound(paneID)
+        }
+
+        if isSourceTabEmptying {
+            closeEmptyTabAfterTransfer(sourceTabID)
+        }
+
+        destinationTab.replacePaneSession(targetPaneID, with: transferredSession, newLayoutTree: newTree)
+        state.activate(tabID: destinationTab.id)
+        destinationTab.activePaneID = paneID
+        objectWillChange.send()
+        return paneID
+    }
+
+    private func resolveResourceSession(
+        for url: URL,
+        existingResource: PDFResourceSession?
+    ) -> Result<PDFResourceSession, Error> {
+        if let existingResource {
+            return .success(existingResource)
+        }
+        let newResource = PDFResourceSession()
+        guard newResource.open(url: url) else {
+            let error = newResource.lastError ?? .unreadable
+            newResource.close()
+            return .failure(error)
+        }
+        return .success(newResource)
+    }
+
     /// Opens a local PDF file from Finder into a split adjacent to a target pane.
     /// Validates destination layout and file before committing layout mutations.
     @discardableResult
@@ -621,17 +776,13 @@ final class WorkspaceWindowModel: ObservableObject {
         }
 
         // 2. Reuse existing resourceSession if file is already open, or open a fresh resourceSession
+        let existing = findResourceSession(for: url)
         let resourceSessionToUse: PDFResourceSession
-        if let existing = findResourceSession(for: url) {
-            resourceSessionToUse = existing
-        } else {
-            let newResource = PDFResourceSession()
-            guard newResource.open(url: url) else {
-                let error = newResource.lastError ?? .unreadable
-                newResource.close()
-                return .failure(error)
-            }
-            resourceSessionToUse = newResource
+        switch resolveResourceSession(for: url, existingResource: existing) {
+        case let .success(session):
+            resourceSessionToUse = session
+        case let .failure(error):
+            return .failure(error)
         }
 
         // 3. Commit layout mutation using the pre-validated tree
@@ -643,6 +794,59 @@ final class WorkspaceWindowModel: ObservableObject {
         )
 
         destinationTab.attachTransferredPaneSession(newSession, newLayoutTree: candidateTree)
+        objectWillChange.send()
+        return .success(candidatePaneID)
+    }
+
+    /// Opens a local PDF file from Finder by occupying/replacing `targetPaneID`.
+    /// Validates target pane safety, layout, and file openability before mutating state.
+    @discardableResult
+    func openPDFReplacingPane(
+        url: URL,
+        in tabID: UUID? = nil,
+        replacing targetPaneID: PaneID
+    ) -> Result<PaneID, Error> {
+        guard url.isFileURL else {
+            return .failure(PDFDocumentModel.LoadError.notAFileURL)
+        }
+        let targetTabID = tabID ?? activeTabID
+        guard let destinationTab = sessions[targetTabID],
+              destinationTab.paneSessions[targetPaneID] != nil else {
+            return .failure(LayoutMutationError.targetPaneNotFound(targetPaneID))
+        }
+
+        // 1. Check unsaved drafts or orphaned dirty document edits before opening anything
+        let existing = findResourceSession(for: url)
+        if let error = destinationTab.replacementError(for: targetPaneID, incomingResourceSession: existing) {
+            return .failure(error)
+        }
+
+        let candidatePaneID = PaneID()
+        let candidateTree: WorkspaceLayoutTree
+        do {
+            candidateTree = try destinationTab.layoutTree.replacing(targetPaneID, with: candidatePaneID)
+        } catch {
+            return .failure(error)
+        }
+
+        // 2. Acquire/validate incoming document before mutating the target pane
+        let resourceSessionToUse: PDFResourceSession
+        switch resolveResourceSession(for: url, existingResource: existing) {
+        case let .success(session):
+            resourceSessionToUse = session
+        case let .failure(error):
+            return .failure(error)
+        }
+
+        // 3. Swap target pane cleanly after acquisition succeeds
+        let newPaneModel = PDFPaneModel(id: candidatePaneID, resourceSession: resourceSessionToUse)
+        let newSession = PDFPaneSession(
+            paneID: candidatePaneID,
+            paneModel: newPaneModel,
+            resourceSession: resourceSessionToUse
+        )
+
+        destinationTab.replacePaneSession(targetPaneID, with: newSession, newLayoutTree: candidateTree)
         objectWillChange.send()
         return .success(candidatePaneID)
     }

@@ -274,16 +274,20 @@ struct DividerView: View {
 
 // MARK: - Pane Drag & Drop Views and Modifiers
 
-/// A clear, semi-transparent preview overlay showing the target split region and validation feedback.
+/// A clear, semi-transparent preview overlay showing the target drop zone (occupy or 4-way split) and validation feedback.
 public struct PaneDropPreviewOverlay: View {
-    public let direction: LayoutInsertionDirection
+    public let zone: PaneDropZone
     public let isValid: Bool
     public let feedbackMessage: String
 
-    public init(direction: LayoutInsertionDirection, isValid: Bool = true, feedbackMessage: String = "") {
-        self.direction = direction
+    public init(zone: PaneDropZone, isValid: Bool = true, feedbackMessage: String = "") {
+        self.zone = zone
         self.isValid = isValid
         self.feedbackMessage = feedbackMessage
+    }
+
+    public init(direction: LayoutInsertionDirection, isValid: Bool = true, feedbackMessage: String = "") {
+        self.init(zone: PaneDropZone(direction: direction), isValid: isValid, feedbackMessage: feedbackMessage)
     }
 
     public var body: some View {
@@ -300,11 +304,11 @@ public struct PaneDropPreviewOverlay: View {
                     )
 
                 VStack(spacing: 6) {
-                    Image(systemName: isValid ? directionSymbolName : "exclamationmark.triangle.fill")
+                    Image(systemName: isValid ? zoneSymbolName : "exclamationmark.triangle.fill")
                         .font(.system(size: 20, weight: .semibold))
                         .foregroundStyle(isValid ? Color.accentColor : Color.red)
 
-                    Text(isValid ? "Split \(direction.rawValue.capitalized)" : feedbackMessage)
+                    Text(isValid ? validTitle : feedbackMessage)
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(isValid ? Color.primary : Color.red)
                 }
@@ -315,16 +319,18 @@ public struct PaneDropPreviewOverlay: View {
             }
             .frame(width: frame.width, height: frame.height)
             .position(x: frame.midX, y: frame.midY)
-            .animation(.easeOut(duration: 0.14), value: direction)
+            .animation(.easeOut(duration: 0.14), value: zone)
             .transition(.opacity)
             .accessibilityElement(children: .combine)
-            .accessibilityLabel("Split \(direction.rawValue) drop preview")
-            .accessibilityIdentifier("pane-drop-preview-\(direction.rawValue)")
+            .accessibilityLabel(accessibilityLabelText)
+            .accessibilityIdentifier("pane-drop-preview-\(zone.rawValue)")
         }
     }
 
     private func previewRect(in size: CGSize) -> CGRect {
-        switch direction {
+        switch zone {
+        case .center:
+            return CGRect(origin: .zero, size: size)
         case .left:
             return CGRect(x: 0, y: 0, width: size.width * 0.5, height: size.height)
         case .right:
@@ -336,12 +342,32 @@ public struct PaneDropPreviewOverlay: View {
         }
     }
 
-    private var directionSymbolName: String {
-        switch direction.axis {
-        case .horizontal:
+    private var zoneSymbolName: String {
+        switch zone {
+        case .center:
+            return "rectangle.inset.filled"
+        case .left, .right:
             return "rectangle.split.2x1"
-        case .vertical:
+        case .top, .bottom:
             return "rectangle.split.1x2"
+        }
+    }
+
+    private var validTitle: String {
+        switch zone {
+        case .center:
+            return "Replace Pane"
+        case .left, .right, .top, .bottom:
+            return "Split \(zone.rawValue.capitalized)"
+        }
+    }
+
+    private var accessibilityLabelText: String {
+        switch zone {
+        case .center:
+            return "Replace pane drop preview"
+        case .left, .right, .top, .bottom:
+            return "Split \(zone.rawValue) drop preview"
         }
     }
 }
@@ -460,26 +486,26 @@ public struct PaneHeaderView: View {
     }
 }
 
-/// Drop delegate for a visual pane handling drag-over direction detection with hysteresis and drop execution.
+/// Drop delegate for a visual pane handling drag-over zone detection with hysteresis and drop execution.
 public struct PaneDropDelegate: DropDelegate {
     public let targetPaneID: PaneID
     public let containerSize: CGSize
-    public let currentHoverDirection: LayoutInsertionDirection?
-    public let validateDrop: (LayoutInsertionDirection) -> (isValid: Bool, feedback: String)
+    public let currentHoverZone: PaneDropZone?
+    public let validateDrop: (PaneDropZone) -> (isValid: Bool, feedback: String)
     public let onHoverChanged: (PaneDropHoverState?) -> Void
-    public let onPerformDrop: (DropPayload, LayoutInsertionDirection) -> Bool
+    public let onPerformDrop: (DropPayload, PaneDropZone) -> Bool
 
     public init(
         targetPaneID: PaneID,
         containerSize: CGSize,
-        currentHoverDirection: LayoutInsertionDirection? = nil,
-        validateDrop: @escaping (LayoutInsertionDirection) -> (isValid: Bool, feedback: String),
+        currentHoverZone: PaneDropZone? = nil,
+        validateDrop: @escaping (PaneDropZone) -> (isValid: Bool, feedback: String),
         onHoverChanged: @escaping (PaneDropHoverState?) -> Void,
-        onPerformDrop: @escaping (DropPayload, LayoutInsertionDirection) -> Bool
+        onPerformDrop: @escaping (DropPayload, PaneDropZone) -> Bool
     ) {
         self.targetPaneID = targetPaneID
         self.containerSize = containerSize
-        self.currentHoverDirection = currentHoverDirection
+        self.currentHoverZone = currentHoverZone
         self.validateDrop = validateDrop
         self.onHoverChanged = onHoverChanged
         self.onPerformDrop = onPerformDrop
@@ -505,14 +531,14 @@ public struct PaneDropDelegate: DropDelegate {
     }
 
     public func dropUpdated(info: DropInfo) -> DropProposal? {
-        let direction = LayoutInsertionDirection.direction(
+        let zone = PaneDropZone.zone(
             for: info.location,
             in: containerSize,
-            previousDirection: currentHoverDirection,
+            previousZone: currentHoverZone,
             hysteresis: 0.05
         )
-        let check = validateDrop(direction)
-        onHoverChanged(PaneDropHoverState(direction: direction, isValid: check.isValid, feedbackMessage: check.feedback))
+        let check = validateDrop(zone)
+        onHoverChanged(PaneDropHoverState(zone: zone, isValid: check.isValid, feedbackMessage: check.feedback))
 
         let isPaneOrTab = info.hasItemsConforming(to: [UTType.yoPDFPaneDrag])
         let isExternalFile = info.hasItemsConforming(to: [UTType.fileURL, UTType.pdf])
@@ -529,13 +555,13 @@ public struct PaneDropDelegate: DropDelegate {
     }
 
     public func performDrop(info: DropInfo) -> Bool {
-        let direction = LayoutInsertionDirection.direction(
+        let zone = PaneDropZone.zone(
             for: info.location,
             in: containerSize,
-            previousDirection: currentHoverDirection,
+            previousZone: currentHoverZone,
             hysteresis: 0.05
         )
-        let check = validateDrop(direction)
+        let check = validateDrop(zone)
         onHoverChanged(nil)
         guard check.isValid else { return false }
 
@@ -544,7 +570,7 @@ public struct PaneDropDelegate: DropDelegate {
             provider.loadDataRepresentation(forTypeIdentifier: UTType.yoPDFPaneDrag.identifier) { data, _ in
                 guard let data, let payload = try? JSONDecoder().decode(PaneDragPayload.self, from: data) else { return }
                 Task { @MainActor in
-                    _ = onPerformDrop(.pane(payload), direction)
+                    _ = onPerformDrop(.pane(payload), zone)
                 }
             }
             return true
@@ -554,7 +580,7 @@ public struct PaneDropDelegate: DropDelegate {
                 _ = provider.loadObject(ofClass: URL.self) { url, _ in
                     guard let url, url.isFileURL else { return }
                     Task { @MainActor in
-                        _ = onPerformDrop(.fileURL(url), direction)
+                        _ = onPerformDrop(.fileURL(url), zone)
                     }
                 }
                 return true
@@ -570,7 +596,7 @@ public struct PaneDropDelegate: DropDelegate {
                     }
                     guard let finalURL = candidate, finalURL.isFileURL else { return }
                     Task { @MainActor in
-                        _ = onPerformDrop(.fileURL(finalURL), direction)
+                        _ = onPerformDrop(.fileURL(finalURL), zone)
                     }
                 }
                 return true
@@ -580,37 +606,37 @@ public struct PaneDropDelegate: DropDelegate {
     }
 
     private func updateHover(info: DropInfo) {
-        let direction = LayoutInsertionDirection.direction(
+        let zone = PaneDropZone.zone(
             for: info.location,
             in: containerSize,
-            previousDirection: currentHoverDirection,
+            previousZone: currentHoverZone,
             hysteresis: 0.05
         )
-        let check = validateDrop(direction)
-        onHoverChanged(PaneDropHoverState(direction: direction, isValid: check.isValid, feedbackMessage: check.feedback))
+        let check = validateDrop(zone)
+        onHoverChanged(PaneDropHoverState(zone: zone, isValid: check.isValid, feedbackMessage: check.feedback))
     }
 }
 
-/// Modifier that attaches four-direction drop detection and drop handling to a pane container.
+/// Modifier that attaches five-mode drop detection and drop handling to a pane container.
 public struct PaneDropTargetModifier: ViewModifier {
     public let targetPaneID: PaneID
     public let containerSize: CGSize
-    public let currentHoverDirection: LayoutInsertionDirection?
-    public let validateDrop: (LayoutInsertionDirection) -> (isValid: Bool, feedback: String)
+    public let currentHoverZone: PaneDropZone?
+    public let validateDrop: (PaneDropZone) -> (isValid: Bool, feedback: String)
     public let onHoverChanged: (PaneDropHoverState?) -> Void
-    public let onPerformDrop: (DropPayload, LayoutInsertionDirection) -> Bool
+    public let onPerformDrop: (DropPayload, PaneDropZone) -> Bool
 
     public init(
         targetPaneID: PaneID,
         containerSize: CGSize,
-        currentHoverDirection: LayoutInsertionDirection? = nil,
-        validateDrop: @escaping (LayoutInsertionDirection) -> (isValid: Bool, feedback: String),
+        currentHoverZone: PaneDropZone? = nil,
+        validateDrop: @escaping (PaneDropZone) -> (isValid: Bool, feedback: String),
         onHoverChanged: @escaping (PaneDropHoverState?) -> Void,
-        onPerformDrop: @escaping (DropPayload, LayoutInsertionDirection) -> Bool
+        onPerformDrop: @escaping (DropPayload, PaneDropZone) -> Bool
     ) {
         self.targetPaneID = targetPaneID
         self.containerSize = containerSize
-        self.currentHoverDirection = currentHoverDirection
+        self.currentHoverZone = currentHoverZone
         self.validateDrop = validateDrop
         self.onHoverChanged = onHoverChanged
         self.onPerformDrop = onPerformDrop
@@ -623,7 +649,7 @@ public struct PaneDropTargetModifier: ViewModifier {
                 delegate: PaneDropDelegate(
                     targetPaneID: targetPaneID,
                     containerSize: containerSize,
-                    currentHoverDirection: currentHoverDirection,
+                    currentHoverZone: currentHoverZone,
                     validateDrop: validateDrop,
                     onHoverChanged: onHoverChanged,
                     onPerformDrop: onPerformDrop

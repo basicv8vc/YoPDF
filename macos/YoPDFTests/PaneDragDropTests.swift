@@ -321,7 +321,7 @@ final class PaneDragDropTests: XCTestCase {
         }
 
         // 3. Reject when available space is smaller than minimum required dimensions
-        let smallSize = CGSize(width: 400, height: 300) // horizontal split requires 320*2 + 1 = 641 pt
+        let smallSize = CGSize(width: 350, height: 300) // horizontal split requires 200*2 + 1 = 401 pt
         XCTAssertThrowsError(try tree.moving(p1, adjacentTo: p2, direction: .left, availableSize: smallSize)) { error in
             if case .insufficientSpace = (error as? LayoutMutationError) {
                 // PASS
@@ -1358,5 +1358,272 @@ final class PaneDragDropTests: XCTestCase {
         source.mouseDown(with: down)
         source.mouseDragged(with: jiggle)
         XCTAssertEqual(dragStartedCount, 0, "Movement below the drag threshold must not start a session")
+    }
+
+    // MARK: - 20. Five-Mode Drop Zones & Occupy/Replace Pane Behavior
+
+    func testFiveDropZoneDetectionAndCenterHysteresis() {
+        let size = CGSize(width: 400, height: 300)
+
+        // Center region occupies interior [0.28, 0.72] along both axes
+        XCTAssertEqual(PaneDropZone.zone(for: CGPoint(x: 200, y: 150), in: size), .center)
+        XCTAssertEqual(PaneDropZone.zone(for: CGPoint(x: 120, y: 100), in: size), .center)
+
+        // Four outer edges resolve to their corresponding split zones
+        XCTAssertEqual(PaneDropZone.zone(for: CGPoint(x: 20, y: 150), in: size), .left)
+        XCTAssertEqual(PaneDropZone.zone(for: CGPoint(x: 380, y: 150), in: size), .right)
+        XCTAssertEqual(PaneDropZone.zone(for: CGPoint(x: 200, y: 20), in: size), .top)
+        XCTAssertEqual(PaneDropZone.zone(for: CGPoint(x: 200, y: 280), in: size), .bottom)
+
+        // Right-pane UI drop coordinate equivalent (nx = 0.44, ny = 0.783 -> bottom edge)
+        XCTAssertEqual(PaneDropZone.zone(for: CGPoint(x: 176, y: 235), in: size), .bottom)
+
+        // Hysteresis between .center and edge bands ([0.23, 0.28] deadband)
+        // nx = 0.25 (x = 100), ny = 0.50: stays .center if previous was .center, stays .left if previous was .left
+        XCTAssertEqual(
+            PaneDropZone.zone(for: CGPoint(x: 100, y: 150), in: size, previousZone: .center, hysteresis: 0.05),
+            .center
+        )
+        XCTAssertEqual(
+            PaneDropZone.zone(for: CGPoint(x: 100, y: 150), in: size, previousZone: .left, hysteresis: 0.05),
+            .left
+        )
+        // Moving deep outside deadband switches from .center to .left (nx = 0.20 -> x = 80)
+        XCTAssertEqual(
+            PaneDropZone.zone(for: CGPoint(x: 80, y: 150), in: size, previousZone: .center, hysteresis: 0.05),
+            .left
+        )
+    }
+
+    func testPaneDropPreviewOverlaySupportsCenterZoneAndValidationFeedback() throws {
+        let previewSize = CGSize(width: 600, height: 450)
+        let centerOverlay = ZStack {
+            Color(nsColor: .windowBackgroundColor)
+            PaneDropPreviewOverlay(zone: .center, isValid: true)
+        }
+        let invalidCenterOverlay = ZStack {
+            Color(nsColor: .windowBackgroundColor)
+            PaneDropPreviewOverlay(zone: .center, isValid: false, feedbackMessage: "Target pane has uncommitted note draft")
+        }
+
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("center-preview-\(UUID().uuidString).png")
+        let tempInvalidURL = FileManager.default.temporaryDirectory.appendingPathComponent("center-invalid-\(UUID().uuidString).png")
+        defer {
+            try? FileManager.default.removeItem(at: tempURL)
+            try? FileManager.default.removeItem(at: tempInvalidURL)
+        }
+
+        try renderViewToPNG(centerOverlay, size: previewSize, targetURL: tempURL)
+        try renderViewToPNG(invalidCenterOverlay, size: previewSize, targetURL: tempInvalidURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tempURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tempInvalidURL.path))
+    }
+
+    func testOpenPDFReplacingPaneReplacesTargetInSplitCleansOrphanAndWorksAtMaxPanes() throws {
+        let urlA = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 3, named: "replace-a")
+        let urlB = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 4, named: "replace-b")
+        let urlC = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 5, named: "replace-c")
+        defer {
+            try? FileManager.default.removeItem(at: urlA.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: urlB.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: urlC.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        guard case .opened(let tabID) = workspace.open(urlA) else {
+            return XCTFail("Expected open success")
+        }
+        let tab = try XCTUnwrap(workspace.session(tabID: tabID))
+        let paneA = tab.activePaneID
+        guard case .success(let paneB) = workspace.openPDFInSplit(
+            url: urlB,
+            in: tabID,
+            adjacentTo: paneA,
+            direction: .right
+        ) else {
+            return XCTFail("Expected split open success")
+        }
+        let resourceB = try XCTUnwrap(tab.paneSessions[paneB]?.resourceSession)
+        XCTAssertEqual(tab.layoutTree.paneCount, 2)
+        XCTAssertEqual(resourceB.activeLeaseCount, 1)
+
+        // Occupying paneB with urlC replaces paneB while leaving paneA (urlA) intact and cleaning up resourceB
+        guard case .success(let replacementPane) = workspace.openPDFReplacingPane(
+            url: urlC,
+            in: tabID,
+            replacing: paneB
+        ) else {
+            return XCTFail("Expected center drop replace to succeed")
+        }
+
+        XCTAssertEqual(tab.layoutTree.paneCount, 2)
+        XCTAssertTrue(tab.layoutTree.contains(paneA))
+        XCTAssertTrue(tab.layoutTree.contains(replacementPane))
+        XCTAssertFalse(tab.layoutTree.contains(paneB))
+        XCTAssertEqual(tab.activePaneID, replacementPane)
+        XCTAssertEqual(tab.paneSessions[paneA]?.resourceSession.fileURL?.standardizedFileURL, urlA.standardizedFileURL)
+        XCTAssertEqual(tab.paneSessions[replacementPane]?.resourceSession.fileURL?.standardizedFileURL, urlC.standardizedFileURL)
+        XCTAssertEqual(resourceB.activeLeaseCount, 0)
+
+        // Failing Finder drop (non-existent URL) leaves target pane & layout intact
+        let missingURL = urlC.deletingLastPathComponent().appendingPathComponent("does-not-exist.pdf")
+        if case .success = workspace.openPDFReplacingPane(url: missingURL, in: tabID, replacing: replacementPane) {
+            return XCTFail("Expected missing URL replacement to fail")
+        }
+        XCTAssertEqual(tab.layoutTree.paneCount, 2)
+        XCTAssertTrue(tab.layoutTree.contains(replacementPane))
+        XCTAssertEqual(tab.paneSessions[replacementPane]?.resourceSession.fileURL?.standardizedFileURL, urlC.standardizedFileURL)
+
+        // Even at maxPanes == 4, occupying an existing pane succeeds while splitting rejects
+        let pane3 = try workspace.splitPane(paneID: paneA, in: tabID, direction: .bottom)
+        let pane4 = try workspace.splitPane(paneID: replacementPane, in: tabID, direction: .bottom)
+        XCTAssertEqual(tab.layoutTree.paneCount, 4)
+
+        if case .success = workspace.openPDFInSplit(url: urlB, in: tabID, adjacentTo: pane4, direction: .right) {
+            return XCTFail("Expected split at maxPanes to fail")
+        }
+        guard case .success(let pane4Replacement) = workspace.openPDFReplacingPane(url: urlB, in: tabID, replacing: pane4) else {
+            return XCTFail("Expected center occupy/replace to succeed even at maxPanes == 4")
+        }
+        XCTAssertEqual(tab.layoutTree.paneCount, 4)
+        XCTAssertFalse(tab.layoutTree.contains(pane4))
+        XCTAssertTrue(tab.layoutTree.contains(pane4Replacement))
+        XCTAssertTrue(tab.layoutTree.contains(pane3))
+
+        workspace.closeAllSessions()
+    }
+
+    func testOpenPDFReplacingPaneProtectsDraftsAndFinalDirtyDocumentButAllowsSharedDirtySibling() throws {
+        let urlA = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 3, named: "guard-a")
+        let urlB = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 3, named: "guard-b")
+        let urlC = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 3, named: "guard-c")
+        defer {
+            try? FileManager.default.removeItem(at: urlA.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: urlB.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: urlC.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        guard case .opened(let tabID) = workspace.open(urlA) else {
+            return XCTFail("Failed to open urlA")
+        }
+        let tab = try XCTUnwrap(workspace.session(tabID: tabID))
+        let paneA = tab.activePaneID
+        guard case .success(let paneB) = workspace.openPDFInSplit(
+            url: urlB,
+            in: tabID,
+            adjacentTo: paneA,
+            direction: .right
+        ) else {
+            return XCTFail("Failed to split open urlB")
+        }
+
+        // 1. Protect uncommitted note draft on target pane
+        let sessionB = try XCTUnwrap(tab.paneSessions[paneB])
+        let docB = try XCTUnwrap(sessionB.resourceSession.document)
+        let pageB0 = try XCTUnwrap(docB.page(at: 0))
+        let docModelB = tab.model(for: sessionB)
+        let draft = try XCTUnwrap(docModelB.pageNoteDraft(at: CGPoint(x: 80, y: 120), on: pageB0))
+        XCTAssertTrue(sessionB.paneModel.noteComposerStore.begin(
+            mode: .create(draft),
+            anchorRect: CGRect(x: 80, y: 120, width: 1, height: 1),
+            pageLabel: "1",
+            excerpt: nil,
+            contents: "",
+            paper: .honey
+        ))
+        sessionB.paneModel.noteComposerStore.session?.contents = "Keep this note draft safe"
+
+        let draftCheck = tab.canReplacePane(paneB)
+        XCTAssertFalse(draftCheck.isValid)
+        if case let .failure(err) = workspace.openPDFReplacingPane(url: urlC, in: tabID, replacing: paneB) {
+            XCTAssertEqual(err as? PaneReplaceError, .targetHasUncommittedDraft)
+        } else {
+            return XCTFail("Expected replacement to fail when target pane has uncommitted note draft")
+        }
+        XCTAssertEqual(sessionB.paneModel.noteComposerStore.session?.contents, "Keep this note draft safe")
+        sessionB.paneModel.noteComposerStore.end()
+
+        // 2. Protect sole surviving lease of a dirty document
+        let selection = try XCTUnwrap(docB.selection(from: pageB0, atCharacterIndex: 0, to: pageB0, atCharacterIndex: 4))
+        sessionB.paneModel.updateSelection(selection)
+        XCTAssertNotNil(docModelB.addMarkup(.highlight))
+        XCTAssertTrue(sessionB.resourceSession.hasUnsavedChanges)
+
+        let dirtyCheck = tab.canReplacePane(paneB)
+        XCTAssertFalse(dirtyCheck.isValid)
+        if case let .failure(err) = workspace.openPDFReplacingPane(url: urlC, in: tabID, replacing: paneB) {
+            XCTAssertEqual(err as? PaneReplaceError, .targetHasUnsavedDocumentChanges)
+        } else {
+            return XCTFail("Expected replacement to fail when target pane holds final dirty lease")
+        }
+
+        // 3. When a second pane shares the dirty resource, replacing one pane is allowed and keeps edits alive
+        let paneBClone = try workspace.splitPane(paneID: paneB, in: tabID, direction: .bottom)
+        XCTAssertTrue(tab.canReplacePane(paneB).isValid)
+        guard case .success = workspace.openPDFReplacingPane(url: urlC, in: tabID, replacing: paneB) else {
+            return XCTFail("Expected replacement to succeed when another pane still leases the dirty resource")
+        }
+        XCTAssertTrue(tab.paneSessions[paneBClone]?.resourceSession.hasUnsavedChanges == true)
+
+        workspace.closeAllSessions()
+    }
+
+    func testMovePaneReplacingIntraTabAndCrossTabPreservesMovedSessionAndCleansReplacedPane() throws {
+        let urlA = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 6, named: "move-replace-a")
+        let urlB = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 6, named: "move-replace-b")
+        let urlC = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 6, named: "move-replace-c")
+        defer {
+            try? FileManager.default.removeItem(at: urlA.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: urlB.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: urlC.deletingLastPathComponent())
+        }
+
+        let workspace = WorkspaceWindowModel(modelFactory: { PDFDocumentModel() })
+        guard case .opened(let tab1ID) = workspace.open(urlA) else { return XCTFail("Failed to open urlA") }
+        let tab1 = try XCTUnwrap(workspace.session(tabID: tab1ID))
+        let p1 = tab1.activePaneID
+        tab1.paneSessions[p1]?.paneModel.goToPage(3)
+        tab1.paneSessions[p1]?.paneModel.setZoomScale(1.75)
+
+        let tab2ID = workspace.createTab()
+        let tab2 = try XCTUnwrap(workspace.session(tabID: tab2ID))
+        XCTAssertTrue(tab2.model.open(url: urlB), "Failed to open urlB")
+        let p2 = tab2.activePaneID
+        guard case .success(let p3) = workspace.openPDFInSplit(url: urlC, in: tab2ID, adjacentTo: p2, direction: .right) else {
+            return XCTFail("Failed to open urlC in split")
+        }
+        let resourceC = try XCTUnwrap(tab2.paneSessions[p3]?.resourceSession)
+
+        // Cross-tab center drop: move p1 (only pane in tab1) onto p3 in tab2
+        let movedID = try workspace.movePaneReplacing(
+            sourceTabID: tab1ID,
+            paneID: p1,
+            toDestinationTabID: tab2ID,
+            replacing: p3
+        )
+        XCTAssertEqual(movedID, p1)
+        XCTAssertNil(workspace.session(tabID: tab1ID), "Emptied source tab should close cleanly")
+        XCTAssertEqual(workspace.activeTabID, tab2ID)
+        XCTAssertEqual(tab2.layoutTree.leafIDs, [p2, p1])
+        XCTAssertEqual(tab2.activePaneID, p1)
+        XCTAssertEqual(tab2.paneSessions[p1]?.paneModel.currentPageIndex, 3)
+        XCTAssertEqual(tab2.paneSessions[p1]?.paneModel.zoomScale ?? 0, 1.75, accuracy: 0.001)
+        XCTAssertEqual(resourceC.activeLeaseCount, 0)
+
+        // Intra-tab center drop: move p1 onto p2 -> single pane tab containing p1
+        let resourceB = try XCTUnwrap(tab2.paneSessions[p2]?.resourceSession)
+        _ = try workspace.movePaneReplacing(
+            sourceTabID: tab2ID,
+            paneID: p1,
+            toDestinationTabID: tab2ID,
+            replacing: p2
+        )
+        XCTAssertEqual(tab2.layoutTree.paneCount, 1)
+        XCTAssertEqual(tab2.layoutTree.leafIDs, [p1])
+        XCTAssertEqual(tab2.activePaneID, p1)
+        XCTAssertEqual(resourceB.activeLeaseCount, 0)
+
+        workspace.closeAllSessions()
     }
 }

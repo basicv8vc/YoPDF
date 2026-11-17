@@ -69,16 +69,98 @@ public enum DropPayload: Sendable, Equatable {
     case fileURL(URL)
 }
 
-/// Hover state describing target insertion direction and validation for drop preview.
+/// The five drop modes supported when dragging a PDF or pane onto an existing pane:
+/// occupy/replace the target pane (`center`), or split and occupy one of its four edges.
+public enum PaneDropZone: String, Codable, Sendable, CaseIterable {
+    case center
+    case left
+    case right
+    case top
+    case bottom
+
+    /// The corresponding split insertion direction, or `nil` when occupying (`center`) the target pane.
+    public var insertionDirection: LayoutInsertionDirection? {
+        switch self {
+        case .center:
+            return nil
+        case .left:
+            return .left
+        case .right:
+            return .right
+        case .top:
+            return .top
+        case .bottom:
+            return .bottom
+        }
+    }
+
+    /// Creates an edge-split drop zone from a `LayoutInsertionDirection`.
+    public init(direction: LayoutInsertionDirection) {
+        switch direction {
+        case .left:
+            self = .left
+        case .right:
+            self = .right
+        case .top:
+            self = .top
+        case .bottom:
+            self = .bottom
+        }
+    }
+
+    /// Resolves the drop zone for a point inside a pane container (`top-left` origin),
+    /// reserving the inner box (`[0.28, 0.72]`) for occupying the target pane and the
+    /// outer bands for four-way splitting, with hysteresis across zone boundaries.
+    public static func zone(
+        for point: CGPoint,
+        in size: CGSize,
+        previousZone: PaneDropZone? = nil,
+        hysteresis: CGFloat = 0.05
+    ) -> PaneDropZone {
+        let width = max(1, size.width)
+        let height = max(1, size.height)
+        let nx = min(max(point.x / width, 0), 1)
+        let ny = min(max(point.y / height, 0), 1)
+        let minEdgeDistance = min(nx, 1 - nx, ny, 1 - ny)
+
+        let centerInset: CGFloat = 0.28
+        let centerThreshold = previousZone == .center
+            ? max(0, centerInset - hysteresis)
+            : centerInset
+
+        if minEdgeDistance >= centerThreshold {
+            return .center
+        }
+
+        let edgeDirection = LayoutInsertionDirection.direction(
+            for: point,
+            in: size,
+            previousDirection: previousZone?.insertionDirection,
+            hysteresis: hysteresis
+        )
+        return PaneDropZone(direction: edgeDirection)
+    }
+}
+
+/// Hover state describing target drop zone and validation for drop preview.
 public struct PaneDropHoverState: Equatable, Sendable {
-    public let direction: LayoutInsertionDirection
+    public let zone: PaneDropZone
     public let isValid: Bool
     public let feedbackMessage: String
 
-    public init(direction: LayoutInsertionDirection, isValid: Bool, feedbackMessage: String = "") {
-        self.direction = direction
+    /// Convenience accessor for edge-split hover states (`nil` when `.center`).
+    public var direction: LayoutInsertionDirection? {
+        zone.insertionDirection
+    }
+
+    public init(zone: PaneDropZone, isValid: Bool, feedbackMessage: String = "") {
+        self.zone = zone
         self.isValid = isValid
         self.feedbackMessage = feedbackMessage
+    }
+
+    public init(direction: LayoutInsertionDirection, isValid: Bool, feedbackMessage: String = "") {
+        self.init(zone: PaneDropZone(direction: direction), isValid: isValid, feedbackMessage: feedbackMessage)
     }
 }
 
@@ -86,14 +168,14 @@ public struct PaneDropHoverState: Equatable, Sendable {
 /// layout model, so the destination layer only decides *where* and *what*,
 /// while the layout rules stay here.
 public struct PaneDropSink: Sendable {
-    public let validate: @Sendable (LayoutInsertionDirection) -> (isValid: Bool, feedback: String)
+    public let validate: @Sendable (PaneDropZone) -> (isValid: Bool, feedback: String)
     public let onHoverChanged: @Sendable (PaneDropHoverState?) -> Void
-    public let onPerformDrop: @Sendable (DropPayload, LayoutInsertionDirection) -> Bool
+    public let onPerformDrop: @Sendable (DropPayload, PaneDropZone) -> Bool
 
     public init(
-        validate: @escaping @Sendable (LayoutInsertionDirection) -> (isValid: Bool, feedback: String),
+        validate: @escaping @Sendable (PaneDropZone) -> (isValid: Bool, feedback: String),
         onHoverChanged: @escaping @Sendable (PaneDropHoverState?) -> Void,
-        onPerformDrop: @escaping @Sendable (DropPayload, LayoutInsertionDirection) -> Bool
+        onPerformDrop: @escaping @Sendable (DropPayload, PaneDropZone) -> Bool
     ) {
         self.validate = validate
         self.onHoverChanged = onHoverChanged

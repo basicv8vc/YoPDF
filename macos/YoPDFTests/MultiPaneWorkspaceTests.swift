@@ -297,8 +297,8 @@ final class MultiPaneWorkspaceTests: XCTestCase {
         let freshTab = freshWorkspace.activeTab
         let freshTreeBefore = freshTab.layoutTree
 
-        // Try splitting in container smaller than required (e.g. 500pt width < 320*2 + 1 = 641pt)
-        let tinySize = CGSize(width: 500, height: 400)
+        // Try splitting in container smaller than required (350pt width < 200*2 + 1 = 401pt)
+        let tinySize = CGSize(width: 350, height: 400)
         XCTAssertFalse(freshWorkspace.canSplit(direction: .right, availableSize: tinySize))
 
         XCTAssertThrowsError(

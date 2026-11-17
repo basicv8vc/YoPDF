@@ -150,7 +150,7 @@ public struct LayoutPolicy: Equatable, Sendable {
     public var maxPanes: Int
 
     public init(
-        minimumLeafWidth: CGFloat = 320,
+        minimumLeafWidth: CGFloat = 200,
         minimumLeafHeight: CGFloat = 240,
         dividerThickness: CGFloat = 1,
         maxPanes: Int = 4
@@ -605,6 +605,18 @@ extension LayoutNode {
         }
     }
 
+    /// Replaces a leaf pane ID in place without changing split structure or ratios.
+    func replacing(_ target: PaneID, with newPaneID: PaneID) -> LayoutNode {
+        switch self {
+        case .leaf(let id):
+            return id == target ? .leaf(newPaneID) : self
+        case let .split(axis, ratio, first, second):
+            let newFirst = first.contains(target) ? first.replacing(target, with: newPaneID) : first
+            let newSecond = second.contains(target) ? second.replacing(target, with: newPaneID) : second
+            return .split(axis: axis, ratio: ratio, first: newFirst, second: newSecond)
+        }
+    }
+
     /// Removes the specified pane ID from this subtree.
     /// Returns the surviving node, or `nil` if this entire subtree was the removed pane.
     func removing(_ paneID: PaneID) -> LayoutNode? {
@@ -823,13 +835,39 @@ public struct WorkspaceLayoutTree: Equatable, Sendable, Codable {
         dividerFrames(in: CGRect(origin: .zero, size: size), policy: policy)
     }
 
+    private static func validateSpace(
+        for node: LayoutNode,
+        axisHint: SplitAxis,
+        policy: LayoutPolicy,
+        availableSize: CGSize?
+    ) throws {
+        guard let availableSize else { return }
+        let requiredTotal = node.minimumRequiredSize(policy: policy)
+        switch axisHint {
+        case .horizontal:
+            if availableSize.width < requiredTotal.width {
+                throw LayoutMutationError.insufficientSpace(required: requiredTotal.width, available: availableSize.width)
+            }
+            if availableSize.height < requiredTotal.height {
+                throw LayoutMutationError.insufficientSpace(required: requiredTotal.height, available: availableSize.height)
+            }
+        case .vertical:
+            if availableSize.height < requiredTotal.height {
+                throw LayoutMutationError.insufficientSpace(required: requiredTotal.height, available: availableSize.height)
+            }
+            if availableSize.width < requiredTotal.width {
+                throw LayoutMutationError.insufficientSpace(required: requiredTotal.width, available: availableSize.width)
+            }
+        }
+    }
+
     /// Inserts a new pane adjacent to the target pane along the specified direction.
     ///
     /// Throws `LayoutMutationError` if:
     /// - The target pane does not exist (`.targetPaneNotFound`).
     /// - The new pane ID already exists in the tree (`.duplicatePaneID`).
     /// - The tree has reached or exceeded `policy.maxPanes` (`.maximumPaneLimitReached`).
-    /// - `availableSize` is provided and the target pane or total tree cannot satisfy minimum dimensions (`.insufficientSpace`).
+    /// - `availableSize` is provided and the resulting tree cannot satisfy minimum dimensions (`.insufficientSpace`).
     public func inserting(
         _ newPaneID: PaneID,
         adjacentTo target: PaneID,
@@ -848,44 +886,11 @@ public struct WorkspaceLayoutTree: Equatable, Sendable, Codable {
             throw LayoutMutationError.maximumPaneLimitReached(limit: policy.maxPanes)
         }
 
-        if let availableSize {
-            // Check container dimension along the split axis
-            let existingFrames = paneFrames(in: availableSize, policy: policy)
-            guard let targetFrame = existingFrames[target] else {
-                throw LayoutMutationError.targetPaneNotFound(target)
-            }
-
-            switch direction.axis {
-            case .horizontal:
-                let requiredWidth = policy.minimumLeafWidth * 2 + policy.dividerThickness
-                if targetFrame.width < requiredWidth {
-                    throw LayoutMutationError.insufficientSpace(required: requiredWidth, available: targetFrame.width)
-                }
-                if targetFrame.height < policy.minimumLeafHeight {
-                    throw LayoutMutationError.insufficientSpace(required: policy.minimumLeafHeight, available: targetFrame.height)
-                }
-            case .vertical:
-                let requiredHeight = policy.minimumLeafHeight * 2 + policy.dividerThickness
-                if targetFrame.height < requiredHeight {
-                    throw LayoutMutationError.insufficientSpace(required: requiredHeight, available: targetFrame.height)
-                }
-                if targetFrame.width < policy.minimumLeafWidth {
-                    throw LayoutMutationError.insufficientSpace(required: policy.minimumLeafWidth, available: targetFrame.width)
-                }
-            }
-        }
-
+        // Validate against the resulting tree's minimumRequiredSize rather than the
+        // pre-split target frame: LayoutNode.clampedRatio rebalances sibling split
+        // ratios whenever the root container can accommodate every leaf minimum.
         let newRoot = try root.inserting(newPaneID, adjacentTo: target, direction: direction, ratio: ratio)
-
-        if let availableSize {
-            let requiredTotal = newRoot.minimumRequiredSize(policy: policy)
-            if availableSize.width < requiredTotal.width {
-                throw LayoutMutationError.insufficientSpace(required: requiredTotal.width, available: availableSize.width)
-            }
-            if availableSize.height < requiredTotal.height {
-                throw LayoutMutationError.insufficientSpace(required: requiredTotal.height, available: availableSize.height)
-            }
-        }
+        try Self.validateSpace(for: newRoot, axisHint: direction.axis, policy: policy, availableSize: availableSize)
 
         return WorkspaceLayoutTree(root: newRoot)
     }
@@ -917,26 +922,50 @@ public struct WorkspaceLayoutTree: Equatable, Sendable, Codable {
         policy: LayoutPolicy = .default,
         availableSize: CGSize? = nil
     ) -> Bool {
-        guard contains(target), !contains(newPaneID), paneCount < policy.maxPanes else {
-            return false
+        (try? inserting(
+            newPaneID,
+            adjacentTo: target,
+            direction: direction,
+            policy: policy,
+            availableSize: availableSize
+        )) != nil
+    }
+
+    /// Replaces `target` in place with `newPaneID` while keeping split structure and pane count unchanged.
+    public func replacing(_ target: PaneID, with newPaneID: PaneID) throws -> WorkspaceLayoutTree {
+        guard contains(target) else {
+            throw LayoutMutationError.targetPaneNotFound(target)
         }
-        if let availableSize {
-            let existingFrames = paneFrames(in: availableSize, policy: policy)
-            guard let targetFrame = existingFrames[target] else { return false }
-            switch direction.axis {
-            case .horizontal:
-                let requiredWidth = policy.minimumLeafWidth * 2 + policy.dividerThickness
-                if targetFrame.width < requiredWidth || targetFrame.height < policy.minimumLeafHeight {
-                    return false
-                }
-            case .vertical:
-                let requiredHeight = policy.minimumLeafHeight * 2 + policy.dividerThickness
-                if targetFrame.height < requiredHeight || targetFrame.width < policy.minimumLeafWidth {
-                    return false
-                }
-            }
+        if newPaneID != target, contains(newPaneID) {
+            throw LayoutMutationError.duplicatePaneID(newPaneID)
         }
-        return true
+        return WorkspaceLayoutTree(root: root.replacing(target, with: newPaneID))
+    }
+
+    /// Moves an existing `paneID` into `target`'s slot, removing `paneID`'s previous slot and closing `target`.
+    public func moving(_ paneID: PaneID, replacing target: PaneID) throws -> WorkspaceLayoutTree {
+        guard paneID != target else {
+            throw LayoutMutationError.duplicatePaneID(paneID)
+        }
+        guard contains(paneID) else {
+            throw LayoutMutationError.targetPaneNotFound(paneID)
+        }
+        guard contains(target) else {
+            throw LayoutMutationError.targetPaneNotFound(target)
+        }
+
+        let treeWithoutPane = try removing(paneID)
+        return try treeWithoutPane.replacing(target, with: paneID)
+    }
+
+    /// Checks whether replacing `target` with an incoming `newPaneID` (not currently a separate leaf) is valid.
+    public func canReplace(_ target: PaneID, with newPaneID: PaneID) -> Bool {
+        (try? replacing(target, with: newPaneID)) != nil
+    }
+
+    /// Checks whether moving `paneID` to occupy `target`'s slot within the same tree is valid.
+    public func canMove(_ paneID: PaneID, replacing target: PaneID) -> Bool {
+        (try? moving(paneID, replacing: target)) != nil
     }
 
     /// Moves an existing pane within the tree adjacent to `target` along `direction`.
