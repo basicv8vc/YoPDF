@@ -251,13 +251,16 @@ private struct WorkspaceTabStrip: View {
                 .accessibilityIdentifier("workspace-tab-close-\(tab.id.uuidString)")
             }
         }
-        // The whole capsule is the drag handle, not just the title text: the
-        // rounded background and the empty space next to the label are hit
-        // targets too. A simultaneous gesture leaves a plain click to the title
-        // Button and needs 4 points of travel before a drag starts, so the
-        // close Button keeps its own action instead of being swallowed.
+        // Multi-pane tabs do not host a `PaneDragSource` overlay, so they
+        // keep SwiftUI's capsule reorder gesture. Single-pane tabs handle
+        // horizontal reorder (including Esc cancellation) and vertical tear-out
+        // in `PaneDragSource` without a competing `DragGesture` eating key
+        // events or committing a duplicate reorder.
         .contentShape(Rectangle())
-        .simultaneousGesture(reorderGesture(for: tab))
+        .simultaneousGesture(
+            reorderGesture(for: tab),
+            isEnabled: tab.layoutTree.paneCount > 1
+        )
         .contextMenu { tabContextMenu(for: tab) }
         .background(
             isActive ? Color.accentColor.opacity(0.16) : Color.clear,

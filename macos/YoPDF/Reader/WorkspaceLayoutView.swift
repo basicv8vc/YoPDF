@@ -699,6 +699,9 @@ final class PaneDragSourceView: NSView, NSDraggingSource {
     /// strip reorders tabs; dragging vertically out of the strip cancels the
     /// reorder preview and begins a native pane-drag session.
     var tabReorder: TabStripDragCallbacks?
+    /// Optional hook allowing unit tests to observe native drag handoff
+    /// without spinning up an AppKit window drag tracking loop.
+    var draggingSessionStarter: ((_ items: [NSDraggingItem], _ event: NSEvent) -> Void)?
 
     /// Movement in points before a press turns into a drag, matching the
     /// feel of SwiftUI's `onDrag` threshold.
@@ -706,6 +709,7 @@ final class PaneDragSourceView: NSView, NSDraggingSource {
     private static let previewOffset = CGPoint(x: 12, y: 4)
     private static let tabTearOutBelowMargin: CGFloat = 16
     private static let tabTearOutAboveMargin: CGFloat = 24
+    private static let escapeKeyCode: UInt16 = 53
 
     private enum DragInteractionPhase {
         case idle
@@ -716,6 +720,13 @@ final class PaneDragSourceView: NSView, NSDraggingSource {
 
     private var phase: DragInteractionPhase = .idle
     private var isForwardingClick = false
+    nonisolated(unsafe) private var reorderKeyMonitor: Any?
+
+    deinit {
+        if let reorderKeyMonitor {
+            NSEvent.removeMonitor(reorderKeyMonitor)
+        }
+    }
 
     // MARK: Hit Testing
 
@@ -738,10 +749,33 @@ final class PaneDragSourceView: NSView, NSDraggingSource {
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         super.viewWillMove(toWindow: newWindow)
-        if newWindow == nil, case .reordering = phase {
-            phase = .idle
-            tabReorder?.onReorderCancelled()
+        if newWindow == nil {
+            cancelActiveReorder()
         }
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if isEscapeKey(event), cancelActiveReorder() {
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    override func cancelOperation(_ sender: Any?) {
+        if cancelActiveReorder() {
+            return
+        }
+        super.cancelOperation(sender)
+    }
+
+    /// Cancels an active horizontal tab-reorder drag, returning true if one was in flight.
+    @discardableResult
+    func cancelActiveReorder() -> Bool {
+        removeReorderKeyMonitor()
+        guard case .reordering = phase else { return false }
+        phase = .idle
+        tabReorder?.onReorderCancelled()
+        return true
     }
 
     /// Returns true once the pointer has moved vertically far enough outside the
@@ -754,6 +788,7 @@ final class PaneDragSourceView: NSView, NSDraggingSource {
     // MARK: Mouse Tracking
 
     override func mouseDown(with event: NSEvent) {
+        removeReorderKeyMonitor()
         let localStart = convert(event.locationInWindow, from: nil)
         phase = .pending(
             mouseDown: event,
@@ -775,6 +810,7 @@ final class PaneDragSourceView: NSView, NSDraggingSource {
             let currentLocal = convert(event.locationInWindow, from: nil)
             if let tabReorder, tabReorder.canReorder(), !shouldTearOutTabDrag(atLocalPoint: currentLocal) {
                 phase = .reordering(startInWindow: startInWindow, localStartX: localStartX)
+                installReorderKeyMonitor()
                 tabReorder.onReorderChanged(localStartX, dx)
             } else {
                 phase = .nativeSession
@@ -787,6 +823,7 @@ final class PaneDragSourceView: NSView, NSDraggingSource {
             if shouldTearOutTabDrag(atLocalPoint: currentLocal) {
                 // Compute `currentLocal` before cancelling reorder so the floating
                 // pill spawns at the cursor's current screen position.
+                removeReorderKeyMonitor()
                 phase = .nativeSession
                 tabReorder?.onReorderCancelled()
                 beginPayloadSession(with: event, dragPoint: currentLocal)
@@ -797,6 +834,7 @@ final class PaneDragSourceView: NSView, NSDraggingSource {
     }
 
     override func mouseUp(with event: NSEvent) {
+        removeReorderKeyMonitor()
         let currentPhase = phase
         phase = .idle
 
@@ -815,6 +853,38 @@ final class PaneDragSourceView: NSView, NSDraggingSource {
         case let .reordering(startInWindow, localStartX):
             let dx = event.locationInWindow.x - startInWindow.x
             tabReorder?.onReorderEnded(localStartX, dx)
+        }
+    }
+
+    private func isEscapeKey(_ event: NSEvent) -> Bool {
+        event.keyCode == Self.escapeKeyCode || event.charactersIgnoringModifiers == "\u{1b}"
+    }
+
+    private func installReorderKeyMonitor() {
+        guard reorderKeyMonitor == nil else { return }
+        let targetWindowNumber = window?.windowNumber
+        // AppKit dispatches keyDown to the window's first responder rather than
+        // the view tracking mouseDragged, so intercept Esc at the local queue.
+        reorderKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            let didCancel = MainActor.assumeIsolated { () -> Bool in
+                if let targetWindowNumber,
+                   let eventWindowNumber = event.window?.windowNumber,
+                   eventWindowNumber != targetWindowNumber
+                {
+                    return false
+                }
+                guard self.isEscapeKey(event) else { return false }
+                return self.cancelActiveReorder()
+            }
+            return didCancel ? nil : event
+        }
+    }
+
+    private func removeReorderKeyMonitor() {
+        if let reorderKeyMonitor {
+            NSEvent.removeMonitor(reorderKeyMonitor)
+            self.reorderKeyMonitor = nil
         }
     }
 
@@ -840,8 +910,12 @@ final class PaneDragSourceView: NSView, NSDraggingSource {
         )
         item.setDraggingFrame(frame, contents: image)
         onDragStarted()
-        let session = beginDraggingSession(with: [item], event: event, source: self)
-        session.draggingFormation = NSDraggingFormation.none
+        if let draggingSessionStarter {
+            draggingSessionStarter([item], event)
+        } else {
+            let session = beginDraggingSession(with: [item], event: event, source: self)
+            session.draggingFormation = NSDraggingFormation.none
+        }
     }
 
     /// Forwards a plain click to the SwiftUI content underneath this overlay,
@@ -969,5 +1043,9 @@ struct PaneDragSource: NSViewRepresentable {
         nsView.onClick = onClick
         nsView.forwardsUnclaimedClicks = forwardsUnclaimedClicks
         nsView.tabReorder = tabReorder
+    }
+
+    static func dismantleNSView(_ nsView: PaneDragSourceView, coordinator: ()) {
+        nsView.cancelActiveReorder()
     }
 }

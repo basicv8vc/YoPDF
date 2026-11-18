@@ -9,8 +9,9 @@
 //  Apache-2.0 Open Source License.
 //
 
-import XCTest
+import CoreGraphics
 import PDFKit
+import XCTest
 
 @MainActor
 final class PaneDragDropUITests: XCTestCase {
@@ -126,24 +127,26 @@ final class PaneDragDropUITests: XCTestCase {
         )
     }
 
-    /// Real-app regression: dragging a single-pane PDF tab filename
-    /// horizontally along the tab strip must reorder the tabs.
-    func testDraggingSinglePaneTabFilenameReordersTabs() throws {
+    private func launchTwoTabWorkspace(
+        prefix: String
+    ) throws -> (
+        app: XCUIApplication,
+        window: XCUIElement,
+        firstTab: XCUIElement,
+        secondTab: XCUIElement,
+        cleanup: () -> Void
+    ) {
         let runID = UUID().uuidString
-        let firstURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 2, named: "tab-alpha-\(runID)")
-        let secondURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 2, named: "tab-beta-\(runID)")
-        defer {
-            try? FileManager.default.removeItem(at: firstURL.deletingLastPathComponent())
-            try? FileManager.default.removeItem(at: secondURL.deletingLastPathComponent())
-        }
+        let firstURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 2, named: "\(prefix)-alpha-\(runID)")
+        let secondURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 2, named: "\(prefix)-beta-\(runID)")
 
         let app = XCUIApplication()
         app.launchArguments = ["-ApplePersistenceIgnoreState", "YES"]
         app.launchEnvironment["YOPDF_SCREENSHOT_PDF"] = firstURL.path
         app.launch()
-        defer { app.terminate() }
         app.activate()
 
+        let window = app.windows.firstMatch
         let firstTab = app.buttons[firstURL.lastPathComponent]
         XCTAssertTrue(firstTab.waitForExistence(timeout: 20), "First PDF tab must appear.")
 
@@ -152,55 +155,52 @@ final class PaneDragDropUITests: XCTestCase {
         XCTAssertTrue(secondTab.waitForExistence(timeout: 15), "Second PDF tab must appear.")
         XCTAssertLessThan(firstTab.frame.minX, secondTab.frame.minX)
 
-        // Drag the second tab's filename to the left of the first tab.
-        let beforeFirst = firstTab.coordinate(withNormalizedOffset: CGVector(dx: 0.1, dy: 0.5))
-        secondTab
-            .coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-            .press(forDuration: 0.15, thenDragTo: beforeFirst)
-
-        let movedLeft = waitUntil {
-            secondTab.exists && firstTab.exists && secondTab.frame.minX < firstTab.frame.minX
+        let cleanup = {
+            app.terminate()
+            try? FileManager.default.removeItem(at: firstURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: secondURL.deletingLastPathComponent())
         }
-        XCTAssertTrue(movedLeft, "Dragging a tab filename left must reorder it before the first tab.")
-        XCTAssertTrue(secondTab.isSelected, "The dragged tab must become active on release.")
+        return (app, window, firstTab, secondTab, cleanup)
+    }
 
-        // Drag the same tab back to the right of the other tab.
-        let afterFirst = firstTab.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5))
-        secondTab
+    /// Real-app regression: dragging an inactive single-pane PDF tab filename
+    /// horizontally along the tab strip must reorder the tabs and activate it on release.
+    func testDraggingSinglePaneTabFilenameReordersTabs() throws {
+        let (_, _, firstTab, secondTab, cleanup) = try launchTwoTabWorkspace(prefix: "tab")
+        defer { cleanup() }
+
+        XCTAssertFalse(firstTab.isSelected, "First tab must start inactive after opening the second PDF.")
+        XCTAssertTrue(secondTab.isSelected, "Second tab starts active after opening the second PDF.")
+
+        // Drag the inactive first tab's filename to the right of the active second tab.
+        let afterSecond = secondTab.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5))
+        firstTab
             .coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-            .press(forDuration: 0.15, thenDragTo: afterFirst)
+            .press(forDuration: 0.15, thenDragTo: afterSecond)
+
+        let movedRight = waitUntil {
+            firstTab.exists && secondTab.exists && secondTab.frame.minX < firstTab.frame.minX
+        }
+        XCTAssertTrue(movedRight, "Dragging an inactive tab filename right must reorder it after the second tab.")
+        XCTAssertTrue(firstTab.isSelected, "The dragged inactive tab must become active on release.")
+
+        // Drag the same tab back to the left of the other tab.
+        let beforeSecond = secondTab.coordinate(withNormalizedOffset: CGVector(dx: 0.1, dy: 0.5))
+        firstTab
+            .coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.15, thenDragTo: beforeSecond)
 
         let movedBack = waitUntil {
-            secondTab.exists && firstTab.exists && firstTab.frame.minX < secondTab.frame.minX
+            firstTab.exists && secondTab.exists && firstTab.frame.minX < secondTab.frame.minX
         }
-        XCTAssertTrue(movedBack, "Dragging a tab filename right must reorder it after the other tab.")
+        XCTAssertTrue(movedBack, "Dragging a tab filename left must reorder it before the other tab.")
     }
 
     /// Real-app regression: dragging a single-pane tab vertically out of the tab
     /// strip into the reader content must still tear out into a split pane.
     func testDraggingSinglePaneTabDownIntoPaneCommitsSplit() throws {
-        let runID = UUID().uuidString
-        let firstURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 2, named: "tear-alpha-\(runID)")
-        let secondURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 2, named: "tear-beta-\(runID)")
-        defer {
-            try? FileManager.default.removeItem(at: firstURL.deletingLastPathComponent())
-            try? FileManager.default.removeItem(at: secondURL.deletingLastPathComponent())
-        }
-
-        let app = XCUIApplication()
-        app.launchArguments = ["-ApplePersistenceIgnoreState", "YES"]
-        app.launchEnvironment["YOPDF_SCREENSHOT_PDF"] = firstURL.path
-        app.launch()
-        defer { app.terminate() }
-        app.activate()
-
-        let window = app.windows.firstMatch
-        let firstTab = app.buttons[firstURL.lastPathComponent]
-        XCTAssertTrue(firstTab.waitForExistence(timeout: 20))
-
-        app.open(secondURL)
-        let secondTab = app.buttons[secondURL.lastPathComponent]
-        XCTAssertTrue(secondTab.waitForExistence(timeout: 15))
+        let (app, window, firstTab, _, cleanup) = try launchTwoTabWorkspace(prefix: "tear")
+        defer { cleanup() }
 
         // Drag the inactive first tab downward onto the right edge of the active pane.
         let rightDropPoint = window.coordinate(withNormalizedOffset: CGVector(dx: 0.88, dy: 0.55))
@@ -212,6 +212,110 @@ final class PaneDragDropUITests: XCTestCase {
             app.buttons["Vertical split divider"].waitForExistence(timeout: 10),
             "Dragging a single-pane tab vertically onto a pane must split it side-by-side."
         )
+    }
+
+    /// Real-app regression: starting a horizontal tab reorder and then tearing
+    /// vertically into the PDF content must cancel reorder and commit a split.
+    func testDraggingSinglePaneTabHorizontallyThenDownIntoPaneCommitsSplit() throws {
+        let (app, window, firstTab, secondTab, cleanup) = try launchTwoTabWorkspace(prefix: "combo")
+        defer { cleanup() }
+
+        let start = CGPoint(x: firstTab.frame.midX, y: firstTab.frame.midY)
+        let horizontalMid = CGPoint(x: secondTab.frame.midX, y: firstTab.frame.midY)
+        let dropPoint = CGPoint(
+            x: window.frame.minX + window.frame.width * 0.88,
+            y: window.frame.minY + window.frame.height * 0.55
+        )
+        try performMultiSegmentDrag(from: start, through: [horizontalMid, dropPoint])
+
+        XCTAssertTrue(
+            app.buttons["Vertical split divider"].waitForExistence(timeout: 10),
+            "Tearing vertically after a horizontal reorder drag must transition to a native pane split."
+        )
+    }
+
+    /// Real-app regression: pressing Escape during a horizontal tab reorder must
+    /// cancel the reorder and preserve both the original tab order and active tab.
+    func testDraggingSinglePaneTabEscapeCancelsReorder() throws {
+        let (_, _, firstTab, secondTab, cleanup) = try launchTwoTabWorkspace(prefix: "esc")
+        defer { cleanup() }
+
+        XCTAssertFalse(firstTab.isSelected)
+        XCTAssertTrue(secondTab.isSelected)
+
+        let start = CGPoint(x: firstTab.frame.midX, y: firstTab.frame.midY)
+        let horizontalPastSecond = CGPoint(x: secondTab.frame.maxX - 8, y: firstTab.frame.midY)
+        try performMultiSegmentDrag(
+            from: start,
+            through: [horizontalPastSecond],
+            pressEscapeBeforeRelease: true
+        )
+
+        XCTAssertTrue(
+            waitUntil { firstTab.exists && secondTab.exists && firstTab.frame.minX < secondTab.frame.minX },
+            "Pressing Escape during tab drag must preserve the original tab order."
+        )
+        XCTAssertTrue(secondTab.isSelected, "Cancelling a drag with Escape must keep the previously active tab selected.")
+        XCTAssertFalse(firstTab.isSelected)
+    }
+
+    private func performMultiSegmentDrag(
+        from start: CGPoint,
+        through waypoints: [CGPoint],
+        pressEscapeBeforeRelease: Bool = false
+    ) throws {
+        let down = try XCTUnwrap(
+            CGEvent(
+                mouseEventSource: nil,
+                mouseType: .leftMouseDown,
+                mouseCursorPosition: start,
+                mouseButton: .left
+            )
+        )
+        down.post(tap: .cghidEventTap)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+
+        var current = start
+        for target in waypoints {
+            let steps = 10
+            for step in 1...steps {
+                let t = CGFloat(step) / CGFloat(steps)
+                let point = CGPoint(
+                    x: current.x + (target.x - current.x) * t,
+                    y: current.y + (target.y - current.y) * t
+                )
+                let drag = try XCTUnwrap(
+                    CGEvent(
+                        mouseEventSource: nil,
+                        mouseType: .leftMouseDragged,
+                        mouseCursorPosition: point,
+                        mouseButton: .left
+                    )
+                )
+                drag.post(tap: .cghidEventTap)
+                RunLoop.current.run(until: Date().addingTimeInterval(0.015))
+            }
+            current = target
+        }
+
+        if pressEscapeBeforeRelease {
+            let keyDown = try XCTUnwrap(CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: true))
+            let keyUp = try XCTUnwrap(CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: false))
+            keyDown.post(tap: .cghidEventTap)
+            keyUp.post(tap: .cghidEventTap)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+
+        let up = try XCTUnwrap(
+            CGEvent(
+                mouseEventSource: nil,
+                mouseType: .leftMouseUp,
+                mouseCursorPosition: current,
+                mouseButton: .left
+            )
+        )
+        up.post(tap: .cghidEventTap)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
     }
 
     private func waitUntil(_ condition: () -> Bool) -> Bool {
