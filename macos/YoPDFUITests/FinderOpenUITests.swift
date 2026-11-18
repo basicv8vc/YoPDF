@@ -49,6 +49,7 @@ final class FinderOpenUITests: XCTestCase {
         XCTAssertTrue(app.buttons[first.lastPathComponent].waitForExistence(timeout: 10))
         XCTAssertTrue(app.buttons[second.lastPathComponent].waitForExistence(timeout: 10))
         assertWorkspaceTabs([first, second], expectedTabCount: 2, in: app)
+        assertTwoLongTabsFitWithoutScrollBarOrClipping(in: app)
 
         try await open([third], with: applicationURL)
         try await open([fourth], with: applicationURL)
@@ -186,6 +187,42 @@ final class FinderOpenUITests: XCTestCase {
                        "Duplicate opens must not create duplicate tabs.\n\(diagnostics)")
         XCTAssertEqual(closeButtons.count, expectedCloseButtonCount,
                        "Each tab in a multi-tab workspace should expose one close button.\n\(diagnostics)")
+    }
+
+    private func assertTwoLongTabsFitWithoutScrollBarOrClipping(in app: XCUIApplication) {
+        let windowFrame = app.windows.firstMatch.frame
+        let closeButtons = workspaceTabCloseButtons(in: app)
+        let newTabButton = app.buttons["workspace-new-tab"]
+        XCTAssertTrue(newTabButton.waitForExistence(timeout: 5))
+
+        guard let rightmostCloseFrame = closeButtons.map(\.frame).max(by: { $0.maxX < $1.maxX }),
+              let leftmostTabFrame = workspaceTabButtons(in: app).map(\.frame).min(by: { $0.minX < $1.minX })
+        else {
+            XCTFail("Expected both tabs and close buttons to have frames.")
+            return
+        }
+
+        let plusFrame = newTabButton.frame
+        XCTAssertLessThanOrEqual(
+            rightmostCloseFrame.maxX, plusFrame.minX,
+            "Second tab close button should not be clipped past + in the default window. close=\(rightmostCloseFrame), plus=\(plusFrame), window=\(windowFrame)"
+        )
+        XCTAssertLessThan(
+            plusFrame.minX - rightmostCloseFrame.maxX, 30,
+            "+ button should stay shrink-wrapped beside the second tab. close=\(rightmostCloseFrame), plus=\(plusFrame)"
+        )
+        XCTAssertGreaterThanOrEqual(
+            leftmostTabFrame.minY - windowFrame.minY, 3,
+            "Tab strip should sit centered without a bottom scroller pushing tabs into the top edge. window=\(windowFrame), tab=\(leftmostTabFrame)"
+        )
+
+        let titlebarScrollBars = app.scrollBars.allElementsBoundByIndex.filter {
+            $0.frame.minY < windowFrame.minY + 46 && $0.frame.width > 0 && $0.frame.height > 0
+        }
+        XCTAssertTrue(
+            titlebarScrollBars.isEmpty,
+            "Tab strip should not show a horizontal scrollbar in the titlebar row: \(titlebarScrollBars.map(\.frame))"
+        )
     }
 
     private func tabCount(in app: XCUIApplication) -> Int {

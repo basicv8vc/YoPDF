@@ -20,7 +20,7 @@ final class ThumbnailNavigationUITests: XCTestCase {
         app.activate()
 
         guard app.windows.firstMatch.waitForExistence(timeout: 10),
-              app.staticTexts[fixtureURL.lastPathComponent].waitForExistence(timeout: 10)
+              app.buttons[fixtureURL.lastPathComponent].waitForExistence(timeout: 10)
         else {
             XCTFail("The reader window did not open the thumbnail navigation test PDF.")
             return

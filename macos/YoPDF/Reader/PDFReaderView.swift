@@ -34,7 +34,7 @@ private struct ReaderPDFDropDestination: ViewModifier {
     }
 }
 
-private struct SinglePaneTabDraggableModifier: ViewModifier {
+private struct TabDraggableModifier: ViewModifier {
     let tab: WorkspaceTabSession
     /// Fired directly for a plain left click that never became a drag. The
     /// click-to-activate path must be an explicit callback, not a synthesized
@@ -47,23 +47,20 @@ private struct SinglePaneTabDraggableModifier: ViewModifier {
     let tabReorder: TabStripDragCallbacks?
 
     func body(content: Content) -> some View {
-        if tab.layoutTree.paneCount == 1 {
-            // The title button hosts the AppKit drag source: horizontal drags
-            // inside the strip reorder tabs with live reflow, while dragging
-            // vertically out of the strip tears into a native pane-drag
-            // session. Plain clicks switch tabs through `onActivate`.
-            content.overlay {
-                PaneDragSource(
-                    payload: PaneDragPayload(kind: .tab, sourceTabID: tab.id, sourcePaneID: tab.activePaneID),
-                    previewTitle: tab.title,
-                    onDragStarted: { onDragStarted?() },
-                    onDragEnded: { onDragEnded?() },
-                    onClick: onActivate,
-                    tabReorder: tabReorder
-                )
-            }
-        } else {
-            content
+        // Every tab hosts the AppKit drag source so horizontal drags inside
+        // the titlebar strip reorder tabs cleanly without competing with window
+        // background dragging. Single-pane tabs additionally allow vertical
+        // tear-out into a native pane-drag session.
+        content.overlay {
+            PaneDragSource(
+                payload: PaneDragPayload(kind: .tab, sourceTabID: tab.id, sourcePaneID: tab.activePaneID),
+                previewTitle: tab.title,
+                onDragStarted: { onDragStarted?() },
+                onDragEnded: { onDragEnded?() },
+                onClick: onActivate,
+                tabReorder: tabReorder,
+                allowsNativeSession: tab.layoutTree.paneCount == 1
+            )
         }
     }
 }
@@ -78,8 +75,20 @@ private struct WorkspaceTabFramePreferenceKey: PreferenceKey {
     }
 }
 
+/// Reports the intrinsic width of the tab strip's tabs so the scroll view
+/// shrink-wraps its content when tabs fit and scrolls only on overflow.
+private struct TabContentWidthPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 private struct WorkspaceTabStrip: View {
     @ObservedObject var workspace: WorkspaceWindowModel
+    @ObservedObject var updateController: SparkleUpdateController
+    let titlebarMetrics: TitlebarLayoutMetrics
     let closeTab: (UUID) -> Void
     var onTabDragStarted: ((WorkspaceTabSession) -> Void)? = nil
     var onTabDragEnded: (() -> Void)? = nil
@@ -87,6 +96,7 @@ private struct WorkspaceTabStrip: View {
     /// Layout frames of the tabs, keyed by tab ID. Reported by each tab and
     /// read only once, when a drag starts.
     @State private var tabFrames: [UUID: CGRect] = [:]
+    @State private var tabContentWidth: CGFloat?
     /// Visual state of an in-flight drag. Deliberately plain `@State`, not
     /// `@GestureState`: the commit must clear it inside the same
     /// `withAnimation` transaction that reorders the strip, so the offset
@@ -103,12 +113,6 @@ private struct WorkspaceTabStrip: View {
     /// frames that the reflow is currently moving would feed the layout back
     /// into the hit test and make the strip oscillate.
     @State private var dragSnapshot: DragSnapshot?
-    /// Tracks whether SwiftUI still considers the drag gesture alive. Its
-    /// automatic reset is the only cancellation signal a `DragGesture`
-    /// offers: `.onEnded` is guaranteed only for successful ends, so a
-    /// gesture cancelled by the system never reaches it and would otherwise
-    /// leave the visual state above dangling — the defect the review flagged.
-    @GestureState private var gestureTracksDrag = false
 
     private struct DragSnapshot {
         let tabIDs: [UUID]
@@ -125,49 +129,65 @@ private struct WorkspaceTabStrip: View {
     private static let reorderAnimation = Animation.easeOut(duration: 0.18)
 
     var body: some View {
-        HStack(spacing: 8) {
-            ScrollView(.horizontal) {
+        HStack(spacing: 6) {
+            ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: Self.tabSpacing) {
                     ForEach(workspace.tabs) { tab in
                         tabView(tab)
                     }
                 }
+                .background(
+                    GeometryReader { geometry in
+                        Color.clear.preference(
+                            key: TabContentWidthPreferenceKey.self,
+                            value: geometry.size.width
+                        )
+                    }
+                )
                 .coordinateSpace(.named(Self.stripSpace))
                 .onPreferenceChange(WorkspaceTabFramePreferenceKey.self) { frames in
                     tabFrames = frames
                 }
             }
             .scrollIndicators(.hidden)
+            .frame(maxWidth: tabContentWidth)
+            // Let the tab strip grow up to its intrinsic width before the
+            // flexible drag area expands, while `+` and the update indicator
+            // outrank the strip so they never clip when tabs overflow.
+            .layoutPriority(1)
+            .onPreferenceChange(TabContentWidthPreferenceKey.self) { width in
+                let rounded = ceil(width)
+                if rounded > 0, tabContentWidth != rounded {
+                    tabContentWidth = rounded
+                }
+            }
 
             Button {
                 _ = workspace.createTab()
             } label: {
                 Image(systemName: "plus")
                     .frame(width: 26, height: 26)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .help("New Tab (⌘T)")
             .accessibilityLabel("New Tab")
             .accessibilityIdentifier("workspace-new-tab")
+            .layoutPriority(2)
+
+            WindowTitlebarDragArea()
+                .frame(minWidth: 36, maxWidth: .infinity, maxHeight: .infinity)
+
+            TitlebarUpdateIndicatorButton(updateController: updateController)
+                .layoutPriority(2)
         }
-        .padding(.horizontal, 10)
-        .frame(height: 38)
-        .background(.bar)
-        .onChange(of: gestureTracksDrag) { _, tracked in
-            guard !tracked else { return }
-            // A successful release runs .onEnded first, which clears the
-            // visual state inside its own commit transaction; the deferred
-            // check below therefore only fires for a cancelled gesture.
-            // Deferring by one runloop turn is what keeps the two exit paths
-            // distinguishable, because the gesture-state reset and .onEnded
-            // happen within the same turn.
-            DispatchQueue.main.async {
-                guard draggingTabID != nil else { return }
-                withAnimation(Self.reorderAnimation) {
-                    draggingTabID = nil
-                    dragTranslation = 0
-                    dropIndex = 0
-                    dragSnapshot = nil
-                }
+        .padding(.leading, titlebarMetrics.leadingInset)
+        .padding(.trailing, 10)
+        .frame(height: titlebarMetrics.barHeight)
+        .background {
+            ZStack {
+                Rectangle().fill(.bar)
+                WindowTitlebarDragArea()
             }
         }
     }
@@ -185,7 +205,7 @@ private struct WorkspaceTabStrip: View {
             } label: {
                 Text(tab.title)
                     .lineLimit(1)
-                    .frame(maxWidth: 190, alignment: .leading)
+                    .frame(maxWidth: 220, alignment: .leading)
                     .padding(.leading, 10)
                     // The close button supplies the visual spacing on the right
                     // when it is there. A lone tab has nothing after the label,
@@ -196,13 +216,14 @@ private struct WorkspaceTabStrip: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .help(tab.title)
             .accessibilityLabel(tab.title)
             .accessibilityIdentifier("workspace-tab-\(tab.id.uuidString)")
             .accessibilityAddTraits(isActive ? .isSelected : [])
             // The drag overlay rides on the title button only. The close
             // button stays outside it so a plain click hits its own native
             // Button, and the drag handle covers the area users actually grab.
-            .modifier(SinglePaneTabDraggableModifier(
+            .modifier(TabDraggableModifier(
                 tab: tab,
                 onActivate: { workspace.activate(tabID: tab.id) },
                 onDragStarted: { onTabDragStarted?(tab) },
@@ -251,16 +272,7 @@ private struct WorkspaceTabStrip: View {
                 .accessibilityIdentifier("workspace-tab-close-\(tab.id.uuidString)")
             }
         }
-        // Multi-pane tabs do not host a `PaneDragSource` overlay, so they
-        // keep SwiftUI's capsule reorder gesture. Single-pane tabs handle
-        // horizontal reorder (including Esc cancellation) and vertical tear-out
-        // in `PaneDragSource` without a competing `DragGesture` eating key
-        // events or committing a duplicate reorder.
         .contentShape(Rectangle())
-        .simultaneousGesture(
-            reorderGesture(for: tab),
-            isEnabled: tab.layoutTree.paneCount > 1
-        )
         .contextMenu { tabContextMenu(for: tab) }
         .background(
             isActive ? Color.accentColor.opacity(0.16) : Color.clear,
@@ -298,23 +310,6 @@ private struct WorkspaceTabStrip: View {
             _ = workspace.moveTab(tabID: tab.id, direction: .next)
         }
         .disabled(workspace.tabs.count < 2)
-    }
-
-    private func reorderGesture(for tab: WorkspaceTabSession) -> some Gesture {
-        DragGesture(minimumDistance: 4, coordinateSpace: .named(Self.stripSpace))
-            .updating($gestureTracksDrag) { _, state, _ in
-                state = true
-            }
-            .onChanged { value in
-                updateTabReorder(
-                    tabID: tab.id,
-                    pointerX: value.location.x,
-                    translationX: value.translation.width
-                )
-            }
-            .onEnded { value in
-                commitTabReorder(tabID: tab.id, pointerX: value.location.x)
-            }
     }
 
     private func tabReorderPointerX(
@@ -496,6 +491,7 @@ struct PDFReaderView: View {
     @FocusState private var isSearchFieldFocused: Bool
     /// Installed on the window so closing it cannot drop unsaved edits.
     @State private var closeGuard = WindowCloseGuard()
+    @State private var titlebarMetrics = TitlebarLayoutMetrics()
     /// True while the next page click places a page note.
     @State private var isPlacingNote = false
     /// Per-pane anchor resolvers converting page rectangles into popover anchors through live PDFViews.
@@ -789,7 +785,7 @@ struct PDFReaderView: View {
     private var titlebarReader: some View {
         closeGuardReader
             .background(
-                TitlebarUpdateIndicatorInstaller(updateController: updateController)
+                TitlebarMetricsObserver(metrics: $titlebarMetrics)
                     .frame(width: 0, height: 0)
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
@@ -1221,6 +1217,8 @@ struct PDFReaderView: View {
         VStack(spacing: 0) {
             WorkspaceTabStrip(
                 workspace: workspace,
+                updateController: updateController,
+                titlebarMetrics: titlebarMetrics,
                 closeTab: requestCloseTab,
                 onTabDragStarted: { draggedTab in
                     activeDraggedPayload = PaneDragPayload(kind: .tab, sourceTabID: draggedTab.id, sourcePaneID: draggedTab.activePaneID)
@@ -1245,6 +1243,7 @@ struct PDFReaderView: View {
                     return true
                 })
         }
+        .ignoresSafeArea(.container, edges: .top)
     }
 
     // MARK: - Toolbar

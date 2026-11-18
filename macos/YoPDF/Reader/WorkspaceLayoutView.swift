@@ -695,10 +695,14 @@ final class PaneDragSourceView: NSView, NSDraggingSource {
     /// SwiftUI content underneath instead (tab capsules with Buttons).
     var onClick: (() -> Void)?
     var forwardsUnclaimedClicks = false
-    /// When set (on single-pane tabs in the tab strip), dragging within the
-    /// strip reorders tabs; dragging vertically out of the strip cancels the
-    /// reorder preview and begins a native pane-drag session.
+    /// When set (on tabs in the tab strip), dragging within the strip reorders
+    /// tabs; when `allowsNativeSession` is also true, dragging vertically out
+    /// of the strip cancels the reorder preview and begins a native pane drag.
     var tabReorder: TabStripDragCallbacks?
+    /// Whether vertical tear-out (or pane dragging) may launch a native
+    /// `NSDraggingSession`. Set `false` for multi-pane tabs so they can still
+    /// reorder horizontally in the titlebar without tearing out as a single pane.
+    var allowsNativeSession = true
     /// Optional hook allowing unit tests to observe native drag handoff
     /// without spinning up an AppKit window drag tracking loop.
     var draggingSessionStarter: ((_ items: [NSDraggingItem], _ event: NSEvent) -> Void)?
@@ -808,11 +812,11 @@ final class PaneDragSourceView: NSView, NSDraggingSource {
             guard hypot(dx, dy) >= Self.dragThreshold else { return }
 
             let currentLocal = convert(event.locationInWindow, from: nil)
-            if let tabReorder, tabReorder.canReorder(), !shouldTearOutTabDrag(atLocalPoint: currentLocal) {
+            if let tabReorder, tabReorder.canReorder(), (!allowsNativeSession || !shouldTearOutTabDrag(atLocalPoint: currentLocal)) {
                 phase = .reordering(startInWindow: startInWindow, localStartX: localStartX)
                 installReorderKeyMonitor()
                 tabReorder.onReorderChanged(localStartX, dx)
-            } else {
+            } else if allowsNativeSession {
                 phase = .nativeSession
                 beginPayloadSession(with: event, dragPoint: currentLocal)
             }
@@ -820,7 +824,7 @@ final class PaneDragSourceView: NSView, NSDraggingSource {
         case let .reordering(startInWindow, localStartX):
             let dx = event.locationInWindow.x - startInWindow.x
             let currentLocal = convert(event.locationInWindow, from: nil)
-            if shouldTearOutTabDrag(atLocalPoint: currentLocal) {
+            if allowsNativeSession, shouldTearOutTabDrag(atLocalPoint: currentLocal) {
                 // Compute `currentLocal` before cancelling reorder so the floating
                 // pill spawns at the cursor's current screen position.
                 removeReorderKeyMonitor()
@@ -1030,6 +1034,7 @@ struct PaneDragSource: NSViewRepresentable {
     var onClick: (() -> Void)? = nil
     var forwardsUnclaimedClicks = false
     var tabReorder: TabStripDragCallbacks? = nil
+    var allowsNativeSession = true
 
     func makeNSView(context: Context) -> PaneDragSourceView {
         PaneDragSourceView()
@@ -1043,6 +1048,7 @@ struct PaneDragSource: NSViewRepresentable {
         nsView.onClick = onClick
         nsView.forwardsUnclaimedClicks = forwardsUnclaimedClicks
         nsView.tabReorder = tabReorder
+        nsView.allowsNativeSession = allowsNativeSession
     }
 
     static func dismantleNSView(_ nsView: PaneDragSourceView, coordinator: ()) {

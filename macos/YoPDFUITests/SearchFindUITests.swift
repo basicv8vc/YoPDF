@@ -27,7 +27,7 @@ final class SearchFindUITests: XCTestCase {
             XCTFail("The reader window did not open.")
             return
         }
-        guard app.staticTexts[fixtureURL.lastPathComponent].waitForExistence(timeout: 10) else {
+        guard app.buttons[fixtureURL.lastPathComponent].waitForExistence(timeout: 10) else {
             XCTFail("The test PDF did not load in the reader.")
             return
         }
@@ -68,7 +68,7 @@ final class SearchFindUITests: XCTestCase {
         app.activate()
 
         guard app.windows.firstMatch.waitForExistence(timeout: 10),
-              app.staticTexts[fixtureURL.lastPathComponent].waitForExistence(timeout: 10)
+              app.buttons[fixtureURL.lastPathComponent].waitForExistence(timeout: 10)
         else {
             XCTFail("The reader window did not open the outline test PDF.")
             return

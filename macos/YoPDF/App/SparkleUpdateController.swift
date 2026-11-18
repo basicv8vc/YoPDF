@@ -16,6 +16,7 @@ final class SparkleUpdateController: NSObject, ObservableObject, SPUUpdaterDeleg
     let reminder = GentleUpdateReminder()
 
     private let isConfigured: Bool
+    private var isPreviewingUpdate = false
     private lazy var controller = SPUStandardUpdaterController(
         startingUpdater: isConfigured,
         updaterDelegate: self,
@@ -52,6 +53,7 @@ final class SparkleUpdateController: NSObject, ObservableObject, SPUUpdaterDeleg
         }) {
             let version = String(argument.dropFirst(previewPrefix.count))
             if !version.isEmpty {
+                isPreviewingUpdate = true
                 reminder.didFindValidUpdate(version: version)
             }
         }
@@ -64,7 +66,9 @@ final class SparkleUpdateController: NSObject, ObservableObject, SPUUpdaterDeleg
         updater.publisher(for: \.canCheckForUpdates)
             .assign(to: &$canCheckForUpdates)
 
-        scheduleInitialUpdateProbe()
+        if !isPreviewingUpdate {
+            scheduleInitialUpdateProbe()
+        }
     }
 
     func checkForUpdates() {
@@ -117,6 +121,7 @@ final class SparkleUpdateController: NSObject, ObservableObject, SPUUpdaterDeleg
     }
 
     func updaterDidNotFindUpdate(_ updater: SPUUpdater) {
+        guard !isPreviewingUpdate else { return }
         reminder.didNotFindUpdate()
     }
 
