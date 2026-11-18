@@ -31,7 +31,7 @@ final class PaneDragDropUITests: XCTestCase {
         app.launch()
 
         guard app.windows.firstMatch.waitForExistence(timeout: 20),
-              app.staticTexts[fixtureURL.lastPathComponent].waitForExistence(timeout: 20)
+              app.buttons[fixtureURL.lastPathComponent].waitForExistence(timeout: 20)
         else {
             throw NSError(domain: "PaneDragDropUITests", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "The reader window did not open the smoke PDF."

@@ -57,6 +57,49 @@ final class TabShortcutUITests: XCTestCase {
         XCTAssertEqual(tabButtons.count, 3, "Navigation must not create or close tabs.")
     }
 
+    func testSingleTabShowsTabStripAndNewTabButtonInUnifiedTitlebarRow() async throws {
+        let applicationURL = try applicationURL()
+        let app = try application(at: applicationURL)
+        defer { app.terminate() }
+        try await launch(app, at: applicationURL)
+
+        let window = app.windows.firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 10), "The reader window should appear.")
+        guard bringToForeground(app, at: applicationURL) else { return }
+
+        let tabButtons = app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND NOT identifier BEGINSWITH %@",
+            "workspace-tab-", "workspace-tab-close-"
+        ))
+        XCTAssertTrue(waitForTabCount(1, in: tabButtons), "A fresh workspace has one tab.\n\(app.debugDescription)")
+
+        let newTabButton = app.buttons["workspace-new-tab"]
+        XCTAssertTrue(newTabButton.waitForExistence(timeout: 5), "Single-tab workspace should still show the + button.")
+
+        let tabFrame = tabButtons.firstMatch.frame
+        let plusFrame = newTabButton.frame
+        let windowFrame = window.frame
+
+        XCTAssertGreaterThanOrEqual(
+            tabFrame.minX - windowFrame.minX, 65,
+            "Tab strip should leave leading space for window traffic lights. window=\(windowFrame), tab=\(tabFrame)"
+        )
+        XCTAssertLessThan(
+            tabFrame.minY - windowFrame.minY, 16,
+            "Tab strip should sit in the top titlebar row. window=\(windowFrame), tab=\(tabFrame)"
+        )
+        XCTAssertLessThan(
+            abs(tabFrame.midY - plusFrame.midY), 6,
+            "New Tab (+) button should align vertically with the tab on the same row. tab=\(tabFrame), plus=\(plusFrame)"
+        )
+        XCTAssertGreaterThanOrEqual(plusFrame.minX, tabFrame.maxX)
+        XCTAssertLessThan(
+            plusFrame.minX - tabFrame.maxX, 30,
+            "New Tab (+) button should shrink-wrap next to the single tab. tab=\(tabFrame), plus=\(plusFrame)"
+        )
+        XCTAssertEqual(window.title, "YoPDF", "NSWindow.title should stay synced even with hiddenTitleBar.")
+    }
+
     private func applicationURL() throws -> URL {
         var directory = Bundle(for: Self.self).bundleURL.deletingLastPathComponent()
         while directory.path != "/" {

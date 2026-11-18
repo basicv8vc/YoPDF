@@ -117,6 +117,7 @@ targets:
       # Finder request ordering and window workspace ownership are app-facing,
       # but their state transitions are intentionally unit tested.
       - path: YoPDF/App/FileOpenRequestQueue.swift
+      - path: YoPDF/App/WindowTitleInstaller.swift
       - path: YoPDF/App/WorkspaceWindowModel.swift
       - path: YoPDF/Reader/ReaderNavigationState.swift
       - path: YoPDF/Reader/ReaderSidebarItems.swift

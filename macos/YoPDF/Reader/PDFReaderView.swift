@@ -78,8 +78,20 @@ private struct WorkspaceTabFramePreferenceKey: PreferenceKey {
     }
 }
 
+/// Reports the intrinsic width of the tab strip's tabs so the scroll view
+/// shrink-wraps its content when tabs fit and scrolls only on overflow.
+private struct TabContentWidthPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 private struct WorkspaceTabStrip: View {
     @ObservedObject var workspace: WorkspaceWindowModel
+    @ObservedObject var updateController: SparkleUpdateController
+    let titlebarMetrics: TitlebarLayoutMetrics
     let closeTab: (UUID) -> Void
     var onTabDragStarted: ((WorkspaceTabSession) -> Void)? = nil
     var onTabDragEnded: (() -> Void)? = nil
@@ -87,6 +99,7 @@ private struct WorkspaceTabStrip: View {
     /// Layout frames of the tabs, keyed by tab ID. Reported by each tab and
     /// read only once, when a drag starts.
     @State private var tabFrames: [UUID: CGRect] = [:]
+    @State private var tabContentWidth: CGFloat?
     /// Visual state of an in-flight drag. Deliberately plain `@State`, not
     /// `@GestureState`: the commit must clear it inside the same
     /// `withAnimation` transaction that reorders the strip, so the offset
@@ -125,33 +138,67 @@ private struct WorkspaceTabStrip: View {
     private static let reorderAnimation = Animation.easeOut(duration: 0.18)
 
     var body: some View {
-        HStack(spacing: 8) {
-            ScrollView(.horizontal) {
+        HStack(spacing: 6) {
+            ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: Self.tabSpacing) {
                     ForEach(workspace.tabs) { tab in
                         tabView(tab)
                     }
                 }
+                .background(
+                    GeometryReader { geometry in
+                        Color.clear.preference(
+                            key: TabContentWidthPreferenceKey.self,
+                            value: geometry.size.width
+                        )
+                    }
+                )
                 .coordinateSpace(.named(Self.stripSpace))
                 .onPreferenceChange(WorkspaceTabFramePreferenceKey.self) { frames in
                     tabFrames = frames
                 }
             }
             .scrollIndicators(.hidden)
+            .frame(maxWidth: tabContentWidth)
+            // Let the tab strip grow up to its intrinsic width before the
+            // flexible drag area expands, while `+` and the update indicator
+            // outrank the strip so they never clip when tabs overflow.
+            .layoutPriority(1)
+            .onPreferenceChange(TabContentWidthPreferenceKey.self) { width in
+                let rounded = ceil(width)
+                if rounded > 0, tabContentWidth != rounded {
+                    tabContentWidth = rounded
+                }
+            }
 
             Button {
                 _ = workspace.createTab()
             } label: {
                 Image(systemName: "plus")
                     .frame(width: 26, height: 26)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .help("New Tab (⌘T)")
             .accessibilityLabel("New Tab")
             .accessibilityIdentifier("workspace-new-tab")
+            .layoutPriority(2)
+
+            WindowTitlebarDragArea()
+                .frame(minWidth: 36, maxWidth: .infinity, maxHeight: .infinity)
+
+            TitlebarUpdateIndicatorButton(updateController: updateController)
+                .layoutPriority(2)
         }
-        .padding(.horizontal, 10)
-        .frame(height: 38)
-        .background(.bar)
+        .padding(.leading, titlebarMetrics.leadingInset)
+        .padding(.trailing, 10)
+        .frame(height: titlebarMetrics.barHeight)
+        .background {
+            ZStack {
+                Rectangle().fill(.bar)
+                WindowTitlebarDragArea()
+            }
+        }
         .onChange(of: gestureTracksDrag) { _, tracked in
             guard !tracked else { return }
             // A successful release runs .onEnded first, which clears the
@@ -185,7 +232,7 @@ private struct WorkspaceTabStrip: View {
             } label: {
                 Text(tab.title)
                     .lineLimit(1)
-                    .frame(maxWidth: 190, alignment: .leading)
+                    .frame(maxWidth: 220, alignment: .leading)
                     .padding(.leading, 10)
                     // The close button supplies the visual spacing on the right
                     // when it is there. A lone tab has nothing after the label,
@@ -196,6 +243,7 @@ private struct WorkspaceTabStrip: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .help(tab.title)
             .accessibilityLabel(tab.title)
             .accessibilityIdentifier("workspace-tab-\(tab.id.uuidString)")
             .accessibilityAddTraits(isActive ? .isSelected : [])
@@ -479,6 +527,7 @@ struct PDFReaderView: View {
     @FocusState private var isSearchFieldFocused: Bool
     /// Installed on the window so closing it cannot drop unsaved edits.
     @State private var closeGuard = WindowCloseGuard()
+    @State private var titlebarMetrics = TitlebarLayoutMetrics()
     /// True while the next page click places a page note.
     @State private var isPlacingNote = false
     /// Per-pane anchor resolvers converting page rectangles into popover anchors through live PDFViews.
@@ -696,7 +745,7 @@ struct PDFReaderView: View {
     private var titlebarReader: some View {
         closeGuardReader
             .background(
-                TitlebarUpdateIndicatorInstaller(updateController: updateController)
+                TitlebarMetricsObserver(metrics: $titlebarMetrics)
                     .frame(width: 0, height: 0)
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
@@ -1023,6 +1072,8 @@ struct PDFReaderView: View {
         VStack(spacing: 0) {
             WorkspaceTabStrip(
                 workspace: workspace,
+                updateController: updateController,
+                titlebarMetrics: titlebarMetrics,
                 closeTab: requestCloseTab,
                 onTabDragStarted: { draggedTab in
                     activeDraggedPayload = PaneDragPayload(kind: .tab, sourceTabID: draggedTab.id, sourcePaneID: draggedTab.activePaneID)
@@ -1047,6 +1098,7 @@ struct PDFReaderView: View {
                     return true
                 })
         }
+        .ignoresSafeArea(.container, edges: .top)
     }
 
     // MARK: - Toolbar
