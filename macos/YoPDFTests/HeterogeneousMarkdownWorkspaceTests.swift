@@ -497,4 +497,155 @@ final class HeterogeneousMarkdownWorkspaceTests: XCTestCase {
         XCTAssertEqual(tab2.markdownPaneSessions[mdPaneID]?.resourceSession.content, "# Shared\nPending transfer edit\n")
         XCTAssertEqual(tab2.markdownPaneSessions[mdPaneID]?.resourceSession.activeLeaseCount, 1)
     }
+
+    // MARK: - 5. Pool Registration, Observer Cleanup, Save-As Conflict & Citation Routing Regressions
+
+    func testCreatingMarkdownInEmptyWorkspaceRegistersPoolAndCancelsOldPlaceholderObserving() throws {
+        let mdURL = directory.url.appendingPathComponent("fresh-note.md")
+        let workspace = makeWorkspace()
+        defer { workspace.closeAllSessions() }
+
+        let tab = workspace.activeTab
+        XCTAssertTrue(tab.isEmptyPlaceholderTab)
+        let oldPlaceholderPaneID = tab.activePaneID
+        XCTAssertEqual(tab.observedPaneIDs, [oldPlaceholderPaneID])
+
+        let createResult = workspace.createMarkdownNote(
+            at: mdURL,
+            initialContent: "# Fresh\n\n"
+        )
+        guard case let .success((tabID, mdPaneID)) = createResult else {
+            return XCTFail("Expected empty-workspace Markdown creation to succeed: \(createResult)")
+        }
+
+        XCTAssertEqual(tabID, tab.id)
+        XCTAssertNotEqual(mdPaneID, oldPlaceholderPaneID)
+        XCTAssertEqual(tab.observedPaneIDs, Set(tab.paneEntries.keys))
+        XCTAssertFalse(tab.observedPaneIDs.contains(oldPlaceholderPaneID))
+
+        let createdSession = try XCTUnwrap(tab.markdownPaneSessions[mdPaneID]?.resourceSession)
+        XCTAssertTrue(workspace.markdownPool.session(for: mdURL) === createdSession)
+        XCTAssertEqual(createdSession.activeLeaseCount, 1)
+
+        // Opening the same file into a second split pane must reuse the registered pool session.
+        let extraPaneID = PaneID()
+        let poolResult = workspace.markdownPool.open(url: mdURL, for: extraPaneID)
+        guard case let .success(reusedSession) = poolResult else {
+            return XCTFail("Expected pool open to succeed")
+        }
+        defer { workspace.markdownPool.release(session: reusedSession, for: extraPaneID) }
+        XCTAssertTrue(reusedSession === createdSession)
+        XCTAssertEqual(createdSession.activeLeaseCount, 2)
+    }
+
+    func testSaveMarkdownAsRefusesDestinationOwnedByAnotherActiveSession() throws {
+        let url1 = try writeTempMarkdown(named: "note1.md", contents: "# Note 1\n")
+        let url2 = try writeTempMarkdown(named: "note2.md", contents: "# Note 2\n")
+        let workspace = makeWorkspace()
+        defer { workspace.closeAllSessions() }
+
+        guard case let .opened(tab1ID, pane1) = workspace.openMarkdown(url1),
+              case let .opened(tab2ID, pane2) = workspace.openMarkdown(url2),
+              let session1 = workspace.session(tabID: tab1ID)?.markdownPaneSessions[pane1]?.resourceSession,
+              let session2 = workspace.session(tabID: tab2ID)?.markdownPaneSessions[pane2]?.resourceSession else {
+            return XCTFail("Expected both Markdown tabs to open")
+        }
+
+        session1.isAutoSaveEnabled = false
+        session1.updateContent("# Note 1 edited\n", from: pane1)
+
+        let conflictOutcome = workspace.saveMarkdownAs(session1, to: url2, overwrite: true)
+        guard case .failed = conflictOutcome else {
+            return XCTFail("Expected saveMarkdownAs to refuse overwriting another active pool session: \(conflictOutcome)")
+        }
+        XCTAssertEqual(session1.fileURL?.resolvingSymlinksInPath().standardizedFileURL,
+                       url1.resolvingSymlinksInPath().standardizedFileURL)
+        XCTAssertEqual(session2.content, "# Note 2\n")
+        XCTAssertEqual(try String(contentsOf: url2, encoding: .utf8), "# Note 2\n")
+    }
+
+    func testCitationRoutingPrefersPaperNoteAssociationAndAssociatedPDFURL() throws {
+        let pdfURLA = try writeTempPDF(named: "paper-a.pdf")
+        let pdfURLB = try writeTempPDF(named: "paper-b.pdf")
+        let workspace = makeWorkspace()
+        defer { workspace.closeAllSessions() }
+
+        guard case .opened = workspace.open(pdfURLA) else {
+            return XCTFail("Failed to open A.pdf")
+        }
+        let tab = workspace.activeTab
+        let pdfPaneA = tab.activePaneID
+
+        guard case let .success(pdfPaneB) = workspace.openPDFInSplit(
+            url: pdfURLB,
+            in: tab.id,
+            adjacentTo: pdfPaneA,
+            direction: .right
+        ) else {
+            return XCTFail("Failed to open B.pdf in split")
+        }
+
+        let createdA = try workspace.noteAssociationStore.createDefaultNote(
+            forPDF: pdfURLA,
+            initialContent: "# Paper A\n"
+        )
+        guard case let .success(mdPaneA) = workspace.openOrActivateMarkdownSession(
+            createdA.session,
+            associatedPDFURL: pdfURLA,
+            in: tab.id,
+            preferredSplitFrom: pdfPaneA,
+            direction: .right
+        ), let mdSessionA = tab.markdownPaneSessions[mdPaneA] else {
+            return XCTFail("Failed to open Paper A note")
+        }
+
+        // B.pdf must NOT hijack Paper A's note just because mdSessionA is the active Markdown pane in the tab.
+        XCTAssertNil(workspace.citationTargetMarkdownPane(forPDF: pdfURLB, in: tab.id))
+
+        // Companion PDF resolution from mdSessionA must return Paper A even when Paper B is active.
+        tab.activePaneID = pdfPaneB
+        XCTAssertEqual(tab.primaryPDFPaneSession?.id, pdfPaneB)
+        XCTAssertEqual(workspace.companionPDFPane(for: mdSessionA, in: tab.id)?.id, pdfPaneA)
+
+        // With Paper B's own note also open in the tab, each PDF routes to its own note regardless of focus.
+        let createdB = try workspace.noteAssociationStore.createDefaultNote(
+            forPDF: pdfURLB,
+            initialContent: "# Paper B\n"
+        )
+        guard case let .success(mdPaneB) = workspace.openOrActivateMarkdownSession(
+            createdB.session,
+            associatedPDFURL: pdfURLB,
+            in: tab.id,
+            preferredSplitFrom: pdfPaneB,
+            direction: .bottom
+        ), let mdSessionB = tab.markdownPaneSessions[mdPaneB] else {
+            return XCTFail("Failed to open Paper B note")
+        }
+
+        tab.activePaneID = mdPaneB
+        XCTAssertEqual(workspace.citationTargetMarkdownPane(forPDF: pdfURLA, in: tab.id)?.id, mdPaneA)
+        XCTAssertEqual(workspace.citationTargetMarkdownPane(forPDF: pdfURLB, in: tab.id)?.id, mdPaneB)
+        XCTAssertEqual(workspace.companionPDFPane(for: mdSessionA, in: tab.id)?.id, pdfPaneA)
+        XCTAssertEqual(workspace.companionPDFPane(for: mdSessionB, in: tab.id)?.id, pdfPaneB)
+    }
+
+    func testCitationInsertionGuardsReadOnlyMarkdownSession() throws {
+        let mdURL = try writeTempMarkdown(named: "readonly-note.md", contents: "# Locked\n")
+        try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: mdURL.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: mdURL.path) }
+
+        let workspace = makeWorkspace()
+        defer { workspace.closeAllSessions() }
+
+        guard case let .opened(tabID, mdPaneID) = workspace.openMarkdown(mdURL),
+              let mdSession = workspace.session(tabID: tabID)?.markdownPaneSessions[mdPaneID] else {
+            return XCTFail("Expected read-only Markdown file to open")
+        }
+
+        XCTAssertTrue(mdSession.resourceSession.isReadOnlyAtOpen)
+        XCTAssertFalse(workspace.canInsertCitation(into: mdSession))
+        XCTAssertFalse(workspace.insertCitationText("[Paper, p. 1](./paper.pdf#page=1)", into: mdSession))
+        XCTAssertEqual(mdSession.resourceSession.content, "# Locked\n")
+        XCTAssertFalse(mdSession.resourceSession.hasUnsavedChanges)
+    }
 }

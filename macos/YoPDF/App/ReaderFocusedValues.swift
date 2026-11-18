@@ -7,6 +7,10 @@ struct DocumentModelFocusKey: FocusedValueKey {
     typealias Value = PDFDocumentModel
 }
 
+struct ActivePaneKindFocusKey: FocusedValueKey {
+    typealias Value = PaneKind
+}
+
 /// Presents the open panel for the focused window. Kept as an action so the
 /// command layer does not need to know which view owns the file importer.
 struct OpenDocumentActionKey: FocusedValueKey {
@@ -132,6 +136,11 @@ extension FocusedValues {
     var documentModel: PDFDocumentModel? {
         get { self[DocumentModelFocusKey.self] }
         set { self[DocumentModelFocusKey.self] = newValue }
+    }
+
+    var activePaneKind: PaneKind? {
+        get { self[ActivePaneKindFocusKey.self] }
+        set { self[ActivePaneKindFocusKey.self] = newValue }
     }
 
     var openDocument: (@MainActor () -> Void)? {

@@ -876,6 +876,7 @@ struct PDFReaderView: View {
 
     private var markdownFocusedReader: some View {
         focusedReader
+            .focusedSceneValue(\.activePaneKind, activePaneKind)
             .focusedSceneValue(\.activeUndo, activeUndoAction)
             .focusedSceneValue(\.activeRedo, activeRedoAction)
             .focusedSceneValue(\.openPaperNote, openPaperNoteAction)
@@ -892,9 +893,9 @@ struct PDFReaderView: View {
             .focusedSceneValue(\.findInDocument, findInDocumentAction)
             .focusedSceneValue(\.findNextSearchResult, findNextSearchResultAction)
             .focusedSceneValue(\.findPreviousSearchResult, findPreviousSearchResultAction)
-            .focusedSceneValue(\.highlightSelection, { _ = model.addMarkup(.highlight) })
-            .focusedSceneValue(\.underlineSelection, { _ = model.addMarkup(.underline) })
-            .focusedSceneValue(\.addNote, { beginNote() })
+            .focusedSceneValue(\.highlightSelection, highlightSelectionAction)
+            .focusedSceneValue(\.underlineSelection, underlineSelectionAction)
+            .focusedSceneValue(\.addNote, addNoteAction)
             .focusedSceneValue(
                 \.readerSidebarActions,
                 ReaderSidebarActions(
@@ -904,9 +905,25 @@ struct PDFReaderView: View {
             )
     }
 
+    private var highlightSelectionAction: (@MainActor () -> Void)? {
+        guard activePaneKind == .pdf else { return nil }
+        return { _ = model.addMarkup(.highlight) }
+    }
+
+    private var underlineSelectionAction: (@MainActor () -> Void)? {
+        guard activePaneKind == .pdf else { return nil }
+        return { _ = model.addMarkup(.underline) }
+    }
+
+    private var addNoteAction: (@MainActor () -> Void)? {
+        guard activePaneKind == .pdf else { return nil }
+        return { beginNote() }
+    }
+
     private var activeUndoAction: (@MainActor () -> Void)? {
-        if activePaneKind == .markdown, let mdSession = activeMarkdownSession {
-            guard mdSession.paneModel.editorController.canUndo else { return nil }
+        if activePaneKind == .markdown {
+            guard let mdSession = activeMarkdownSession,
+                  mdSession.paneModel.editorController.canUndo else { return nil }
             return { _ = mdSession.paneModel.editorController.undo() }
         }
         guard model.canUndoMarkup else { return nil }
@@ -914,8 +931,9 @@ struct PDFReaderView: View {
     }
 
     private var activeRedoAction: (@MainActor () -> Void)? {
-        if activePaneKind == .markdown, let mdSession = activeMarkdownSession {
-            guard mdSession.paneModel.editorController.canRedo else { return nil }
+        if activePaneKind == .markdown {
+            guard let mdSession = activeMarkdownSession,
+                  mdSession.paneModel.editorController.canRedo else { return nil }
             return { _ = mdSession.paneModel.editorController.redo() }
         }
         guard model.canRedoMarkup else { return nil }
@@ -954,7 +972,11 @@ struct PDFReaderView: View {
     }
 
     private var insertCitationAction: (@MainActor () -> Void)? {
-        guard model.isLoaded else { return nil }
+        if activePaneKind == .markdown, let mdSession = activeMarkdownSession {
+            guard canCiteCompanionPDF(in: mdSession) else { return nil }
+            return { citeCompanionPDFInMarkdown(mdSession) }
+        }
+        guard canCiteFromPDFPane(tab.primaryPDFPaneSession) else { return nil }
         return { citeActivePDFInPaperNote() }
     }
 
@@ -1453,7 +1475,7 @@ struct PDFReaderView: View {
                 Image(systemName: "quote.bubble")
                     .font(.system(size: 13, weight: .medium))
             }
-            .disabled(!model.isLoaded || model.fileURL == nil)
+            .disabled(!canCiteFromPDFPane(tab.primaryPDFPaneSession))
             .help("Cite selection or page in Paper Note (⇧⌘I)")
             .accessibilityLabel("Cite in Paper Note")
             .accessibilityIdentifier("pdf-cite-in-note-button")
@@ -1548,7 +1570,7 @@ struct PDFReaderView: View {
                 Label("Cite PDF", systemImage: "quote.bubble")
                     .font(.callout)
             }
-            .disabled(!model.isLoaded)
+            .disabled(!canCiteCompanionPDF(in: mdSession))
             .help("Insert portable citation for companion PDF (⇧⌘I)")
             .accessibilityIdentifier("markdown-insert-citation-button")
 
@@ -2533,7 +2555,7 @@ struct PDFReaderView: View {
         panel.nameFieldStringValue = mdResource.fileURL?.lastPathComponent ?? suggestedMarkdownFilename(for: mdResource.title)
         let response = mdResource.withAutoSavePaused { panel.runModal() }
         guard response == .OK, let url = panel.url else { return }
-        _ = presentMarkdownOutcome(mdResource.saveAs(to: url, overwrite: true), tabID: tabID, paneID: paneID)
+        _ = presentMarkdownOutcome(workspace.saveMarkdownAs(mdResource, to: url, overwrite: true), tabID: tabID, paneID: paneID)
     }
 
     @discardableResult
@@ -2866,7 +2888,9 @@ struct PDFReaderView: View {
         }
         items.append(contentsOf: markup)
 
-        if model.isLoaded, model.fileURL != nil {
+        if let pdfPane = tab.paneSessions[targetPaneID],
+           pdfPane.resourceSession.isLoaded,
+           pdfPane.resourceSession.fileURL != nil {
             if !items.isEmpty {
                 items.append(.separator())
             }
@@ -2874,11 +2898,13 @@ struct PDFReaderView: View {
                 .string?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .isEmpty == false
-            items.append(MarkupActionMenuItem(
+            let citeItem = MarkupActionMenuItem(
                 title: hasSelection ? "Cite Selection in Paper Note" : "Cite Page in Paper Note"
             ) {
                 citeActivePDFInPaperNote(from: targetPaneID, pageOverride: context.page)
-            })
+            }
+            citeItem.isEnabled = canCiteFromPDFPane(pdfPane)
+            items.append(citeItem)
             items.append(MarkupActionMenuItem(title: "Open Paper Note") {
                 openOrCreatePaperNote(from: targetPaneID)
             })
@@ -3520,35 +3546,18 @@ struct PDFReaderView: View {
         }
 
         let initialTitle = url.deletingPathExtension().lastPathComponent
-        let createdSession = MarkdownResourceSession()
-        guard createdSession.create(at: url, initialContent: "# \(initialTitle)\n\n") else {
-            presentMarkdownOpenFailure(createdSession.lastError ?? MarkdownLoadError.unreadable("Could not create note."))
-            createdSession.close()
-            return
+        let result = workspace.createMarkdownNote(
+            at: url,
+            initialContent: "# \(initialTitle)\n\n",
+            associatedPDFURL: model.fileURL,
+            in: tab.id,
+            adjacentTo: tab.activePaneID,
+            direction: .right,
+            availableSize: currentContentSize
+        )
+        if case let .failure(error) = result {
+            presentMarkdownOpenFailure(error)
         }
-
-        if tab.hasLoadedContent,
-           case .success = workspace.openMarkdownSessionInSplit(
-               session: createdSession,
-               associatedPDFURL: model.fileURL,
-               in: tab.id,
-               adjacentTo: tab.activePaneID,
-               direction: .right,
-               availableSize: currentContentSize
-           ) {
-            return
-        }
-
-        if tab.isEmptyPlaceholderTab,
-           workspace.activeTab.replaceEmptyPlaceholderWithMarkdown(
-               resourceSession: createdSession,
-               associatedPDFURL: model.fileURL
-           ) != nil {
-            workspace.objectWillChange.send()
-            return
-        }
-
-        _ = workspace.openMarkdownInNewTab(session: createdSession, associatedPDFURL: model.fileURL)
     }
 
     private func requestOpenMarkdown(_ url: URL) {
@@ -3651,6 +3660,23 @@ struct PDFReaderView: View {
         }
     }
 
+    private func canCiteCompanionPDF(in mdSession: MarkdownPaneSession) -> Bool {
+        workspace.canInsertCitation(into: mdSession)
+            && workspace.companionPDFPane(for: mdSession, in: tab.id)?.resourceSession.isLoaded == true
+    }
+
+    private func canCiteFromPDFPane(_ pdfPane: PDFPaneSession?) -> Bool {
+        guard let pdfPane,
+              pdfPane.resourceSession.isLoaded,
+              let pdfURL = pdfPane.resourceSession.fileURL else {
+            return false
+        }
+        if let targetMarkdown = workspace.citationTargetMarkdownPane(forPDF: pdfURL, in: tab.id) {
+            return workspace.canInsertCitation(into: targetMarkdown)
+        }
+        return true
+    }
+
     private func citeActivePDFInPaperNote(
         from sourcePaneID: PaneID? = nil,
         pageOverride: PDFPage? = nil
@@ -3669,15 +3695,13 @@ struct PDFReaderView: View {
         let pdfURL = pdfPane.resourceSession.fileURL
         let title = pdfPane.resourceSession.title
 
-        // If any Markdown pane is already open in the current tab, insert into the most
-        // recently active or first Markdown pane in this tab.
-        if let existingMarkdown = tab.activeMarkdownPaneSession ?? tab.markdownPaneSessions.values.first {
+        if let targetMarkdown = workspace.citationTargetMarkdownPane(forPDF: pdfURL, in: tab.id) {
             insertCitation(
                 pdfURL: pdfURL,
                 title: title,
                 pageIndex: pageIndex,
                 selectedText: selectedText,
-                into: existingMarkdown
+                into: targetMarkdown
             )
             return
         }
@@ -3694,7 +3718,8 @@ struct PDFReaderView: View {
     }
 
     private func citeCompanionPDFInMarkdown(_ mdSession: MarkdownPaneSession) {
-        guard let pdfPane = tab.primaryPDFPaneSession, pdfPane.resourceSession.isLoaded else { return }
+        guard let pdfPane = workspace.companionPDFPane(for: mdSession, in: tab.id),
+              pdfPane.resourceSession.isLoaded else { return }
         insertCitation(
             pdfURL: pdfPane.resourceSession.fileURL,
             title: pdfPane.resourceSession.title,
@@ -3711,6 +3736,7 @@ struct PDFReaderView: View {
         selectedText: String?,
         into mdSession: MarkdownPaneSession
     ) {
+        guard workspace.canInsertCitation(into: mdSession) else { return }
         let citation = MarkdownCitation.formatCitation(
             pdfURL: pdfURL,
             title: title,
@@ -3719,13 +3745,7 @@ struct PDFReaderView: View {
             relativeTo: mdSession.resourceSession.fileURL
         )
         activatePane(mdSession.id)
-        let controller = mdSession.paneModel.editorController
-        _ = controller.focus()
-        if !controller.insertText(citation) {
-            let separator = mdSession.resourceSession.content.isEmpty || mdSession.resourceSession.content.hasSuffix("\n") ? "" : "\n"
-            let updated = mdSession.resourceSession.content + separator + citation
-            mdSession.resourceSession.updateContent(updated, from: mdSession.id)
-        }
+        _ = workspace.insertCitationText(citation, into: mdSession)
     }
 
     private func handleMarkdownCitationLink(_ rawDestination: String, from mdSession: MarkdownPaneSession) {

@@ -14,6 +14,7 @@ struct PDFReaderCommands: Commands {
     @ObservedObject private var recentDocuments: RecentDocumentsStore
 
     @FocusedValue(\.documentModel) private var model
+    @FocusedValue(\.activePaneKind) private var activePaneKind
     @FocusedValue(\.openDocument) private var openDocument
     @FocusedValue(\.newWorkspaceTab) private var newWorkspaceTab
     @FocusedValue(\.closeWorkspaceTab) private var closeWorkspaceTab
@@ -136,28 +137,21 @@ struct PDFReaderCommands: Commands {
             .disabled((workspaceTabMove?.tabCount ?? 0) < 2)
         }
 
-        // Annotation edits use the PDF model's own history; Markdown panes route
-        // Undo/Redo to the focused pane's MarkdownEditorController.
+        // Annotation edits and Markdown edits are both routed through
+        // `activeUndo` / `activeRedo` so an empty Markdown undo stack never
+        // falls back to undoing edits on a companion PDF pane.
         CommandGroup(replacing: .undoRedo) {
             Button("Undo") {
-                if let activeUndo {
-                    activeUndo()
-                } else {
-                    model?.undoMarkup()
-                }
+                activeUndo?()
             }
             .keyboardShortcut("z", modifiers: .command)
-            .disabled(activeUndo == nil && model?.canUndoMarkup != true)
+            .disabled(activeUndo == nil)
 
             Button("Redo") {
-                if let activeRedo {
-                    activeRedo()
-                } else {
-                    model?.redoMarkup()
-                }
+                activeRedo?()
             }
             .keyboardShortcut("z", modifiers: [.command, .shift])
-            .disabled(activeRedo == nil && model?.canRedoMarkup != true)
+            .disabled(activeRedo == nil)
         }
 
         // Replaces the standard Save/Save As items: those would call into AppKit
@@ -205,43 +199,45 @@ struct PDFReaderCommands: Commands {
         }
 
         CommandMenu("Annotate") {
+            let isPDFPaneActive = (activePaneKind ?? .pdf) == .pdf
+
             Button("Highlight") {
                 highlightSelection?()
             }
             .keyboardShortcut("h", modifiers: [.command, .shift])
-            .disabled(model?.canAddMarkup(.highlight) != true)
+            .disabled(!isPDFPaneActive || highlightSelection == nil || model?.canAddMarkup(.highlight) != true)
 
             Button("Underline") {
                 underlineSelection?()
             }
             .keyboardShortcut("u", modifiers: [.command, .shift])
-            .disabled(model?.canAddMarkup(.underline) != true)
+            .disabled(!isPDFPaneActive || underlineSelection == nil || model?.canAddMarkup(.underline) != true)
 
             // No key equivalent: ⇧⌘S is already Save As. Preview also leaves
             // Strike Out unshortcut.
             Button("Strike Out") {
                 model?.addMarkup(.strikeOut)
             }
-            .disabled(model?.canAddMarkup(.strikeOut) != true)
+            .disabled(!isPDFPaneActive || model?.canAddMarkup(.strikeOut) != true)
 
             Button("Add Note") {
                 addNote?()
             }
             .keyboardShortcut("n", modifiers: [.command, .shift])
-            .disabled(model?.canCreateNote != true)
+            .disabled(!isPDFPaneActive || addNote == nil || model?.canCreateNote != true)
 
             Divider()
 
             Button("Convert Annotation") {
                 model?.convertSelectedMarkup()
             }
-            .disabled(model?.canModifySelectedMarkup != true)
+            .disabled(!isPDFPaneActive || model?.canModifySelectedMarkup != true)
 
             Button("Delete Annotation") {
                 model?.deleteSelectedMarkup()
             }
             .keyboardShortcut(.delete, modifiers: .command)
-            .disabled(model?.canModifySelectedMarkup != true)
+            .disabled(!isPDFPaneActive || model?.canModifySelectedMarkup != true)
         }
 
         CommandMenu("Page") {

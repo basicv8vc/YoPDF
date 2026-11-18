@@ -419,20 +419,21 @@ final class WorkspaceTabSession: Identifiable, ObservableObject {
     @discardableResult
     func replaceEmptyPlaceholderWithMarkdown(
         resourceSession: MarkdownResourceSession,
-        associatedPDFURL: URL? = nil
+        associatedPDFURL: URL? = nil,
+        paneID: PaneID = PaneID()
     ) -> PaneID? {
         guard isEmptyPlaceholderTab,
               let (oldPaneID, oldEntry) = paneEntries.first,
               case let .pdf(oldPDFSession) = oldEntry
         else { return nil }
 
-        let newPaneID = PaneID()
         let newSession = MarkdownPaneSession(
-            paneID: newPaneID,
+            paneID: paneID,
             resourceSession: resourceSession,
             associatedPDFURL: associatedPDFURL
         )
 
+        cancelObserving(for: oldPaneID)
         oldPDFSession.paneModel.close()
         if oldPDFSession.resourceSession.activeLeaseCount == 0 {
             oldPDFSession.resourceSession.close()
@@ -440,12 +441,12 @@ final class WorkspaceTabSession: Identifiable, ObservableObject {
 
         paneEntries.removeValue(forKey: oldPaneID)
         documentModels.removeValue(forKey: oldPaneID)
-        paneEntries[newPaneID] = .markdown(newSession)
-        layoutTree = WorkspaceLayoutTree(leaf: newPaneID)
-        activePaneID = newPaneID
+        paneEntries[paneID] = .markdown(newSession)
+        layoutTree = WorkspaceLayoutTree(leaf: paneID)
+        activePaneID = paneID
         setupObserving(for: newSession)
         objectWillChange.send()
-        return newPaneID
+        return paneID
     }
 
     @discardableResult
@@ -1741,8 +1742,9 @@ final class WorkspaceWindowModel: ObservableObject {
 
         let current = activeTab
         if current.isEmptyPlaceholderTab,
-           let replacedPaneID = current.replaceEmptyPlaceholderWithMarkdown(
-               resourceSession: mdSession,
+           let replacedPaneID = replaceEmptyPlaceholderWithMarkdown(
+               in: current.id,
+               session: mdSession,
                associatedPDFURL: associatedPDFURL
            ) {
             // Transfer lease from temporary candidatePaneID to the real paneID.
@@ -1760,6 +1762,229 @@ final class WorkspaceWindowModel: ObservableObject {
         observeTabSession(newTab)
         objectWillChange.send()
         return .opened(tabID: newTab.id, paneID: candidatePaneID)
+    }
+
+    /// Replaces an empty placeholder tab with `markdownSession` while ensuring
+    /// the session is registered and leased in `markdownPool`.
+    @discardableResult
+    func replaceEmptyPlaceholderWithMarkdown(
+        in tabID: UUID? = nil,
+        session markdownSession: MarkdownResourceSession,
+        associatedPDFURL: URL? = nil
+    ) -> PaneID? {
+        let targetTab = tabID.flatMap { sessions[$0] } ?? activeTab
+        guard targetTab.isEmptyPlaceholderTab else { return nil }
+
+        let paneID = PaneID()
+        markdownPool.register(markdownSession, for: paneID)
+        guard let replacedPaneID = targetTab.replaceEmptyPlaceholderWithMarkdown(
+            resourceSession: markdownSession,
+            associatedPDFURL: associatedPDFURL,
+            paneID: paneID
+        ) else {
+            markdownPool.release(session: markdownSession, for: paneID)
+            return nil
+        }
+        objectWillChange.send()
+        return replacedPaneID
+    }
+
+    /// Creates a new Markdown document registered in `markdownPool` and opens it
+    /// in a split, empty placeholder tab, or new tab fallback.
+    @discardableResult
+    func createMarkdownNote(
+        at url: URL,
+        initialContent: String,
+        associatedPDFURL: URL? = nil,
+        in tabID: UUID? = nil,
+        adjacentTo targetPaneID: PaneID? = nil,
+        direction: LayoutInsertionDirection = .right,
+        availableSize: CGSize? = nil
+    ) -> Result<(tabID: UUID, paneID: PaneID), MarkdownLoadError> {
+        let seedPaneID = PaneID()
+        let createdSession: MarkdownResourceSession
+        switch markdownPool.create(at: url, initialContent: initialContent, for: seedPaneID) {
+        case let .success(created):
+            createdSession = created
+        case let .failure(error):
+            return .failure(error)
+        }
+
+        let targetTab = tabID.flatMap { sessions[$0] } ?? activeTab
+
+        if targetTab.hasLoadedContent,
+           case let .success(splitPaneID) = openMarkdownSessionInSplit(
+               session: createdSession,
+               associatedPDFURL: associatedPDFURL,
+               in: targetTab.id,
+               adjacentTo: targetPaneID ?? targetTab.activePaneID,
+               direction: direction,
+               availableSize: availableSize
+           ) {
+            createdSession.releaseLease(for: seedPaneID)
+            return .success((targetTab.id, splitPaneID))
+        }
+
+        if targetTab.isEmptyPlaceholderTab,
+           let replacedPaneID = replaceEmptyPlaceholderWithMarkdown(
+               in: targetTab.id,
+               session: createdSession,
+               associatedPDFURL: associatedPDFURL
+           ) {
+            createdSession.releaseLease(for: seedPaneID)
+            return .success((targetTab.id, replacedPaneID))
+        }
+
+        let opened = openMarkdownInNewTab(
+            session: createdSession,
+            associatedPDFURL: associatedPDFURL
+        )
+        createdSession.releaseLease(for: seedPaneID)
+        return .success(opened)
+    }
+
+    @discardableResult
+    func saveMarkdownAs(
+        _ session: MarkdownResourceSession,
+        to destination: URL,
+        overwrite: Bool = false
+    ) -> SaveOutcome {
+        markdownPool.saveAs(session, to: destination, overwrite: overwrite)
+    }
+
+    /// Resolves the target Markdown pane in `tabID` when citing a PDF at `pdfURL`.
+    ///
+    /// Priority:
+    /// 1. Open Markdown pane matching the PDF's `PaperNoteAssociation`. If an
+    ///    association exists for `pdfURL` but that note is not open in `tabID`,
+    ///    returns `nil` rather than writing into another paper's note.
+    /// 2. Open Markdown pane whose `associatedPDFURL` matches `pdfURL`.
+    /// 3. Unassociated Markdown pane in `tabID`.
+    func citationTargetMarkdownPane(
+        forPDF pdfURL: URL?,
+        in tabID: UUID? = nil
+    ) -> MarkdownPaneSession? {
+        guard let targetTab = sessions[tabID ?? activeTabID] else { return nil }
+
+        var orderedPanes: [MarkdownPaneSession] = []
+        if let activeMD = targetTab.activeMarkdownPaneSession {
+            orderedPanes.append(activeMD)
+        }
+        for leafID in targetTab.layoutTree.leafIDs {
+            if case let .markdown(mdPane) = targetTab.paneEntries[leafID],
+               mdPane.id != targetTab.activePaneID {
+                orderedPanes.append(mdPane)
+            }
+        }
+        guard !orderedPanes.isEmpty else { return nil }
+
+        let pdfCanonical = pdfURL?.resolvingSymlinksInPath().standardizedFileURL
+
+        if let pdfURL, let pdfCanonical {
+            if let association = noteAssociationStore.association(forPDF: pdfURL) {
+                let resolved = noteAssociationStore.resolveAssociation(association)
+                let expectedURL: URL
+                if case let .resolved(resolvedURL, _) = resolved.markdownResolution {
+                    expectedURL = resolvedURL
+                } else {
+                    expectedURL = association.markdownURL
+                }
+                let expectedCanonical = expectedURL.resolvingSymlinksInPath().standardizedFileURL
+                return orderedPanes.first { mdPane in
+                    mdPane.resourceSession.fileURL?
+                        .resolvingSymlinksInPath()
+                        .standardizedFileURL == expectedCanonical
+                }
+            }
+
+            if let matchingByPaneAssociation = orderedPanes.first(where: { mdPane in
+                mdPane.paneModel.associatedPDFURL?
+                    .resolvingSymlinksInPath()
+                    .standardizedFileURL == pdfCanonical
+            }) {
+                return matchingByPaneAssociation
+            }
+        }
+
+        return orderedPanes.first { mdPane in
+            guard mdPane.paneModel.associatedPDFURL == nil else { return false }
+            guard let mdURL = mdPane.resourceSession.fileURL else { return true }
+            let mdCanonical = mdURL.resolvingSymlinksInPath().standardizedFileURL
+            let linkedToDifferentPDF = noteAssociationStore.associations.contains { assoc in
+                let assocMDCanonical = assoc.markdownURL.resolvingSymlinksInPath().standardizedFileURL
+                let assocPDFCanonical = assoc.pdfURL.resolvingSymlinksInPath().standardizedFileURL
+                return assocMDCanonical == mdCanonical && assocPDFCanonical != pdfCanonical
+            }
+            return !linkedToDifferentPDF
+        }
+    }
+
+    /// Resolves the companion loaded PDF pane in `tabID` for `mdSession`,
+    /// preferring explicit `associatedPDFURL` and persisted `PaperNoteAssociation`
+    /// matches before falling back to `primaryPDFPaneSession`.
+    func companionPDFPane(
+        for mdSession: MarkdownPaneSession,
+        in tabID: UUID? = nil
+    ) -> PDFPaneSession? {
+        guard let targetTab = sessions[tabID ?? activeTabID] else { return nil }
+
+        func matchingLoadedPDF(for targetPDFURL: URL) -> PDFPaneSession? {
+            let targetCanonical = targetPDFURL.resolvingSymlinksInPath().standardizedFileURL
+            if let activePDF = targetTab.primaryPDFPaneSession,
+               activePDF.resourceSession.isLoaded,
+               activePDF.resourceSession.fileURL?.resolvingSymlinksInPath().standardizedFileURL == targetCanonical {
+                return activePDF
+            }
+            for leafID in targetTab.layoutTree.leafIDs {
+                if case let .pdf(pdfPane) = targetTab.paneEntries[leafID],
+                   pdfPane.resourceSession.isLoaded,
+                   pdfPane.resourceSession.fileURL?.resolvingSymlinksInPath().standardizedFileURL == targetCanonical {
+                    return pdfPane
+                }
+            }
+            return nil
+        }
+
+        if let associatedPDF = mdSession.paneModel.associatedPDFURL,
+           let matched = matchingLoadedPDF(for: associatedPDF) {
+            return matched
+        }
+
+        if let mdURL = mdSession.resourceSession.fileURL {
+            let mdCanonical = mdURL.resolvingSymlinksInPath().standardizedFileURL
+            if let assoc = noteAssociationStore.associations.first(where: {
+                $0.markdownURL.resolvingSymlinksInPath().standardizedFileURL == mdCanonical
+            }),
+               let matched = matchingLoadedPDF(for: assoc.pdfURL) {
+                return matched
+            }
+        }
+
+        if let fallback = targetTab.primaryPDFPaneSession, fallback.resourceSession.isLoaded {
+            return fallback
+        }
+        return nil
+    }
+
+    func canInsertCitation(into mdSession: MarkdownPaneSession) -> Bool {
+        mdSession.resourceSession.isLoaded
+            && !mdSession.resourceSession.isReadOnlyAtOpen
+            && mdSession.paneModel.configuration.isEditable
+    }
+
+    @discardableResult
+    func insertCitationText(_ citation: String, into mdSession: MarkdownPaneSession) -> Bool {
+        guard canInsertCitation(into: mdSession) else { return false }
+        let controller = mdSession.paneModel.editorController
+        _ = controller.focus()
+        if controller.insertText(citation) {
+            return true
+        }
+        let separator = mdSession.resourceSession.content.isEmpty
+            || mdSession.resourceSession.content.hasSuffix("\n") ? "" : "\n"
+        let updated = mdSession.resourceSession.content + separator + citation
+        mdSession.resourceSession.updateContent(updated, from: mdSession.id)
+        return true
     }
 
     /// Opens an already-created `MarkdownResourceSession` in a new tab (used when

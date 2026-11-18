@@ -43,8 +43,8 @@ final class PaperNoteMarkdownUITests: XCTestCase {
         app.typeKey(.downArrow, modifierFlags: .command)
         app.typeKey(.downArrow, modifierFlags: .command)
         XCTAssertTrue(
-            app.staticTexts["3 / 5"].waitForExistence(timeout: 5),
-            "PDF pane should navigate to page 3 / 5."
+            app.staticTexts["Page 3 of 5"].waitForExistence(timeout: 5),
+            "PDF pane should navigate to Page 3 of 5."
         )
 
         let openNoteButton = app.buttons["pdf-open-paper-note-button"]
@@ -83,18 +83,64 @@ final class PaperNoteMarkdownUITests: XCTestCase {
         // 3. Type additional note text into the Markdown editor, verify Undo/Redo, and save.
         let editorTextView = app.textViews.firstMatch
         XCTAssertTrue(editorTextView.waitForExistence(timeout: 5), "Markdown editor text view should exist.")
+
+        let editorValuePredicate = NSPredicate { element, _ in
+            guard let text = (element as? XCUIElement)?.value as? String else { return false }
+            return text.contains("./paper-note-smoke.pdf#page=3")
+        }
+        let citationExpectation = XCTNSPredicateExpectation(predicate: editorValuePredicate, object: editorTextView)
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [citationExpectation], timeout: 5),
+            .completed,
+            "Markdown editor should display inserted page 3 citation."
+        )
+
         editorTextView.click()
-        app.typeText("\n- Verified UI note persistence.")
+        editorTextView.typeText("\n- Verified UI note persistence.")
+
+        let typedPredicate = NSPredicate { element, _ in
+            guard let text = (element as? XCUIElement)?.value as? String else { return false }
+            return text.contains("Verified UI note persistence.")
+        }
+        let typedExpectation = XCTNSPredicateExpectation(predicate: typedPredicate, object: editorTextView)
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [typedExpectation], timeout: 5),
+            .completed,
+            "Markdown editor should contain typed note text."
+        )
+
+        // Exercise isolated Undo/Redo on the active Markdown editor.
+        app.typeKey("z", modifierFlags: .command)
+        let undonePredicate = NSPredicate { element, _ in
+            guard let text = (element as? XCUIElement)?.value as? String else { return false }
+            return !text.contains("Verified UI note persistence.")
+        }
+        let undoneExpectation = XCTNSPredicateExpectation(predicate: undonePredicate, object: editorTextView)
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [undoneExpectation], timeout: 5),
+            .completed,
+            "Cmd+Z should undo the typed Markdown edit."
+        )
+
+        app.typeKey("z", modifierFlags: [.command, .shift])
+        let redoneExpectation = XCTNSPredicateExpectation(predicate: typedPredicate, object: editorTextView)
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [redoneExpectation], timeout: 5),
+            .completed,
+            "Shift+Cmd+Z should redo the undone Markdown edit."
+        )
+
         app.typeKey("s", modifierFlags: .command)
 
         let savedDeadline = Date().addingTimeInterval(5)
         var savedText = ""
         while Date() < savedDeadline {
-            if let content = try? String(contentsOf: expectedNoteURL, encoding: .utf8),
-               content.contains("#page=3"),
-               content.contains("Verified UI note persistence.") {
+            if let content = try? String(contentsOf: expectedNoteURL, encoding: .utf8) {
                 savedText = content
-                break
+                if content.contains("#page=3"),
+                   content.contains("Verified UI note persistence.") {
+                    break
+                }
             }
             RunLoop.current.run(until: Date().addingTimeInterval(0.1))
         }
