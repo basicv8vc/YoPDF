@@ -34,7 +34,7 @@ final class PaperNoteMarkdownUITests: XCTestCase {
         app.activate()
 
         guard app.windows.firstMatch.waitForExistence(timeout: 20),
-              app.staticTexts[fixtureURL.lastPathComponent].waitForExistence(timeout: 20)
+              app.buttons[fixtureURL.lastPathComponent].waitForExistence(timeout: 20)
         else {
             return XCTFail("The reader window did not open the smoke test PDF.")
         }
