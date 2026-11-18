@@ -108,6 +108,26 @@ struct ClosePaneActionKey: FocusedValueKey {
     typealias Value = @MainActor () -> Void
 }
 
+struct ActiveUndoActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
+struct ActiveRedoActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
+struct OpenPaperNoteActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
+struct NewMarkdownNoteActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
+struct InsertCitationActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
 extension FocusedValues {
     var documentModel: PDFDocumentModel? {
         get { self[DocumentModelFocusKey.self] }
@@ -212,5 +232,30 @@ extension FocusedValues {
     var closePane: (@MainActor () -> Void)? {
         get { self[ClosePaneActionKey.self] }
         set { self[ClosePaneActionKey.self] = newValue }
+    }
+
+    var activeUndo: (@MainActor () -> Void)? {
+        get { self[ActiveUndoActionKey.self] }
+        set { self[ActiveUndoActionKey.self] = newValue }
+    }
+
+    var activeRedo: (@MainActor () -> Void)? {
+        get { self[ActiveRedoActionKey.self] }
+        set { self[ActiveRedoActionKey.self] = newValue }
+    }
+
+    var openPaperNote: (@MainActor () -> Void)? {
+        get { self[OpenPaperNoteActionKey.self] }
+        set { self[OpenPaperNoteActionKey.self] = newValue }
+    }
+
+    var newMarkdownNote: (@MainActor () -> Void)? {
+        get { self[NewMarkdownNoteActionKey.self] }
+        set { self[NewMarkdownNoteActionKey.self] = newValue }
+    }
+
+    var insertCitation: (@MainActor () -> Void)? {
+        get { self[InsertCitationActionKey.self] }
+        set { self[InsertCitationActionKey.self] = newValue }
     }
 }
