@@ -98,7 +98,6 @@ targets:
         SUFeedURL: "$(SPARKLE_FEED_URL)"
         SUPublicEDKey: "$(SPARKLE_PUBLIC_ED_KEY)"
         SUEnableAutomaticChecks: true
-        SUShowReleaseNotes: true
         SUAutomaticallyUpdate: false
         SUAllowsAutomaticUpdates: false
         SUVerifyUpdateBeforeExtraction: true

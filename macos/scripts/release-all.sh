@@ -219,11 +219,13 @@ RELEASE_URL="$(./scripts/release.sh "${RELEASE_ARGS[@]}" | tail -1)"
 # upload. It is committed and pushed right away: a feed that exists only in the
 # working tree leaves every installed copy checking a stale file.
 phase "appcast"
+APPCAST_ARGS=("$OUT_DIR")
+if [[ -n "$NOTES" ]]; then APPCAST_ARGS+=(--notes-file "$NOTES"); fi
 if [[ "$KEY_FROM_KEYCHAIN" == 1 ]]; then
   security find-generic-password -a ed25519 -s "https://sparkle-project.org" -w |
-    SPARKLE_ED_KEY_FILE=- ./scripts/appcast.sh "$OUT_DIR"
+    SPARKLE_ED_KEY_FILE=- ./scripts/appcast.sh "${APPCAST_ARGS[@]}"
 else
-  ./scripts/appcast.sh "$OUT_DIR"
+  ./scripts/appcast.sh "${APPCAST_ARGS[@]}"
 fi
 
 git -C "$REPO_ROOT" add appcast.xml

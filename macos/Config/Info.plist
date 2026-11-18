@@ -55,8 +55,6 @@
 	<string>$(SPARKLE_PUBLIC_ED_KEY)</string>
 	<key>SURequireSignedFeed</key>
 	<true/>
-	<key>SUShowReleaseNotes</key>
-	<true/>
 	<key>SUVerifyUpdateBeforeExtraction</key>
 	<true/>
 </dict>
