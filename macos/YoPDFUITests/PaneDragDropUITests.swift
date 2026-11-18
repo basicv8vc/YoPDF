@@ -9,6 +9,7 @@
 //  Apache-2.0 Open Source License.
 //
 
+import AppKit
 import CoreGraphics
 import PDFKit
 import XCTest
@@ -16,7 +17,64 @@ import XCTest
 @MainActor
 final class PaneDragDropUITests: XCTestCase {
 
-    private func launchTwoPaneWorkspace() throws -> (app: XCUIApplication, window: XCUIElement, fixtureURL: URL) {
+    private func applicationURL() throws -> URL {
+        var directory = Bundle(for: Self.self).bundleURL.deletingLastPathComponent()
+        while directory.path != "/" {
+            let candidate = directory.appendingPathComponent("YoPDF.app")
+            if FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+            directory.deleteLastPathComponent()
+        }
+        throw NSError(domain: "PaneDragDropUITests", code: 1, userInfo: [
+            NSLocalizedDescriptionKey: "Could not find YoPDF.app beside the test runner."
+        ])
+    }
+
+    @discardableResult
+    private func bringToForeground(_ app: XCUIApplication, at applicationURL: URL) -> Bool {
+        guard let bundleIdentifier = Bundle(url: applicationURL)?.bundleIdentifier else {
+            XCTFail("The built YoPDF app should have a bundle identifier.")
+            return false
+        }
+        guard let process = NSRunningApplication.runningApplications(
+            withBundleIdentifier: bundleIdentifier
+        ).first(where: { $0.bundleURL?.standardizedFileURL == applicationURL.standardizedFileURL }) else {
+            XCTFail("YoPDF should be running before UI interaction.")
+            return false
+        }
+        _ = process.activate(options: [.activateAllWindows])
+        app.activate()
+        let foreground = waitUntil {
+            NSWorkspace.shared.frontmostApplication?.processIdentifier == process.processIdentifier
+        }
+        XCTAssertTrue(foreground, "The built YoPDF process should be frontmost before drag/key events are sent.")
+        return foreground
+    }
+
+    private func launchApp(
+        arguments: [String] = []
+    ) async throws -> (app: XCUIApplication, applicationURL: URL) {
+        let appURL = try applicationURL()
+        guard let bundleIdentifier = Bundle(url: appURL)?.bundleIdentifier else {
+            throw NSError(domain: "PaneDragDropUITests", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "The built YoPDF app should have a bundle identifier."
+            ])
+        }
+        let app = XCUIApplication(bundleIdentifier: bundleIdentifier)
+        if app.state != .notRunning {
+            app.terminate()
+            _ = app.wait(for: .notRunning, timeout: 10)
+        }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.arguments = ["-ApplePersistenceIgnoreState", "YES"] + arguments
+        let process = try await NSWorkspace.shared.openApplication(at: appURL, configuration: configuration)
+        XCTAssertEqual(process.bundleURL?.standardizedFileURL, appURL.standardizedFileURL)
+        _ = process.activate(options: [.activateAllWindows])
+        app.activate()
+        _ = bringToForeground(app, at: appURL)
+        return (app, appURL)
+    }
+
+    private func launchTwoPaneWorkspace() async throws -> (app: XCUIApplication, applicationURL: URL, window: XCUIElement, fixtureURL: URL) {
         let fixtureURL = try PDFFixtureFactory.writeTemporaryPDF(
             pageCount: 6,
             named: "drag-drop-smoke",
@@ -25,18 +83,20 @@ final class PaneDragDropUITests: XCTestCase {
             }
         )
 
-        let app = XCUIApplication()
-        app.launchArguments = ["-ApplePersistenceIgnoreState", "YES"]
-        app.launchEnvironment["YOPDF_SCREENSHOT_PDF"] = fixtureURL.path
-        app.launch()
+        let (app, appURL) = try await launchApp()
+        let window = app.windows.firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 20), "The reader window should appear before opening the smoke PDF.")
 
-        guard app.windows.firstMatch.waitForExistence(timeout: 20),
-              app.buttons[fixtureURL.lastPathComponent].waitForExistence(timeout: 20)
-        else {
+        let openConfig = NSWorkspace.OpenConfiguration()
+        openConfig.arguments = ["-ApplePersistenceIgnoreState", "YES"]
+        _ = try await NSWorkspace.shared.open([fixtureURL], withApplicationAt: appURL, configuration: openConfig)
+
+        guard app.buttons[fixtureURL.lastPathComponent].waitForExistence(timeout: 20) else {
             throw NSError(domain: "PaneDragDropUITests", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "The reader window did not open the smoke PDF."
             ])
         }
+        _ = bringToForeground(app, at: appURL)
 
         let splitRightButton = app.buttons["pdf-split-right-button"]
         XCTAssertTrue(splitRightButton.waitForExistence(timeout: 10))
@@ -45,7 +105,7 @@ final class PaneDragDropUITests: XCTestCase {
             app.buttons["Vertical split divider"].waitForExistence(timeout: 10),
             "A two-pane side-by-side layout shows a vertical divider."
         )
-        return (app, app.windows.firstMatch, fixtureURL)
+        return (app, appURL, app.windows.firstMatch, fixtureURL)
     }
 
     /// The leftmost pane drag handle in the current two-pane layout.
@@ -65,15 +125,17 @@ final class PaneDragDropUITests: XCTestCase {
     /// Real-app smoke: drag Pane A's handle onto Pane B's lower half and
     /// verify the reorder commits — the divider flips from the side-by-side
     /// "Vertical split divider" to the stacked "Horizontal split divider".
-    func testPaneHandleDragCommitsIntraTabReorder() throws {
-        let (app, window, fixtureURL) = try launchTwoPaneWorkspace()
+    func testPaneHandleDragCommitsIntraTabReorder() async throws {
+        let (app, appURL, window, fixtureURL) = try await launchTwoPaneWorkspace()
         defer {
             app.terminate()
+            _ = app.wait(for: .notRunning, timeout: 5)
             try? FileManager.default.removeItem(at: fixtureURL.deletingLastPathComponent())
         }
 
         let sourceHandle = leftmostPaneHandle(in: app)
         XCTAssertTrue(sourceHandle.waitForExistence(timeout: 10), "Each pane exposes a drag handle.")
+        guard bringToForeground(app, at: appURL) else { return }
 
         // Drop into the lower half of the right-hand pane.
         let dropPoint = window.coordinate(withNormalizedOffset: CGVector(dx: 0.72, dy: 0.80))
@@ -93,15 +155,17 @@ final class PaneDragDropUITests: XCTestCase {
 
     /// A drag released outside every drop target must end without mutating
     /// the layout and leave the panes interactive.
-    func testDragReleasedOutsideTargetsLeavesLayoutUnchanged() throws {
-        let (app, window, fixtureURL) = try launchTwoPaneWorkspace()
+    func testDragReleasedOutsideTargetsLeavesLayoutUnchanged() async throws {
+        let (app, appURL, window, fixtureURL) = try await launchTwoPaneWorkspace()
         defer {
             app.terminate()
+            _ = app.wait(for: .notRunning, timeout: 5)
             try? FileManager.default.removeItem(at: fixtureURL.deletingLastPathComponent())
         }
 
         let sourceHandle = leftmostPaneHandle(in: app)
         XCTAssertTrue(sourceHandle.waitForExistence(timeout: 10), "Each pane exposes a drag handle.")
+        guard bringToForeground(app, at: appURL) else { return }
 
         // Release over the tab strip, outside every pane drop target.
         let outsidePoint = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.03))
@@ -129,8 +193,9 @@ final class PaneDragDropUITests: XCTestCase {
 
     private func launchTwoTabWorkspace(
         prefix: String
-    ) throws -> (
+    ) async throws -> (
         app: XCUIApplication,
+        applicationURL: URL,
         window: XCUIElement,
         firstTab: XCUIElement,
         secondTab: XCUIElement,
@@ -140,38 +205,48 @@ final class PaneDragDropUITests: XCTestCase {
         let firstURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 2, named: "\(prefix)-alpha-\(runID)")
         let secondURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 2, named: "\(prefix)-beta-\(runID)")
 
-        let app = XCUIApplication()
-        app.launchArguments = ["-ApplePersistenceIgnoreState", "YES"]
-        app.launchEnvironment["YOPDF_SCREENSHOT_PDF"] = firstURL.path
-        app.launch()
-        app.activate()
+        let (app, appURL) = try await launchApp()
 
         let window = app.windows.firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 20), "The reader window must appear before opening PDFs.")
+
+        let openConfig = NSWorkspace.OpenConfiguration()
+        openConfig.arguments = ["-ApplePersistenceIgnoreState", "YES"]
+        _ = try await NSWorkspace.shared.open([firstURL], withApplicationAt: appURL, configuration: openConfig)
+
         let firstTab = app.buttons[firstURL.lastPathComponent]
         XCTAssertTrue(firstTab.waitForExistence(timeout: 20), "First PDF tab must appear.")
 
-        app.open(secondURL)
+        _ = try await NSWorkspace.shared.open([secondURL], withApplicationAt: appURL, configuration: openConfig)
+
         let secondTab = app.buttons[secondURL.lastPathComponent]
         XCTAssertTrue(secondTab.waitForExistence(timeout: 15), "Second PDF tab must appear.")
-        XCTAssertLessThan(firstTab.frame.minX, secondTab.frame.minX)
+        _ = bringToForeground(app, at: appURL)
+        XCTAssertTrue(
+            waitUntil { firstTab.exists && secondTab.exists && firstTab.frame.minX < secondTab.frame.minX },
+            "Two tabs should be laid out in order."
+        )
 
         let cleanup = {
             app.terminate()
+            _ = app.wait(for: .notRunning, timeout: 5)
             try? FileManager.default.removeItem(at: firstURL.deletingLastPathComponent())
             try? FileManager.default.removeItem(at: secondURL.deletingLastPathComponent())
         }
-        return (app, window, firstTab, secondTab, cleanup)
+        return (app, appURL, window, firstTab, secondTab, cleanup)
     }
 
     /// Real-app regression: dragging an inactive single-pane PDF tab filename
     /// horizontally along the tab strip must reorder the tabs and activate it on release.
-    func testDraggingSinglePaneTabFilenameReordersTabs() throws {
-        let (_, _, firstTab, secondTab, cleanup) = try launchTwoTabWorkspace(prefix: "tab")
+    func testDraggingSinglePaneTabFilenameReordersTabs() async throws {
+        let (app, appURL, _, firstTab, secondTab, cleanup) = try await launchTwoTabWorkspace(prefix: "tab")
         defer { cleanup() }
+        guard bringToForeground(app, at: appURL) else { return }
 
         XCTAssertFalse(firstTab.isSelected, "First tab must start inactive after opening the second PDF.")
         XCTAssertTrue(secondTab.isSelected, "Second tab starts active after opening the second PDF.")
 
+        // Drag the inactive first tab's filename to the right of the active second tab.
         // Drag the inactive first tab's filename to the right of the active second tab.
         let afterSecond = secondTab.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5))
         firstTab
@@ -196,17 +271,62 @@ final class PaneDragDropUITests: XCTestCase {
         XCTAssertTrue(movedBack, "Dragging a tab filename left must reorder it before the other tab.")
     }
 
+    /// Real-app regression: dragging a multi-pane tab horizontally in the
+    /// unified titlebar row must still reorder tabs cleanly without tearing out
+    /// or dragging the hosting window.
+    func testDraggingMultiPaneTabFilenameReordersTabs() async throws {
+        let (app, appURL, _, firstTab, secondTab, cleanup) = try await launchTwoTabWorkspace(prefix: "multipane-tab")
+        defer { cleanup() }
+        guard bringToForeground(app, at: appURL) else { return }
+
+        XCTAssertTrue(secondTab.isSelected)
+        let splitRightButton = app.buttons["pdf-split-right-button"]
+        XCTAssertTrue(splitRightButton.waitForExistence(timeout: 10))
+        splitRightButton.click()
+        XCTAssertTrue(
+            app.buttons["Vertical split divider"].waitForExistence(timeout: 10),
+            "Splitting the second tab makes it a multi-pane tab."
+        )
+
+        let beforeFirst = firstTab.coordinate(withNormalizedOffset: CGVector(dx: 0.1, dy: 0.5))
+        secondTab
+            .coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.15, thenDragTo: beforeFirst)
+
+        let movedLeft = waitUntil {
+            firstTab.exists && secondTab.exists && secondTab.frame.minX < firstTab.frame.minX
+        }
+        XCTAssertTrue(
+            movedLeft,
+            "Dragging a multi-pane tab left in the unified titlebar must reorder it before the first tab."
+        )
+
+        let afterFirst = firstTab.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5))
+        secondTab
+            .coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.15, thenDragTo: afterFirst)
+
+        let movedBack = waitUntil {
+            firstTab.exists && secondTab.exists && firstTab.frame.minX < secondTab.frame.minX
+        }
+        XCTAssertTrue(
+            movedBack,
+            "Dragging a multi-pane tab right in the unified titlebar must reorder it after the other tab."
+        )
+    }
+
     /// Real-app regression: dragging a single-pane tab vertically out of the tab
     /// strip into the reader content must still tear out into a split pane.
-    func testDraggingSinglePaneTabDownIntoPaneCommitsSplit() throws {
-        let (app, window, firstTab, _, cleanup) = try launchTwoTabWorkspace(prefix: "tear")
+    func testDraggingSinglePaneTabDownIntoPaneCommitsSplit() async throws {
+        let (app, appURL, window, firstTab, _, cleanup) = try await launchTwoTabWorkspace(prefix: "tear")
         defer { cleanup() }
+        guard bringToForeground(app, at: appURL) else { return }
 
         // Drag the inactive first tab downward onto the right edge of the active pane.
-        let rightDropPoint = window.coordinate(withNormalizedOffset: CGVector(dx: 0.88, dy: 0.55))
+        let rightEdgeTarget = window.coordinate(withNormalizedOffset: CGVector(dx: 0.88, dy: 0.55))
         firstTab
             .coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-            .press(forDuration: 0.15, thenDragTo: rightDropPoint)
+            .press(forDuration: 0.15, thenDragTo: rightEdgeTarget)
 
         XCTAssertTrue(
             app.buttons["Vertical split divider"].waitForExistence(timeout: 10),
@@ -216,9 +336,10 @@ final class PaneDragDropUITests: XCTestCase {
 
     /// Real-app regression: starting a horizontal tab reorder and then tearing
     /// vertically into the PDF content must cancel reorder and commit a split.
-    func testDraggingSinglePaneTabHorizontallyThenDownIntoPaneCommitsSplit() throws {
-        let (app, window, firstTab, secondTab, cleanup) = try launchTwoTabWorkspace(prefix: "combo")
+    func testDraggingSinglePaneTabHorizontallyThenDownIntoPaneCommitsSplit() async throws {
+        let (app, appURL, window, firstTab, secondTab, cleanup) = try await launchTwoTabWorkspace(prefix: "combo")
         defer { cleanup() }
+        guard bringToForeground(app, at: appURL) else { return }
 
         let start = CGPoint(x: firstTab.frame.midX, y: firstTab.frame.midY)
         let horizontalMid = CGPoint(x: secondTab.frame.midX, y: firstTab.frame.midY)
@@ -236,9 +357,10 @@ final class PaneDragDropUITests: XCTestCase {
 
     /// Real-app regression: pressing Escape during a horizontal tab reorder must
     /// cancel the reorder and preserve both the original tab order and active tab.
-    func testDraggingSinglePaneTabEscapeCancelsReorder() throws {
-        let (_, _, firstTab, secondTab, cleanup) = try launchTwoTabWorkspace(prefix: "esc")
+    func testDraggingSinglePaneTabEscapeCancelsReorder() async throws {
+        let (app, appURL, _, firstTab, secondTab, cleanup) = try await launchTwoTabWorkspace(prefix: "esc")
         defer { cleanup() }
+        guard bringToForeground(app, at: appURL) else { return }
 
         XCTAssertFalse(firstTab.isSelected)
         XCTAssertTrue(secondTab.isSelected)

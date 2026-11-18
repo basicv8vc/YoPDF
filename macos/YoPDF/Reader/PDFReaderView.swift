@@ -34,7 +34,7 @@ private struct ReaderPDFDropDestination: ViewModifier {
     }
 }
 
-private struct SinglePaneTabDraggableModifier: ViewModifier {
+private struct TabDraggableModifier: ViewModifier {
     let tab: WorkspaceTabSession
     /// Fired directly for a plain left click that never became a drag. The
     /// click-to-activate path must be an explicit callback, not a synthesized
@@ -47,23 +47,20 @@ private struct SinglePaneTabDraggableModifier: ViewModifier {
     let tabReorder: TabStripDragCallbacks?
 
     func body(content: Content) -> some View {
-        if tab.layoutTree.paneCount == 1 {
-            // The title button hosts the AppKit drag source: horizontal drags
-            // inside the strip reorder tabs with live reflow, while dragging
-            // vertically out of the strip tears into a native pane-drag
-            // session. Plain clicks switch tabs through `onActivate`.
-            content.overlay {
-                PaneDragSource(
-                    payload: PaneDragPayload(kind: .tab, sourceTabID: tab.id, sourcePaneID: tab.activePaneID),
-                    previewTitle: tab.title,
-                    onDragStarted: { onDragStarted?() },
-                    onDragEnded: { onDragEnded?() },
-                    onClick: onActivate,
-                    tabReorder: tabReorder
-                )
-            }
-        } else {
-            content
+        // Every tab hosts the AppKit drag source so horizontal drags inside
+        // the titlebar strip reorder tabs cleanly without competing with window
+        // background dragging. Single-pane tabs additionally allow vertical
+        // tear-out into a native pane-drag session.
+        content.overlay {
+            PaneDragSource(
+                payload: PaneDragPayload(kind: .tab, sourceTabID: tab.id, sourcePaneID: tab.activePaneID),
+                previewTitle: tab.title,
+                onDragStarted: { onDragStarted?() },
+                onDragEnded: { onDragEnded?() },
+                onClick: onActivate,
+                tabReorder: tabReorder,
+                allowsNativeSession: tab.layoutTree.paneCount == 1
+            )
         }
     }
 }
@@ -116,12 +113,6 @@ private struct WorkspaceTabStrip: View {
     /// frames that the reflow is currently moving would feed the layout back
     /// into the hit test and make the strip oscillate.
     @State private var dragSnapshot: DragSnapshot?
-    /// Tracks whether SwiftUI still considers the drag gesture alive. Its
-    /// automatic reset is the only cancellation signal a `DragGesture`
-    /// offers: `.onEnded` is guaranteed only for successful ends, so a
-    /// gesture cancelled by the system never reaches it and would otherwise
-    /// leave the visual state above dangling — the defect the review flagged.
-    @GestureState private var gestureTracksDrag = false
 
     private struct DragSnapshot {
         let tabIDs: [UUID]
@@ -199,24 +190,6 @@ private struct WorkspaceTabStrip: View {
                 WindowTitlebarDragArea()
             }
         }
-        .onChange(of: gestureTracksDrag) { _, tracked in
-            guard !tracked else { return }
-            // A successful release runs .onEnded first, which clears the
-            // visual state inside its own commit transaction; the deferred
-            // check below therefore only fires for a cancelled gesture.
-            // Deferring by one runloop turn is what keeps the two exit paths
-            // distinguishable, because the gesture-state reset and .onEnded
-            // happen within the same turn.
-            DispatchQueue.main.async {
-                guard draggingTabID != nil else { return }
-                withAnimation(Self.reorderAnimation) {
-                    draggingTabID = nil
-                    dragTranslation = 0
-                    dropIndex = 0
-                    dragSnapshot = nil
-                }
-            }
-        }
     }
 
     // MARK: - Tabs
@@ -250,7 +223,7 @@ private struct WorkspaceTabStrip: View {
             // The drag overlay rides on the title button only. The close
             // button stays outside it so a plain click hits its own native
             // Button, and the drag handle covers the area users actually grab.
-            .modifier(SinglePaneTabDraggableModifier(
+            .modifier(TabDraggableModifier(
                 tab: tab,
                 onActivate: { workspace.activate(tabID: tab.id) },
                 onDragStarted: { onTabDragStarted?(tab) },
@@ -299,16 +272,7 @@ private struct WorkspaceTabStrip: View {
                 .accessibilityIdentifier("workspace-tab-close-\(tab.id.uuidString)")
             }
         }
-        // Multi-pane tabs do not host a `PaneDragSource` overlay, so they
-        // keep SwiftUI's capsule reorder gesture. Single-pane tabs handle
-        // horizontal reorder (including Esc cancellation) and vertical tear-out
-        // in `PaneDragSource` without a competing `DragGesture` eating key
-        // events or committing a duplicate reorder.
         .contentShape(Rectangle())
-        .simultaneousGesture(
-            reorderGesture(for: tab),
-            isEnabled: tab.layoutTree.paneCount > 1
-        )
         .contextMenu { tabContextMenu(for: tab) }
         .background(
             isActive ? Color.accentColor.opacity(0.16) : Color.clear,
@@ -346,23 +310,6 @@ private struct WorkspaceTabStrip: View {
             _ = workspace.moveTab(tabID: tab.id, direction: .next)
         }
         .disabled(workspace.tabs.count < 2)
-    }
-
-    private func reorderGesture(for tab: WorkspaceTabSession) -> some Gesture {
-        DragGesture(minimumDistance: 4, coordinateSpace: .named(Self.stripSpace))
-            .updating($gestureTracksDrag) { _, state, _ in
-                state = true
-            }
-            .onChanged { value in
-                updateTabReorder(
-                    tabID: tab.id,
-                    pointerX: value.location.x,
-                    translationX: value.translation.width
-                )
-            }
-            .onEnded { value in
-                commitTabReorder(tabID: tab.id, pointerX: value.location.x)
-            }
     }
 
     private func tabReorderPointerX(

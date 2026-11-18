@@ -29,12 +29,15 @@ struct TitlebarLayoutMetrics: Equatable {
 }
 
 enum TitlebarDoubleClickAction: Equatable {
+    case fill
     case zoom
     case miniaturize
     case none
 
     static func resolve(preference: String?) -> TitlebarDoubleClickAction {
         switch preference {
+        case "Fill":
+            return .fill
         case "Minimize":
             return .miniaturize
         case "None":
@@ -261,6 +264,15 @@ struct WindowTitlebarDragArea: NSViewRepresentable {
 @MainActor
 final class WindowTitlebarDragNSView: NSView {
 
+    var doubleClickPreferenceProvider: () -> String? = {
+        UserDefaults.standard.string(forKey: "AppleActionOnDoubleClick")
+    }
+    var doubleClickExecutor: (TitlebarDoubleClickAction, NSWindow) -> Void = { action, window in
+        performStandardDoubleClickAction(action, on: window)
+    }
+
+    private var pendingDoubleClick = false
+
     override var mouseDownCanMoveWindow: Bool { true }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
@@ -273,22 +285,45 @@ final class WindowTitlebarDragNSView: NSView {
             return
         }
         if event.clickCount == 2 {
-            performTitlebarDoubleClickAction(on: window)
+            pendingDoubleClick = true
             return
         }
+        pendingDoubleClick = false
         window.performDrag(with: event)
     }
 
-    private func performTitlebarDoubleClickAction(on window: NSWindow) {
-        switch TitlebarDoubleClickAction.resolve(
-            preference: UserDefaults.standard.string(forKey: "AppleActionOnDoubleClick")
-        ) {
+    override func mouseUp(with event: NSEvent) {
+        if pendingDoubleClick {
+            pendingDoubleClick = false
+            guard let window, event.clickCount == 2 else { return }
+            let action = TitlebarDoubleClickAction.resolve(preference: doubleClickPreferenceProvider())
+            doubleClickExecutor(action, window)
+            return
+        }
+        super.mouseUp(with: event)
+    }
+
+    /// Executes the resolved macOS titlebar double-click action on `window`.
+    /// `.zoom` and `.miniaturize` delegate directly to AppKit's standard window
+    /// actions, while `.fill` expands the window to the active screen's
+    /// `visibleFrame` because `.fullSizeContentView` + transparent titlebars
+    /// suppress AppKit's private titlebar double-click dispatcher and AppKit
+    /// exposes no public `performFill:` selector.
+    static func performStandardDoubleClickAction(_ action: TitlebarDoubleClickAction, on window: NSWindow) {
+        switch action {
+        case .fill:
+            guard !window.styleMask.contains(.fullScreen),
+                  let screen = window.screen ?? NSScreen.main
+            else { return }
+            let targetFrame = screen.visibleFrame
+            guard window.frame != targetFrame else { return }
+            window.setFrame(targetFrame, display: true, animate: true)
+        case .zoom:
+            window.performZoom(nil)
         case .miniaturize:
             window.performMiniaturize(nil)
         case .none:
             break
-        case .zoom:
-            window.performZoom(nil)
         }
     }
 }

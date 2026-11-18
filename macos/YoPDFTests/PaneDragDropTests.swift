@@ -2114,6 +2114,42 @@ final class PaneDragDropTests: XCTestCase {
         XCTAssertEqual(dragEndedCount, 1)
     }
 
+    func testMultiPaneTabDisablesNativeSessionWhilePreservingHorizontalReorder() throws {
+        let source = PaneDragSourceView(frame: NSRect(x: 0, y: 0, width: 120, height: 28))
+        source.allowsNativeSession = false
+        var dragStartedCount = 0
+        var changedCount = 0
+        var endedEvents: [(CGFloat, CGFloat)] = []
+        var cancelledCount = 0
+        var startedSessions: [[NSDraggingItem]] = []
+
+        source.onDragStarted = { dragStartedCount += 1 }
+        source.draggingSessionStarter = { items, _ in
+            startedSessions.append(items)
+        }
+        source.tabReorder = TabStripDragCallbacks(
+            canReorder: { true },
+            onReorderChanged: { _, _ in changedCount += 1 },
+            onReorderEnded: { startX, dx in endedEvents.append((startX, dx)) },
+            onReorderCancelled: { cancelledCount += 1 }
+        )
+
+        source.mouseDown(with: try makeMouseEvent(.leftMouseDown, at: NSPoint(x: 30, y: 14), number: 1))
+        source.mouseDragged(with: try makeMouseEvent(.leftMouseDragged, at: NSPoint(x: 65, y: 14), number: 2))
+        // Even if the pointer dips below the titlebar strip vertically, a multi-pane
+        // tab must continue horizontal reordering instead of starting a native pane session.
+        source.mouseDragged(with: try makeMouseEvent(.leftMouseDragged, at: NSPoint(x: 95, y: -24), number: 3))
+        source.mouseUp(with: try makeMouseEvent(.leftMouseUp, at: NSPoint(x: 95, y: -24), number: 4, pressure: 0))
+
+        XCTAssertEqual(dragStartedCount, 0)
+        XCTAssertTrue(startedSessions.isEmpty)
+        XCTAssertEqual(cancelledCount, 0)
+        XCTAssertEqual(changedCount, 2)
+        XCTAssertEqual(endedEvents.count, 1)
+        XCTAssertEqual(endedEvents[0].0, 30, accuracy: 0.001)
+        XCTAssertEqual(endedEvents[0].1, 65, accuracy: 0.001)
+    }
+
     private func makeMouseEvent(
         _ type: NSEvent.EventType,
         at location: NSPoint,
