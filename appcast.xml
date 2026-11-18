@@ -6,6 +6,15 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>YoPDF</title>
         <item>
+            <title>2026.11.18</title>
+            <pubDate>Wed, 18 Nov 2026 11:49:56 +0900</pubDate>
+            <link>https://github.com/basicv8vc/YoPDF/releases</link>
+            <sparkle:version>12</sparkle:version>
+            <sparkle:shortVersionString>2026.11.18</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.18/YoPDF-2026.11.18-build12-universal.dmg" length="7299854" type="application/octet-stream" sparkle:edSignature="VZLxiOYf1ju3khAkJd1knbAsuebYIXxD0zw5n63xVGjhA/RaGRRaCCWe9EQ7GWCj6AtQSnK186H/VUzWLTYZBQ=="/>
+        </item>
+        <item>
             <title>2026.11.17</title>
             <pubDate>Tue, 17 Nov 2026 23:18:10 +0900</pubDate>
             <link>https://github.com/basicv8vc/YoPDF/releases</link>
@@ -23,18 +32,9 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
             <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.16/YoPDF-2026.11.16-build10-universal.dmg" length="7236912" type="application/octet-stream" sparkle:edSignature="DcZaLycg7zRYLggzoPO8QKbIy2Ml0qRm2gS2o9TeLawP2YmhMoJrWWPY3G0kbh4X0pJwaQAZkU+Bvx6ehXDWDQ=="/>
         </item>
-        <item>
-            <title>2026.11.13</title>
-            <pubDate>Fri, 13 Nov 2026 15:37:34 +0900</pubDate>
-            <link>https://github.com/basicv8vc/YoPDF/releases</link>
-            <sparkle:version>9</sparkle:version>
-            <sparkle:shortVersionString>2026.11.13</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.13/YoPDF-2026.11.13-build9-universal.dmg" length="6861844" type="application/octet-stream" sparkle:edSignature="y3s4GuuUKPcpjj75zxwUUo71dAfyLdoozzFPwIpyaUOCnH7NUlLS8exIVyXoNfmZ03f0g/4FSOY/XJkWVCrVDw=="/>
-        </item>
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: 6sNwf58MdGFjxCCjiZK4sGyhx9+hPfBoV78khe5QINetlOoWAqCBAXkX4oDl4ZRuV7Al7dcdpiSxa9IRgqQoAg==
-length: 2539
+edSignature: SozWgTfENh9b0iQ9gBu5BF/yD1p9G8lEFVQvRN195mmu5ghbxLWXFrye/MHaiIic4Pp+Tc2AAuWo47e760lnDQ==
+length: 2541
 -->
