@@ -1919,9 +1919,12 @@ final class WorkspaceWindowModel: ObservableObject {
         }
     }
 
-    /// Resolves the companion loaded PDF pane in `tabID` for `mdSession`,
-    /// preferring explicit `associatedPDFURL` and persisted `PaperNoteAssociation`
-    /// matches before falling back to `primaryPDFPaneSession`.
+    /// Resolves the companion loaded PDF pane in `tabID` for `mdSession`.
+    ///
+    /// When `mdSession` has a persisted `PaperNoteAssociation` or explicit
+    /// `associatedPDFURL`, citations strictly target that PDF and return `nil`
+    /// if it is not open in `tabID`, rather than citing an unrelated PDF. Only
+    /// unassociated standalone Markdown panes fall back to `primaryPDFPaneSession`.
     func companionPDFPane(
         for mdSession: MarkdownPaneSession,
         in tabID: UUID? = nil
@@ -1945,19 +1948,17 @@ final class WorkspaceWindowModel: ObservableObject {
             return nil
         }
 
-        if let associatedPDF = mdSession.paneModel.associatedPDFURL,
-           let matched = matchingLoadedPDF(for: associatedPDF) {
-            return matched
-        }
-
         if let mdURL = mdSession.resourceSession.fileURL {
             let mdCanonical = mdURL.resolvingSymlinksInPath().standardizedFileURL
             if let assoc = noteAssociationStore.associations.first(where: {
                 $0.markdownURL.resolvingSymlinksInPath().standardizedFileURL == mdCanonical
-            }),
-               let matched = matchingLoadedPDF(for: assoc.pdfURL) {
-                return matched
+            }) {
+                return matchingLoadedPDF(for: assoc.pdfURL)
             }
+        }
+
+        if let associatedPDF = mdSession.paneModel.associatedPDFURL {
+            return matchingLoadedPDF(for: associatedPDF)
         }
 
         if let fallback = targetTab.primaryPDFPaneSession, fallback.resourceSession.isLoaded {
