@@ -14,6 +14,7 @@ struct PDFReaderCommands: Commands {
     @ObservedObject private var recentDocuments: RecentDocumentsStore
 
     @FocusedValue(\.documentModel) private var model
+    @FocusedValue(\.activePaneKind) private var activePaneKind
     @FocusedValue(\.openDocument) private var openDocument
     @FocusedValue(\.newWorkspaceTab) private var newWorkspaceTab
     @FocusedValue(\.closeWorkspaceTab) private var closeWorkspaceTab
@@ -34,6 +35,11 @@ struct PDFReaderCommands: Commands {
     @FocusedValue(\.splitRight) private var splitRight
     @FocusedValue(\.splitDown) private var splitDown
     @FocusedValue(\.closePane) private var closePane
+    @FocusedValue(\.activeUndo) private var activeUndo
+    @FocusedValue(\.activeRedo) private var activeRedo
+    @FocusedValue(\.openPaperNote) private var openPaperNote
+    @FocusedValue(\.newMarkdownNote) private var newMarkdownNote
+    @FocusedValue(\.insertCitation) private var insertCitation
 
     init(updateController: SparkleUpdateController, recentDocuments: RecentDocumentsStore) {
         self.updateController = updateController
@@ -50,11 +56,17 @@ struct PDFReaderCommands: Commands {
             .keyboardShortcut("t", modifiers: .command)
             .disabled(newWorkspaceTab == nil)
 
-            Button("Open PDF…") {
+            Button("Open…") {
                 openDocument?()
             }
             .keyboardShortcut("o", modifiers: .command)
             .disabled(openDocument == nil)
+
+            Button("New Markdown Note…") {
+                newMarkdownNote?()
+            }
+            .keyboardShortcut("m", modifiers: [.command, .option])
+            .disabled(newMarkdownNote == nil)
 
             Menu("Open Recent") {
                 if recentDocuments.items.isEmpty {
@@ -125,21 +137,21 @@ struct PDFReaderCommands: Commands {
             .disabled((workspaceTabMove?.tabCount ?? 0) < 2)
         }
 
-        // Annotation edits use the model's own history rather than PDFKit's
-        // UndoManager. A cross-page mark is one entry, a recolour gesture is one
-        // entry, and the history is cleared when Save As replaces the document.
+        // Annotation edits and Markdown edits are both routed through
+        // `activeUndo` / `activeRedo` so an empty Markdown undo stack never
+        // falls back to undoing edits on a companion PDF pane.
         CommandGroup(replacing: .undoRedo) {
             Button("Undo") {
-                model?.undoMarkup()
+                activeUndo?()
             }
             .keyboardShortcut("z", modifiers: .command)
-            .disabled(model?.canUndoMarkup != true)
+            .disabled(activeUndo == nil)
 
             Button("Redo") {
-                model?.redoMarkup()
+                activeRedo?()
             }
             .keyboardShortcut("z", modifiers: [.command, .shift])
-            .disabled(model?.canRedoMarkup != true)
+            .disabled(activeRedo == nil)
         }
 
         // Replaces the standard Save/Save As items: those would call into AppKit
@@ -150,13 +162,13 @@ struct PDFReaderCommands: Commands {
                 saveDocument?()
             }
             .keyboardShortcut("s", modifiers: .command)
-            .disabled(model?.isLoaded != true)
+            .disabled(saveDocument == nil)
 
             Button("Save As…") {
                 saveDocumentAs?()
             }
             .keyboardShortcut("s", modifiers: [.command, .shift])
-            .disabled(model?.isLoaded != true)
+            .disabled(saveDocumentAs == nil)
 
             Divider()
 
@@ -167,11 +179,11 @@ struct PDFReaderCommands: Commands {
         }
 
         CommandGroup(after: .pasteboard) {
-            Button("Find in PDF") {
+            Button("Find…") {
                 findInDocument?()
             }
             .keyboardShortcut("f", modifiers: .command)
-            .disabled(model?.isLoaded != true)
+            .disabled(findInDocument == nil)
 
             Button("Find Next") {
                 findNextSearchResult?()
@@ -187,43 +199,45 @@ struct PDFReaderCommands: Commands {
         }
 
         CommandMenu("Annotate") {
+            let isPDFPaneActive = (activePaneKind ?? .pdf) == .pdf
+
             Button("Highlight") {
                 highlightSelection?()
             }
             .keyboardShortcut("h", modifiers: [.command, .shift])
-            .disabled(model?.canAddMarkup(.highlight) != true)
+            .disabled(!isPDFPaneActive || highlightSelection == nil || model?.canAddMarkup(.highlight) != true)
 
             Button("Underline") {
                 underlineSelection?()
             }
             .keyboardShortcut("u", modifiers: [.command, .shift])
-            .disabled(model?.canAddMarkup(.underline) != true)
+            .disabled(!isPDFPaneActive || underlineSelection == nil || model?.canAddMarkup(.underline) != true)
 
             // No key equivalent: ⇧⌘S is already Save As. Preview also leaves
             // Strike Out unshortcut.
             Button("Strike Out") {
                 model?.addMarkup(.strikeOut)
             }
-            .disabled(model?.canAddMarkup(.strikeOut) != true)
+            .disabled(!isPDFPaneActive || model?.canAddMarkup(.strikeOut) != true)
 
             Button("Add Note") {
                 addNote?()
             }
             .keyboardShortcut("n", modifiers: [.command, .shift])
-            .disabled(model?.canCreateNote != true)
+            .disabled(!isPDFPaneActive || addNote == nil || model?.canCreateNote != true)
 
             Divider()
 
             Button("Convert Annotation") {
                 model?.convertSelectedMarkup()
             }
-            .disabled(model?.canModifySelectedMarkup != true)
+            .disabled(!isPDFPaneActive || model?.canModifySelectedMarkup != true)
 
             Button("Delete Annotation") {
                 model?.deleteSelectedMarkup()
             }
             .keyboardShortcut(.delete, modifiers: .command)
-            .disabled(model?.canModifySelectedMarkup != true)
+            .disabled(!isPDFPaneActive || model?.canModifySelectedMarkup != true)
         }
 
         CommandMenu("Page") {
@@ -292,6 +306,20 @@ struct PDFReaderCommands: Commands {
         }
 
         CommandMenu("Layout") {
+            Button("Open Paper Note") {
+                openPaperNote?()
+            }
+            .keyboardShortcut("m", modifiers: [.command, .shift])
+            .disabled(openPaperNote == nil)
+
+            Button("Cite in Paper Note") {
+                insertCitation?()
+            }
+            .keyboardShortcut("i", modifiers: [.command, .shift])
+            .disabled(insertCitation == nil)
+
+            Divider()
+
             Button("Split Right") {
                 splitRight?()
             }

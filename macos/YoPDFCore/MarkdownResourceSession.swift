@@ -1190,6 +1190,22 @@ public final class MarkdownResourcePool: ObservableObject {
             eventCancellables.removeValue(forKey: session.id)
         }
     }
+
+    /// Saves `session` to `destination` only if no other active session in this
+    /// pool currently owns `destination`, preserving the single-writer invariant.
+    @discardableResult
+    public func saveAs(
+        _ session: MarkdownResourceSession,
+        to destination: URL,
+        overwrite: Bool = false
+    ) -> SaveOutcome {
+        if let existing = self.session(for: destination), existing !== session {
+            return .failed(.store(.stagingFailed(
+                "“\(destination.lastPathComponent)” is currently open in another pane."
+            )))
+        }
+        return session.saveAs(to: destination, overwrite: overwrite)
+    }
 }
 
 private extension DocumentStoreError {
