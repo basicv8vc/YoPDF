@@ -1529,18 +1529,6 @@ struct PDFReaderView: View {
                 Divider().frame(height: 18)
             }
 
-            Picker("Theme", selection: Binding(
-                get: { mdModel.configuration.theme },
-                set: { mdModel.configuration.theme = $0 }
-            )) {
-                Text("System").tag(MarkdownColorTheme.system)
-                Text("Light").tag(MarkdownColorTheme.light)
-                Text("Dark").tag(MarkdownColorTheme.dark)
-            }
-            .pickerStyle(.segmented)
-            .frame(maxWidth: 190)
-            .accessibilityIdentifier("markdown-theme-picker")
-
             Button {
                 mdModel.configuration.fontSize = max(10, mdModel.configuration.fontSize - 1)
             } label: {
