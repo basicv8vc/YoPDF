@@ -1808,4 +1808,330 @@ final class PaneDragDropTests: XCTestCase {
         XCTAssertTrue(tab1.observedPaneIDs.isEmpty)
         XCTAssertTrue(tab2.observedPaneIDs.isEmpty)
     }
+
+    // MARK: - 21. Tab Strip Reorder vs Tear-Out in PaneDragSourceView
+
+    func testTabSourceHorizontalDragReordersWithoutStartingNativeSession() {
+        let source = PaneDragSourceView(frame: NSRect(x: 0, y: 0, width: 120, height: 28))
+        var dragStartedCount = 0
+        var clickCount = 0
+        var changedEvents: [(CGFloat, CGFloat)] = []
+        var endedEvents: [(CGFloat, CGFloat)] = []
+        var cancelledCount = 0
+
+        source.onDragStarted = { dragStartedCount += 1 }
+        source.onClick = { clickCount += 1 }
+        source.tabReorder = TabStripDragCallbacks(
+            canReorder: { true },
+            onReorderChanged: { startX, dx in changedEvents.append((startX, dx)) },
+            onReorderEnded: { startX, dx in endedEvents.append((startX, dx)) },
+            onReorderCancelled: { cancelledCount += 1 }
+        )
+
+        let down = NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: NSPoint(x: 30, y: 14),
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1
+        )!
+        let drag1 = NSEvent.mouseEvent(
+            with: .leftMouseDragged,
+            location: NSPoint(x: 55, y: 12),
+            modifierFlags: [],
+            timestamp: 0.01,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 2,
+            clickCount: 1,
+            pressure: 1
+        )!
+        let drag2 = NSEvent.mouseEvent(
+            with: .leftMouseDragged,
+            location: NSPoint(x: 90, y: 10),
+            modifierFlags: [],
+            timestamp: 0.02,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 3,
+            clickCount: 1,
+            pressure: 1
+        )!
+        let up = NSEvent.mouseEvent(
+            with: .leftMouseUp,
+            location: NSPoint(x: 90, y: 10),
+            modifierFlags: [],
+            timestamp: 0.03,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 4,
+            clickCount: 1,
+            pressure: 0
+        )!
+
+        source.mouseDown(with: down)
+        source.mouseDragged(with: drag1)
+        source.mouseDragged(with: drag2)
+        source.mouseUp(with: up)
+
+        XCTAssertEqual(dragStartedCount, 0, "Horizontal tab drag must reorder instead of starting NSDraggingSession.")
+        XCTAssertEqual(clickCount, 0, "A completed reorder drag must not trigger a click.")
+        XCTAssertEqual(cancelledCount, 0)
+        XCTAssertEqual(changedEvents.count, 2)
+        XCTAssertEqual(changedEvents[0].0, 30, accuracy: 0.001)
+        XCTAssertEqual(changedEvents[0].1, 25, accuracy: 0.001)
+        XCTAssertEqual(changedEvents[1].0, 30, accuracy: 0.001)
+        XCTAssertEqual(changedEvents[1].1, 60, accuracy: 0.001)
+        XCTAssertEqual(endedEvents.count, 1)
+        XCTAssertEqual(endedEvents[0].0, 30, accuracy: 0.001)
+        XCTAssertEqual(endedEvents[0].1, 60, accuracy: 0.001)
+    }
+
+    func testTabSourcePlainClickStillActivatesWithTabReorderConfigured() {
+        let source = PaneDragSourceView(frame: NSRect(x: 0, y: 0, width: 120, height: 28))
+        var dragStartedCount = 0
+        var clickCount = 0
+        var reorderCallCount = 0
+
+        source.onDragStarted = { dragStartedCount += 1 }
+        source.onClick = { clickCount += 1 }
+        source.tabReorder = TabStripDragCallbacks(
+            canReorder: { true },
+            onReorderChanged: { _, _ in reorderCallCount += 1 },
+            onReorderEnded: { _, _ in reorderCallCount += 1 },
+            onReorderCancelled: { reorderCallCount += 1 }
+        )
+
+        let down = NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: NSPoint(x: 20, y: 14),
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1
+        )!
+        let up = NSEvent.mouseEvent(
+            with: .leftMouseUp,
+            location: NSPoint(x: 21, y: 14),
+            modifierFlags: [],
+            timestamp: 0.01,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 2,
+            clickCount: 1,
+            pressure: 0
+        )!
+
+        source.mouseDown(with: down)
+        source.mouseUp(with: up)
+
+        XCTAssertEqual(clickCount, 1)
+        XCTAssertEqual(dragStartedCount, 0)
+        XCTAssertEqual(reorderCallCount, 0)
+    }
+
+    func testTabSourceTearOutThresholdAndWindowRemovalCancellation() {
+        let source = PaneDragSourceView(frame: NSRect(x: 0, y: 0, width: 120, height: 28))
+        var cancelledCount = 0
+
+        source.tabReorder = TabStripDragCallbacks(
+            canReorder: { true },
+            onReorderChanged: { _, _ in },
+            onReorderEnded: { _, _ in },
+            onReorderCancelled: { cancelledCount += 1 }
+        )
+
+        XCTAssertFalse(source.shouldTearOutTabDrag(atLocalPoint: NSPoint(x: 50, y: 14)))
+        XCTAssertFalse(source.shouldTearOutTabDrag(atLocalPoint: NSPoint(x: 50, y: -10)))
+        XCTAssertTrue(source.shouldTearOutTabDrag(atLocalPoint: NSPoint(x: 50, y: -20)))
+        XCTAssertTrue(source.shouldTearOutTabDrag(atLocalPoint: NSPoint(x: 50, y: 60)))
+
+        let down = NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: NSPoint(x: 20, y: 14),
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1
+        )!
+        let drag = NSEvent.mouseEvent(
+            with: .leftMouseDragged,
+            location: NSPoint(x: 45, y: 14),
+            modifierFlags: [],
+            timestamp: 0.01,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 2,
+            clickCount: 1,
+            pressure: 1
+        )!
+
+        source.mouseDown(with: down)
+        source.mouseDragged(with: drag)
+        source.viewWillMove(toWindow: nil)
+
+        XCTAssertEqual(cancelledCount, 1, "Detaching the drag source mid-reorder must cancel the reorder state.")
+    }
+
+    func testTabSourceEscapeCancelsReorderAndSuppressesMouseUpCommit() throws {
+        let source = PaneDragSourceView(frame: NSRect(x: 0, y: 0, width: 120, height: 28))
+        var dragStartedCount = 0
+        var clickCount = 0
+        var changedCount = 0
+        var endedCount = 0
+        var cancelledCount = 0
+
+        source.onDragStarted = { dragStartedCount += 1 }
+        source.onClick = { clickCount += 1 }
+        source.tabReorder = TabStripDragCallbacks(
+            canReorder: { true },
+            onReorderChanged: { _, _ in changedCount += 1 },
+            onReorderEnded: { _, _ in endedCount += 1 },
+            onReorderCancelled: { cancelledCount += 1 }
+        )
+
+        source.mouseDown(with: try makeMouseEvent(.leftMouseDown, at: NSPoint(x: 20, y: 14), number: 1))
+        source.mouseDragged(with: try makeMouseEvent(.leftMouseDragged, at: NSPoint(x: 55, y: 14), number: 2))
+        XCTAssertEqual(changedCount, 1)
+
+        let esc = try XCTUnwrap(
+            NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: [],
+                timestamp: 0.02,
+                windowNumber: 0,
+                context: nil,
+                characters: "\u{1b}",
+                charactersIgnoringModifiers: "\u{1b}",
+                isARepeat: false,
+                keyCode: 53
+            )
+        )
+        source.keyDown(with: esc)
+        XCTAssertEqual(cancelledCount, 1, "Pressing Escape mid-reorder must cancel the active reorder.")
+
+        // Trailing drags and release after Escape must neither update nor commit reorder.
+        source.mouseDragged(with: try makeMouseEvent(.leftMouseDragged, at: NSPoint(x: 90, y: 14), number: 3))
+        source.mouseUp(with: try makeMouseEvent(.leftMouseUp, at: NSPoint(x: 90, y: 14), number: 4, pressure: 0))
+
+        XCTAssertEqual(changedCount, 1)
+        XCTAssertEqual(endedCount, 0, "Release after Escape must not commit reorder.")
+        XCTAssertEqual(clickCount, 0, "Release after cancelled drag must not fire click.")
+        XCTAssertEqual(dragStartedCount, 0)
+
+        // Subsequent plain click works normally once returned to idle.
+        source.mouseDown(with: try makeMouseEvent(.leftMouseDown, at: NSPoint(x: 20, y: 14), number: 5))
+        source.mouseUp(with: try makeMouseEvent(.leftMouseUp, at: NSPoint(x: 20, y: 14), number: 6, pressure: 0))
+        XCTAssertEqual(clickCount, 1)
+
+        // Responder cancelOperation(_:) also cancels an active reorder cleanly.
+        source.mouseDown(with: try makeMouseEvent(.leftMouseDown, at: NSPoint(x: 20, y: 14), number: 7))
+        source.mouseDragged(with: try makeMouseEvent(.leftMouseDragged, at: NSPoint(x: 60, y: 14), number: 8))
+        source.cancelOperation(nil)
+        source.mouseUp(with: try makeMouseEvent(.leftMouseUp, at: NSPoint(x: 60, y: 14), number: 9, pressure: 0))
+        XCTAssertEqual(cancelledCount, 2)
+        XCTAssertEqual(endedCount, 0)
+        XCTAssertEqual(clickCount, 1)
+    }
+
+    func testTabSourceHorizontalReorderTransitionsToNativeSessionOnVerticalTearOut() throws {
+        let source = PaneDragSourceView(frame: NSRect(x: 0, y: 0, width: 120, height: 28))
+        let expectedTabID = UUID()
+        let expectedPaneID = PaneID()
+        var dragStartedCount = 0
+        var dragEndedCount = 0
+        var clickCount = 0
+        var changedCount = 0
+        var endedCount = 0
+        var cancelledCount = 0
+        var startedSessions: [[NSDraggingItem]] = []
+
+        source.makePayload = {
+            PaneDragPayload(kind: .tab, sourceTabID: expectedTabID, sourcePaneID: expectedPaneID)
+        }
+        source.previewTitle = { "TearOut.pdf" }
+        source.onDragStarted = { dragStartedCount += 1 }
+        source.onDragEnded = { dragEndedCount += 1 }
+        source.onClick = { clickCount += 1 }
+        source.draggingSessionStarter = { items, _ in
+            startedSessions.append(items)
+        }
+        source.tabReorder = TabStripDragCallbacks(
+            canReorder: { true },
+            onReorderChanged: { _, _ in changedCount += 1 },
+            onReorderEnded: { _, _ in endedCount += 1 },
+            onReorderCancelled: { cancelledCount += 1 }
+        )
+
+        source.mouseDown(with: try makeMouseEvent(.leftMouseDown, at: NSPoint(x: 30, y: 14), number: 1))
+        source.mouseDragged(with: try makeMouseEvent(.leftMouseDragged, at: NSPoint(x: 65, y: 14), number: 2))
+
+        XCTAssertEqual(changedCount, 1)
+        XCTAssertEqual(cancelledCount, 0)
+        XCTAssertEqual(dragStartedCount, 0)
+        XCTAssertEqual(startedSessions.count, 0)
+
+        // Now tear vertically out of the tab strip below `tabTearOutBelowMargin` (16pt).
+        source.mouseDragged(with: try makeMouseEvent(.leftMouseDragged, at: NSPoint(x: 65, y: -20), number: 3))
+
+        XCTAssertEqual(cancelledCount, 1, "Tearing out mid-reorder must cancel the horizontal reorder preview.")
+        XCTAssertEqual(dragStartedCount, 1, "Tearing out must start exactly one native drag session.")
+        XCTAssertEqual(startedSessions.count, 1)
+        XCTAssertEqual(changedCount, 1)
+
+        let item = try XCTUnwrap(startedSessions.first?.first)
+        let pasteboardItem = try XCTUnwrap(item.item as? NSPasteboardItem)
+        let encoded = try XCTUnwrap(
+            pasteboardItem.data(forType: NSPasteboard.PasteboardType(UTType.yoPDFPaneDrag.identifier))
+        )
+        let decoded = try JSONDecoder().decode(PaneDragPayload.self, from: encoded)
+        XCTAssertEqual(decoded.kind, .tab)
+        XCTAssertEqual(decoded.sourceTabID, expectedTabID)
+        XCTAssertEqual(decoded.sourcePaneID, expectedPaneID)
+
+        // Further motion and release belong to the native session and must not re-fire callbacks.
+        source.mouseDragged(with: try makeMouseEvent(.leftMouseDragged, at: NSPoint(x: 80, y: -40), number: 4))
+        source.mouseUp(with: try makeMouseEvent(.leftMouseUp, at: NSPoint(x: 80, y: -40), number: 5, pressure: 0))
+
+        XCTAssertEqual(changedCount, 1)
+        XCTAssertEqual(cancelledCount, 1)
+        XCTAssertEqual(dragStartedCount, 1)
+        XCTAssertEqual(endedCount, 0)
+        XCTAssertEqual(clickCount, 0)
+
+        source.dragSessionDidEnd()
+        XCTAssertEqual(dragEndedCount, 1)
+    }
+
+    private func makeMouseEvent(
+        _ type: NSEvent.EventType,
+        at location: NSPoint,
+        number: Int,
+        pressure: Float = 1
+    ) throws -> NSEvent {
+        try XCTUnwrap(
+            NSEvent.mouseEvent(
+                with: type,
+                location: location,
+                modifierFlags: [],
+                timestamp: TimeInterval(number) * 0.01,
+                windowNumber: 0,
+                context: nil,
+                eventNumber: number,
+                clickCount: 1,
+                pressure: pressure
+            )
+        )
+    }
 }
