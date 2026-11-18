@@ -6,6 +6,22 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>YoPDF</title>
         <item>
+            <title>2026.11.18.2</title>
+            <pubDate>Wed, 18 Nov 2026 17:06:37 +0900</pubDate>
+            <link>https://github.com/basicv8vc/YoPDF/releases</link>
+            <sparkle:version>13</sparkle:version>
+            <sparkle:shortVersionString>2026.11.18.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[## What's Changed
+* fix(macos): embed Sparkle release notes and avoid endless update spinner by @basicv8vc in https://github.com/basicv8vc/YoPDF/pull/62
+* feat(macos): integrate heterogeneous PDF and Markdown split panes (P0-C-C) by @basicv8vc in https://github.com/basicv8vc/YoPDF/pull/63
+
+
+**Full Changelog**: https://github.com/basicv8vc/YoPDF/compare/v2026.11.18...v2026.11.18.2
+]]></description>
+            <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.18.2/YoPDF-2026.11.18.2-build13-universal.dmg" length="7547746" type="application/octet-stream" sparkle:edSignature="zGjMQtY9mCQ3Pcn/xQBTn2tTFP+dpxPyGcXKdmnTSA2FI/Vynj+PRsIy4IiIwqTDOjV0sOuqoZcNL2w3CwSECA=="/>
+        </item>
+        <item>
             <title>2026.11.18</title>
             <pubDate>Wed, 18 Nov 2026 11:49:56 +0900</pubDate>
             <link>https://github.com/basicv8vc/YoPDF/releases</link>
@@ -23,18 +39,9 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
             <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.17/YoPDF-2026.11.17-build11-universal.dmg" length="7285310" type="application/octet-stream" sparkle:edSignature="JasiQR5acWJHT7K3ryOeLmQXKiCmc4ouZI9puqXq03I+JcVhVOPINHZkkp4vCsudiLbW88FSAw7hOM/VXi/yCA=="/>
         </item>
-        <item>
-            <title>2026.11.16</title>
-            <pubDate>Mon, 16 Nov 2026 17:19:13 +0900</pubDate>
-            <link>https://github.com/basicv8vc/YoPDF/releases</link>
-            <sparkle:version>10</sparkle:version>
-            <sparkle:shortVersionString>2026.11.16</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.16/YoPDF-2026.11.16-build10-universal.dmg" length="7236912" type="application/octet-stream" sparkle:edSignature="DcZaLycg7zRYLggzoPO8QKbIy2Ml0qRm2gS2o9TeLawP2YmhMoJrWWPY3G0kbh4X0pJwaQAZkU+Bvx6ehXDWDQ=="/>
-        </item>
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: SozWgTfENh9b0iQ9gBu5BF/yD1p9G8lEFVQvRN195mmu5ghbxLWXFrye/MHaiIic4Pp+Tc2AAuWo47e760lnDQ==
-length: 2541
+edSignature: pw5yLiNfzrsR1zH4Y8KPkuv9YPIKfjVmjQBJxzm1oIek6LFsunr0R15yl5WGqc0NWXWJvU1/yuLA6uX4GXo3Dg==
+length: 3010
 -->
