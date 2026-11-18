@@ -256,13 +256,19 @@ and is generated from a published image:
 ```bash
 cd macos
 ./scripts/appcast.sh build/dist-<version>-<build>-<sha>
+# or refresh an already-published release without rebuilding:
+./scripts/appcast.sh --tag v<version>
 git add ../appcast.xml && git commit -m "chore: publish appcast for <version>" && git push
 ```
 
 Run it *after* `release.sh`, because every enclosure URL points at the GitHub
 Release asset for that tag and the script refuses to write a feed whose asset
 is not downloadable yet. The previous `appcast.xml` is fed back in, so older
-versions stay listed. Commit and push the result; Sparkle clients read the raw
+versions stay listed, and the release notes (from `--notes-file`, a matching
+sidecar file in `<dist-dir>`, or the GitHub Release body — falling back to a
+default summary if unavailable or empty) are embedded directly in the signed
+`<description>` element so Sparkle's update alert displays them without an
+external asset fetch. Commit and push the result; Sparkle clients read the raw
 URL, which GitHub caches for a few minutes.
 
 The private EdDSA key never enters the repository. It lives in the login
