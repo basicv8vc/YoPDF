@@ -77,7 +77,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -z "$NOTES" || -f "$NOTES" ]] || fail "notes file not found: $NOTES"
+if [[ -n "$NOTES" ]]; then
+  [[ -f "$NOTES" ]] || fail "notes file not found: $NOTES"
+  grep -q '[^[:space:]]' "$NOTES" ||
+    fail "notes file is empty: $NOTES"
+fi
 
 # --- preflight --------------------------------------------------------------
 # Everything below runs before a single byte is compiled, so an avoidable
