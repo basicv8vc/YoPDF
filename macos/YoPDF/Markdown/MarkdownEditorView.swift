@@ -27,6 +27,8 @@ public struct MarkdownEditorView: View {
     private let onTextChange: ((String) -> Void)?
     private let onSelectionChange: ((NSRange) -> Void)?
     private let onFocusChange: ((Bool) -> Void)?
+    private let onOpenLink: ((String) -> Void)?
+    private let paneDropSink: PaneDropSink?
 
     public init(
         text: Binding<String>,
@@ -35,7 +37,9 @@ public struct MarkdownEditorView: View {
         controller: MarkdownEditorController? = nil,
         onTextChange: ((String) -> Void)? = nil,
         onSelectionChange: ((NSRange) -> Void)? = nil,
-        onFocusChange: ((Bool) -> Void)? = nil
+        onFocusChange: ((Bool) -> Void)? = nil,
+        onOpenLink: ((String) -> Void)? = nil,
+        paneDropSink: PaneDropSink? = nil
     ) {
         self._text = text
         self.selection = selection
@@ -44,6 +48,8 @@ public struct MarkdownEditorView: View {
         self.onTextChange = onTextChange
         self.onSelectionChange = onSelectionChange
         self.onFocusChange = onFocusChange
+        self.onOpenLink = onOpenLink
+        self.paneDropSink = paneDropSink
     }
 
     public var body: some View {
@@ -54,7 +60,9 @@ public struct MarkdownEditorView: View {
             controller: controller,
             onTextChange: onTextChange,
             onSelectionChange: onSelectionChange,
-            onFocusChange: onFocusChange
+            onFocusChange: onFocusChange,
+            onOpenLink: onOpenLink,
+            paneDropSink: paneDropSink
         )
         .accessibilityElement(children: .contain)
     }
@@ -70,6 +78,8 @@ private struct MarkdownEditorRepresentable: NSViewRepresentable {
     let onTextChange: ((String) -> Void)?
     let onSelectionChange: ((NSRange) -> Void)?
     let onFocusChange: ((Bool) -> Void)?
+    let onOpenLink: ((String) -> Void)?
+    let paneDropSink: PaneDropSink?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -98,6 +108,8 @@ private struct MarkdownEditorRepresentable: NSViewRepresentable {
         textView.onMarkedTextEnded = { [weak coordinator = context.coordinator] priorMarkedRange in
             coordinator?.handleMarkedTextEnded(priorMarkedRange)
         }
+        textView.onOpenLink = onOpenLink
+        textView.installPaneDropSink(paneDropSink)
 
         scrollView.documentView = textView
         context.coordinator.scrollView = scrollView
@@ -133,7 +145,8 @@ private struct MarkdownEditorRepresentable: NSViewRepresentable {
         if scrollView.hasHorizontalScroller != !configuration.wrapsLines {
             scrollView.hasHorizontalScroller = !configuration.wrapsLines
         }
-        _ = textView
+        textView.onOpenLink = onOpenLink
+        textView.installPaneDropSink(paneDropSink)
     }
 
     static func dismantleNSView(_ scrollView: NSScrollView, coordinator: Coordinator) {
@@ -274,6 +287,16 @@ private struct MarkdownEditorRepresentable: NSViewRepresentable {
             isolatedUndoManager.redo()
             syncAfterUndoOrRedoIfNeeded()
             return true
+        }
+
+        func performFindPanelAction(_ action: NSTextFinder.Action) {
+            guard let textView else { return }
+            if let window = textView.window, window.firstResponder !== textView {
+                window.makeFirstResponder(textView)
+            }
+            let menuItem = NSMenuItem()
+            menuItem.tag = action.rawValue
+            textView.performFindPanelAction(menuItem)
         }
 
         private func syncAfterUndoOrRedoIfNeeded() {
@@ -701,10 +724,13 @@ public final class MarkdownNSTextView: NSTextView {
     var onFirstResponderChange: ((Bool) -> Void)?
     var onWindowAttachment: (() -> Void)?
     var onMarkedTextEnded: ((NSRange) -> Void)?
+    var onOpenLink: ((String) -> Void)?
     weak var coordinator: AnyObject?
 
     private let fallbackUndoManager = UndoManager()
     private var isCommittingInsertText = false
+    private let paneDropHandler = PaneDropSessionHandler()
+    private var pendingContextLinkAction: (() -> Void)?
 
     public init(engine: MarkdownTextEngine = .textKit2) {
         let textStorage = NSTextStorage()
@@ -827,5 +853,99 @@ public final class MarkdownNSTextView: NSTextView {
         if !isCommittingInsertText && !hasMarkedText() {
             onMarkedTextEnded?(priorMarked)
         }
+    }
+
+    // MARK: - Citation Links & Pane Drop Destination
+
+    func installPaneDropSink(_ sink: PaneDropSink?) {
+        paneDropHandler.sink = sink
+        guard sink != nil else { return }
+        let types = Set(registeredDraggedTypes).union(PaneDropSessionHandler.supportedPasteboardTypes)
+        registerForDraggedTypes(Array(types))
+    }
+
+    private var dropCoordinateView: NSView {
+        enclosingScrollView ?? self
+    }
+
+    public override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        if let operation = paneDropHandler.draggingUpdated(sender, in: dropCoordinateView) {
+            return operation
+        }
+        return super.draggingEntered(sender)
+    }
+
+    public override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        if let operation = paneDropHandler.draggingUpdated(sender, in: dropCoordinateView) {
+            return operation
+        }
+        return super.draggingUpdated(sender)
+    }
+
+    public override func draggingExited(_ sender: NSDraggingInfo?) {
+        super.draggingExited(sender)
+        paneDropHandler.conclude()
+    }
+
+    public override func draggingEnded(_ sender: NSDraggingInfo?) {
+        paneDropHandler.conclude()
+    }
+
+    public override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        if let handled = paneDropHandler.performDragOperation(sender, in: dropCoordinateView) {
+            return handled
+        }
+        return super.performDragOperation(sender)
+    }
+
+    public override func concludeDragOperation(_ sender: NSDraggingInfo?) {
+        super.concludeDragOperation(sender)
+        paneDropHandler.conclude()
+    }
+
+    public override func mouseDown(with event: NSEvent) {
+        if event.modifierFlags.contains(.command),
+           let onOpenLink,
+           let target = citationLink(for: event) {
+            onOpenLink(target.rawDestination)
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
+    public override func menu(for event: NSEvent) -> NSMenu? {
+        let baseMenu = super.menu(for: event)
+        guard let onOpenLink, let target = citationLink(for: event) else {
+            return baseMenu
+        }
+
+        let menu = baseMenu ?? NSMenu()
+        pendingContextLinkAction = {
+            onOpenLink(target.rawDestination)
+        }
+        let openItem = NSMenuItem(
+            title: "Open Citation Link",
+            action: #selector(handleOpenPendingContextLink(_:)),
+            keyEquivalent: ""
+        )
+        openItem.target = self
+        menu.insertItem(openItem, at: 0)
+        if menu.items.count > 1 {
+            menu.insertItem(.separator(), at: 1)
+        }
+        return menu
+    }
+
+    @objc private func handleOpenPendingContextLink(_ sender: Any?) {
+        let action = pendingContextLinkAction
+        pendingContextLinkAction = nil
+        action?()
+    }
+
+    private func citationLink(for event: NSEvent) -> MarkdownCitation.LinkTarget? {
+        let point = convert(event.locationInWindow, from: nil)
+        let charIndex = characterIndexForInsertion(at: point)
+        guard charIndex != NSNotFound else { return nil }
+        return MarkdownCitation.linkAt(utf16Offset: charIndex, in: string)?.target
     }
 }

@@ -191,3 +191,81 @@ public struct PaneDropSink: Sendable {
         }
     }
 }
+
+/// Shared AppKit dragging-destination helper used by heterogeneous pane hosts
+/// (`MarkupPDFView`, `MarkdownNSTextView`) so drop-zone direction hysteresis,
+/// payload decoding, and hover cleanup live in one place.
+@MainActor
+public final class PaneDropSessionHandler {
+    public var sink: PaneDropSink?
+    private var activeZone: PaneDropZone?
+
+    public init(sink: PaneDropSink? = nil) {
+        self.sink = sink
+    }
+
+    public static var supportedPasteboardTypes: [NSPasteboard.PasteboardType] {
+        [
+            NSPasteboard.PasteboardType(UTType.yoPDFPaneDrag.identifier),
+            NSPasteboard.PasteboardType(UTType.fileURL.identifier),
+            NSPasteboard.PasteboardType(UTType.pdf.identifier),
+        ]
+    }
+
+    public func dropPayload(for pasteboard: NSPasteboard) -> DropPayload? {
+        if let data = pasteboard.data(
+            forType: NSPasteboard.PasteboardType(UTType.yoPDFPaneDrag.identifier)
+        ), let payload = try? JSONDecoder().decode(PaneDragPayload.self, from: data) {
+            return .pane(payload)
+        }
+        if let urls = pasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL], let url = urls.first, url.isFileURL {
+            return .fileURL(url)
+        }
+        return nil
+    }
+
+    @discardableResult
+    public func draggingUpdated(_ draggingInfo: NSDraggingInfo, in view: NSView) -> NSDragOperation? {
+        guard let sink, let payload = dropPayload(for: draggingInfo.draggingPasteboard) else {
+            return nil
+        }
+        let point = view.convert(draggingInfo.draggingLocation, from: nil)
+        let topLeftPoint = view.isFlipped ? point : CGPoint(x: point.x, y: view.bounds.height - point.y)
+        let zone = PaneDropZone.zone(
+            for: topLeftPoint,
+            in: view.bounds.size,
+            previousZone: activeZone,
+            hysteresis: 0.05
+        )
+        activeZone = zone
+        let check = sink.validate(payload, zone)
+        sink.onHoverChanged(PaneDropHoverState(
+            zone: zone,
+            isValid: check.isValid,
+            feedbackMessage: check.feedback
+        ))
+        return check.isValid ? sink.dropOperation(for: payload) : []
+    }
+
+    public func performDragOperation(_ draggingInfo: NSDraggingInfo, in view: NSView) -> Bool? {
+        defer { conclude() }
+        guard let sink, let payload = dropPayload(for: draggingInfo.draggingPasteboard) else {
+            return nil
+        }
+        let point = view.convert(draggingInfo.draggingLocation, from: nil)
+        let topLeftPoint = view.isFlipped ? point : CGPoint(x: point.x, y: view.bounds.height - point.y)
+        let zone = activeZone ?? PaneDropZone.zone(
+            for: topLeftPoint,
+            in: view.bounds.size
+        )
+        return sink.onPerformDrop(payload, zone)
+    }
+
+    public func conclude() {
+        activeZone = nil
+        sink?.onHoverChanged(nil)
+    }
+}

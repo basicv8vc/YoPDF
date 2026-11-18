@@ -461,6 +461,23 @@ struct PDFReaderView: View {
     private var navigationState: ReaderNavigationState {
         tab.navigationState
     }
+    private var activePaneKind: PaneKind {
+        tab.activePaneKind
+    }
+    private var activeMarkdownSession: MarkdownPaneSession? {
+        tab.activeMarkdownPaneSession
+    }
+
+    private static let supportedOpenTypes: [UTType] = {
+        var types: [UTType] = [.pdf]
+        if let md = UTType(filenameExtension: "md") {
+            types.append(md)
+        }
+        if let markdown = UTType(filenameExtension: "markdown") {
+            types.append(markdown)
+        }
+        return types
+    }()
 
     @State private var isImporterPresented = false
     @State private var pendingRecentRelink: RecentDocument?
@@ -553,6 +570,9 @@ struct PDFReaderView: View {
         case unsavedChanges(PendingAction)
         case workspaceChanges
         case saveProblem(title: String, message: String, offersSaveAs: Bool, tabID: UUID?)
+        case markdownSaveProblem(title: String, message: String, offersSaveAs: Bool, tabID: UUID, paneID: PaneID)
+        case paperNoteCollision(pdfURL: URL, existingURL: URL, suggestedAlternativeURL: URL, sourcePaneID: PaneID)
+        case brokenPaperNoteAssociation(association: PaperNoteAssociation, pdfURL: URL, sourcePaneID: PaneID)
         case recentDocumentUnavailable(RecentDocument)
 
         var id: String {
@@ -567,6 +587,12 @@ struct PDFReaderView: View {
                 return "workspace-changes"
             case let .saveProblem(title, _, _, tabID):
                 return "problem-\(tabID?.uuidString ?? "active")-\(title)"
+            case let .markdownSaveProblem(title, _, _, tabID, paneID):
+                return "md-problem-\(tabID.uuidString)-\(paneID.description)-\(title)"
+            case let .paperNoteCollision(pdfURL, existingURL, _, _):
+                return "paper-note-collision-\(pdfURL.path)-\(existingURL.path)"
+            case let .brokenPaperNoteAssociation(association, _, _):
+                return "broken-paper-note-\(association.id.uuidString)"
             case let .recentDocumentUnavailable(item):
                 return "recent-\(item.id)"
             }
@@ -584,6 +610,12 @@ struct PDFReaderView: View {
                 return "Save changes before closing this workspace?"
             case let .saveProblem(title, _, _, _):
                 return title
+            case let .markdownSaveProblem(title, _, _, _, _):
+                return title
+            case .paperNoteCollision:
+                return "A note file already exists"
+            case .brokenPaperNoteAssociation:
+                return "Paper note not found"
             case .recentDocumentUnavailable:
                 return "Couldn’t open recent document"
             }
@@ -608,8 +640,14 @@ struct PDFReaderView: View {
                 }
             case let .saveProblem(_, message, _, _):
                 return message
+            case let .markdownSaveProblem(_, message, _, _, _):
+                return message
+            case let .paperNoteCollision(_, existingURL, _, _):
+                return "“\(existingURL.lastPathComponent)” already exists in this folder. Link it to this PDF, or create a new note file?"
+            case let .brokenPaperNoteAssociation(association, _, _):
+                return "The linked note “\(association.markdownURL.lastPathComponent)” could not be found. Relink the existing file or create a new note."
             case .workspaceChanges:
-                return "This workspace has unsaved PDF changes or note drafts in one or more tabs."
+                return "This workspace has unsaved changes or note drafts in one or more tabs."
             case let .recentDocumentUnavailable(item):
                 return "YoPDF can no longer resolve the saved location for “\(item.displayName)”. Locate the PDF to reconnect this recent item."
             }
@@ -677,6 +715,61 @@ struct PDFReaderView: View {
                     self.prompt = nil
                     finishFinderOpenRequestIfResolved()
                 }
+            case let .markdownSaveProblem(_, _, offersSaveAs, tabID, paneID):
+                if offersSaveAs {
+                    Button("Save As…") {
+                        self.prompt = nil
+                        if let mdSession = workspace.session(tabID: tabID)?.markdownPaneSessions[paneID] {
+                            presentMarkdownSaveAsPanel(for: mdSession.resourceSession, tabID: tabID, paneID: paneID)
+                        }
+                        finishFinderOpenRequestIfResolved()
+                    }
+                }
+                Button("OK", role: .cancel) {
+                    self.prompt = nil
+                    finishFinderOpenRequestIfResolved()
+                }
+            case let .paperNoteCollision(pdfURL, existingURL, suggestedAlternativeURL, sourcePaneID):
+                Button("Link Existing Note") {
+                    self.prompt = nil
+                    linkExistingPaperNote(pdfURL: pdfURL, markdownURL: existingURL, sourcePaneID: sourcePaneID)
+                }
+                Button("Create “\(suggestedAlternativeURL.lastPathComponent)”") {
+                    self.prompt = nil
+                    createPaperNote(
+                        pdfURL: pdfURL,
+                        at: suggestedAlternativeURL,
+                        isUserSelectedDestination: false,
+                        sourcePaneID: sourcePaneID
+                    )
+                }
+                Button("Choose Location…") {
+                    self.prompt = nil
+                    presentNewPaperNoteSavePanel(
+                        for: pdfURL,
+                        suggestedURL: suggestedAlternativeURL,
+                        sourcePaneID: sourcePaneID
+                    )
+                }
+                Button("Cancel", role: .cancel) {
+                    self.prompt = nil
+                }
+            case let .brokenPaperNoteAssociation(association, pdfURL, sourcePaneID):
+                Button("Relink Note…") {
+                    self.prompt = nil
+                    relinkBrokenPaperNote(association: association, pdfURL: pdfURL, sourcePaneID: sourcePaneID)
+                }
+                Button("Create New Note…") {
+                    self.prompt = nil
+                    presentNewPaperNoteSavePanel(
+                        for: pdfURL,
+                        suggestedURL: nil,
+                        sourcePaneID: sourcePaneID
+                    )
+                }
+                Button("Cancel", role: .cancel) {
+                    self.prompt = nil
+                }
             case let .recentDocumentUnavailable(item):
                 Button("Relink…") { beginRecentRelink(item) }
                 Button("Cancel", role: .cancel) {
@@ -698,11 +791,20 @@ struct PDFReaderView: View {
                     .accessibilityHidden(true)
             )
             .background(
-                WindowTitleInstaller(title: model.fileURL?.lastPathComponent ?? "YoPDF")
+                WindowTitleInstaller(title: activeWindowTitle)
                     .frame(width: 0, height: 0)
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
             )
+    }
+
+    private var activeWindowTitle: String {
+        if activePaneKind == .markdown,
+           let mdSession = activeMarkdownSession {
+            return mdSession.resourceSession.fileURL?.lastPathComponent
+                ?? (mdSession.resourceSession.title.isEmpty ? "Notes.md" : mdSession.resourceSession.title)
+        }
+        return model.fileURL?.lastPathComponent ?? "YoPDF"
     }
 
     private var closeGuardReader: some View {
@@ -762,24 +864,34 @@ struct PDFReaderView: View {
     }
 
     private var splitFocusedReader: some View {
-        focusedReader
+        markdownFocusedReader
             .focusedSceneValue(\.splitRight, splitRightAction)
             .focusedSceneValue(\.splitDown, splitDownAction)
             .focusedSceneValue(\.closePane, closePaneAction)
     }
 
+    private var markdownFocusedReader: some View {
+        focusedReader
+            .focusedSceneValue(\.activePaneKind, activePaneKind)
+            .focusedSceneValue(\.activeUndo, activeUndoAction)
+            .focusedSceneValue(\.activeRedo, activeRedoAction)
+            .focusedSceneValue(\.openPaperNote, openPaperNoteAction)
+            .focusedSceneValue(\.newMarkdownNote, { presentNewStandaloneMarkdownPanel() })
+            .focusedSceneValue(\.insertCitation, insertCitationAction)
+    }
+
     private var focusedReader: some View {
         tabFocusedReader
             .focusedSceneValue(\.openRecentDocument, { requestOpenRecent($0) })
-            .focusedSceneValue(\.saveDocument, { requestSave() })
-            .focusedSceneValue(\.saveDocumentAs, { requestSaveAs() })
+            .focusedSceneValue(\.saveDocument, saveDocumentAction)
+            .focusedSceneValue(\.saveDocumentAs, saveDocumentAsAction)
             .focusedSceneValue(\.exportAnnotations, { exportAnnotationsAsMarkdown() })
-            .focusedSceneValue(\.findInDocument, { showSearch() })
+            .focusedSceneValue(\.findInDocument, findInDocumentAction)
             .focusedSceneValue(\.findNextSearchResult, findNextSearchResultAction)
             .focusedSceneValue(\.findPreviousSearchResult, findPreviousSearchResultAction)
-            .focusedSceneValue(\.highlightSelection, { _ = model.addMarkup(.highlight) })
-            .focusedSceneValue(\.underlineSelection, { _ = model.addMarkup(.underline) })
-            .focusedSceneValue(\.addNote, { beginNote() })
+            .focusedSceneValue(\.highlightSelection, highlightSelectionAction)
+            .focusedSceneValue(\.underlineSelection, underlineSelectionAction)
+            .focusedSceneValue(\.addNote, addNoteAction)
             .focusedSceneValue(
                 \.readerSidebarActions,
                 ReaderSidebarActions(
@@ -787,6 +899,81 @@ struct PDFReaderView: View {
                     select: { showSidebarSection($0) }
                 )
             )
+    }
+
+    private var highlightSelectionAction: (@MainActor () -> Void)? {
+        guard activePaneKind == .pdf else { return nil }
+        return { _ = model.addMarkup(.highlight) }
+    }
+
+    private var underlineSelectionAction: (@MainActor () -> Void)? {
+        guard activePaneKind == .pdf else { return nil }
+        return { _ = model.addMarkup(.underline) }
+    }
+
+    private var addNoteAction: (@MainActor () -> Void)? {
+        guard activePaneKind == .pdf else { return nil }
+        return { beginNote() }
+    }
+
+    private var activeUndoAction: (@MainActor () -> Void)? {
+        if activePaneKind == .markdown {
+            guard let mdSession = activeMarkdownSession,
+                  mdSession.paneModel.editorController.canUndo else { return nil }
+            return { _ = mdSession.paneModel.editorController.undo() }
+        }
+        guard model.canUndoMarkup else { return nil }
+        return { model.undoMarkup() }
+    }
+
+    private var activeRedoAction: (@MainActor () -> Void)? {
+        if activePaneKind == .markdown {
+            guard let mdSession = activeMarkdownSession,
+                  mdSession.paneModel.editorController.canRedo else { return nil }
+            return { _ = mdSession.paneModel.editorController.redo() }
+        }
+        guard model.canRedoMarkup else { return nil }
+        return { model.redoMarkup() }
+    }
+
+    private var saveDocumentAction: (@MainActor () -> Void)? {
+        if activePaneKind == .markdown {
+            guard activeMarkdownSession?.resourceSession.isLoaded == true else { return nil }
+            return { requestSave() }
+        }
+        guard model.isLoaded else { return nil }
+        return { requestSave() }
+    }
+
+    private var saveDocumentAsAction: (@MainActor () -> Void)? {
+        if activePaneKind == .markdown {
+            guard activeMarkdownSession?.resourceSession.isLoaded == true else { return nil }
+            return { requestSaveAs() }
+        }
+        guard model.isLoaded else { return nil }
+        return { requestSaveAs() }
+    }
+
+    private var findInDocumentAction: (@MainActor () -> Void)? {
+        if activePaneKind == .markdown, let mdSession = activeMarkdownSession {
+            return { mdSession.paneModel.editorController.performFindPanelAction(.showFindInterface) }
+        }
+        guard model.isLoaded else { return nil }
+        return { showSearch() }
+    }
+
+    private var openPaperNoteAction: (@MainActor () -> Void)? {
+        guard model.isLoaded, model.fileURL != nil else { return nil }
+        return { openOrCreatePaperNote() }
+    }
+
+    private var insertCitationAction: (@MainActor () -> Void)? {
+        if activePaneKind == .markdown, let mdSession = activeMarkdownSession {
+            guard canCiteCompanionPDF(in: mdSession) else { return nil }
+            return { citeCompanionPDFInMarkdown(mdSession) }
+        }
+        guard canCiteFromPDFPane(tab.primaryPDFPaneSession) else { return nil }
+        return { citeActivePDFInPaperNote() }
     }
 
     /// Tab commands live in their own link of the chain: one very long
@@ -855,6 +1042,9 @@ struct PDFReaderView: View {
             }
             .onChange(of: model.autoSaveFailureRevision) { _, _ in
                 presentLatestAutoSaveFailure()
+            }
+            .onChange(of: activeMarkdownSession?.resourceSession.autoSaveFailureRevision ?? 0) { _, _ in
+                presentLatestMarkdownAutoSaveFailure()
             }
             .onChange(of: model.loadGeneration) { _, _ in
                 isPlacingNote = false
@@ -936,7 +1126,7 @@ struct PDFReaderView: View {
             .background(Color(nsColor: .windowBackgroundColor))
             .fileImporter(
                 isPresented: $isImporterPresented,
-                allowedContentTypes: [.pdf],
+                allowedContentTypes: pendingRecentRelink != nil ? [.pdf] : Self.supportedOpenTypes,
                 allowsMultipleSelection: pendingRecentRelink == nil
             ) { result in
                 handleImportResult(result)
@@ -968,6 +1158,14 @@ struct PDFReaderView: View {
         // free to retry or save a copy.
         guard prompt == nil, let outcome = model.lastAutoSaveOutcome else { return }
         _ = present(outcome, for: workspace.activeTabID)
+    }
+
+    private func presentLatestMarkdownAutoSaveFailure() {
+        guard prompt == nil,
+              let mdSession = activeMarkdownSession,
+              let outcome = mdSession.resourceSession.lastAutoSaveOutcome
+        else { return }
+        _ = presentMarkdownOutcome(outcome, tabID: workspace.activeTabID, paneID: mdSession.id)
     }
 
     private var promptPresentation: Binding<Bool> {
@@ -1039,7 +1237,7 @@ struct PDFReaderView: View {
             content
                 .modifier(ReaderPDFDropDestination(
                     isTargeted: $isDropTargeted,
-                    showsPersistentHint: !model.isLoaded
+                    showsPersistentHint: !tab.hasLoadedContent
                 ) { url in
                     requestOpen(url)
                     return true
@@ -1075,7 +1273,16 @@ struct PDFReaderView: View {
         navigationRevision &+= 1
     }
 
+    @ViewBuilder
     private var toolbar: some View {
+        if activePaneKind == .markdown, let mdSession = activeMarkdownSession {
+            markdownToolbar(for: mdSession)
+        } else {
+            pdfToolbar
+        }
+    }
+
+    private var pdfToolbar: some View {
         HStack(spacing: 12) {
             // No "Open" button here: the empty workspace already offers
             // "Open PDF…" in the middle of the window, and File › Open (⌘O)
@@ -1251,34 +1458,30 @@ struct PDFReaderView: View {
             Divider().frame(height: 18)
 
             Button {
-                splitActivePane(direction: .right)
+                openOrCreatePaperNote()
             } label: {
-                Image(systemName: "rectangle.split.2x1")
+                Image(systemName: "doc.text")
+                    .font(.system(size: 13, weight: .medium))
             }
-            .disabled(!canSplitActivePane(direction: .right))
-            .help(splitButtonHelp(direction: .right))
-            .accessibilityLabel("Split Right")
-            .accessibilityIdentifier("pdf-split-right-button")
+            .disabled(!model.isLoaded || model.fileURL == nil)
+            .help("Open or create Paper Note (⇧⌘M)")
+            .accessibilityLabel("Open Paper Note")
+            .accessibilityIdentifier("pdf-open-paper-note-button")
 
             Button {
-                splitActivePane(direction: .bottom)
+                citeActivePDFInPaperNote()
             } label: {
-                Image(systemName: "rectangle.split.1x2")
+                Image(systemName: "quote.bubble")
+                    .font(.system(size: 13, weight: .medium))
             }
-            .disabled(!canSplitActivePane(direction: .bottom))
-            .help(splitButtonHelp(direction: .bottom))
-            .accessibilityLabel("Split Down")
-            .accessibilityIdentifier("pdf-split-down-button")
+            .disabled(!canCiteFromPDFPane(tab.primaryPDFPaneSession))
+            .help("Cite selection or page in Paper Note (⇧⌘I)")
+            .accessibilityLabel("Cite in Paper Note")
+            .accessibilityIdentifier("pdf-cite-in-note-button")
 
-            Button {
-                requestCloseActivePane()
-            } label: {
-                Image(systemName: "rectangle.badge.xmark")
-            }
-            .disabled(!canCloseActivePane())
-            .help(canCloseActivePane() ? "Close active pane" : "Cannot close the only pane")
-            .accessibilityLabel("Close Pane")
-            .accessibilityIdentifier("pdf-close-pane-button")
+            Divider().frame(height: 18)
+
+            splitToolbarButtons
 
             Spacer(minLength: 8)
 
@@ -1295,36 +1498,175 @@ struct PDFReaderView: View {
                 .accessibilityLabel("Reopen the unsaved note draft")
             }
 
-            switch model.autoSaveStatus {
-            case .idle:
-                if model.hasUnsavedChanges {
-                    Label("Edited", systemImage: "circle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .help("This document has unsaved changes")
-                        .accessibilityLabel("Unsaved changes")
-                }
-            case .pending, .saving:
-                Label("Saving…", systemImage: "arrow.triangle.2.circlepath")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .help("YoPDF will save annotation changes automatically.")
-            case .saved:
-                Label("Saved", systemImage: "checkmark.circle")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .accessibilityLabel("All annotation changes are saved")
-            case .failed:
-                Label("Auto-save failed", systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .help("The edits are still in memory. See the save details and retry or save a copy.")
-            }
+            autoSaveStatusView(
+                status: model.autoSaveStatus,
+                hasUnsavedChanges: model.hasUnsavedChanges,
+                savedHelp: "All annotation changes are saved",
+                pendingHelp: "YoPDF will save annotation changes automatically."
+            )
         }
         .buttonStyle(ReaderInteractiveButtonStyle())
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .background(.bar)
+    }
+
+    private func markdownToolbar(for mdSession: MarkdownPaneSession) -> some View {
+        let mdResource = mdSession.resourceSession
+        let mdModel = mdSession.paneModel
+        return HStack(spacing: 12) {
+            if model.isLoaded {
+                Button {
+                    toggleSidebar()
+                } label: {
+                    Image(systemName: "sidebar.left")
+                }
+                .buttonStyle(ReaderInteractiveButtonStyle(isSelected: isSidebarVisible))
+                .help(isSidebarVisible ? "Hide Sidebar" : "Show Sidebar")
+                .accessibilityLabel(isSidebarVisible ? "Hide Sidebar" : "Show Sidebar")
+
+                Divider().frame(height: 18)
+            }
+
+            Picker("Theme", selection: Binding(
+                get: { mdModel.configuration.theme },
+                set: { mdModel.configuration.theme = $0 }
+            )) {
+                Text("System").tag(MarkdownColorTheme.system)
+                Text("Light").tag(MarkdownColorTheme.light)
+                Text("Dark").tag(MarkdownColorTheme.dark)
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 190)
+            .accessibilityIdentifier("markdown-theme-picker")
+
+            Button {
+                mdModel.configuration.fontSize = max(10, mdModel.configuration.fontSize - 1)
+            } label: {
+                Image(systemName: "textformat.size.smaller")
+            }
+            .disabled(mdModel.configuration.fontSize <= 10)
+            .help("Decrease editor font size")
+
+            Text("\(Int(mdModel.configuration.fontSize))pt")
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 34)
+
+            Button {
+                mdModel.configuration.fontSize = min(32, mdModel.configuration.fontSize + 1)
+            } label: {
+                Image(systemName: "textformat.size.larger")
+            }
+            .disabled(mdModel.configuration.fontSize >= 32)
+            .help("Increase editor font size")
+
+            Divider().frame(height: 18)
+
+            Button {
+                citeCompanionPDFInMarkdown(mdSession)
+            } label: {
+                Label("Cite PDF", systemImage: "quote.bubble")
+                    .font(.callout)
+            }
+            .disabled(!canCiteCompanionPDF(in: mdSession))
+            .help("Insert portable citation for companion PDF (⇧⌘I)")
+            .accessibilityIdentifier("markdown-insert-citation-button")
+
+            Button {
+                requestSave()
+            } label: {
+                Image(systemName: "square.and.arrow.down")
+                    .font(.system(size: 13, weight: .medium))
+            }
+            .disabled(!mdResource.isLoaded)
+            .accessibilityLabel("Save")
+            .help("Save Markdown note (⌘S)")
+
+            Divider().frame(height: 18)
+
+            splitToolbarButtons
+
+            Spacer(minLength: 8)
+
+            autoSaveStatusView(
+                status: mdResource.autoSaveStatus,
+                hasUnsavedChanges: mdResource.hasUnsavedChanges,
+                savedHelp: "All Markdown changes are saved",
+                pendingHelp: "YoPDF will save Markdown changes automatically."
+            )
+        }
+        .buttonStyle(ReaderInteractiveButtonStyle())
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(.bar)
+    }
+
+    @ViewBuilder
+    private var splitToolbarButtons: some View {
+        Button {
+            splitActivePane(direction: .right)
+        } label: {
+            Image(systemName: "rectangle.split.2x1")
+        }
+        .disabled(!canSplitActivePane(direction: .right))
+        .help(splitButtonHelp(direction: .right))
+        .accessibilityLabel("Split Right")
+        .accessibilityIdentifier("pdf-split-right-button")
+
+        Button {
+            splitActivePane(direction: .bottom)
+        } label: {
+            Image(systemName: "rectangle.split.1x2")
+        }
+        .disabled(!canSplitActivePane(direction: .bottom))
+        .help(splitButtonHelp(direction: .bottom))
+        .accessibilityLabel("Split Down")
+        .accessibilityIdentifier("pdf-split-down-button")
+
+        Button {
+            requestCloseActivePane()
+        } label: {
+            Image(systemName: "rectangle.badge.xmark")
+        }
+        .disabled(!canCloseActivePane())
+        .help(canCloseActivePane() ? "Close active pane" : "Cannot close the only pane")
+        .accessibilityLabel("Close Pane")
+        .accessibilityIdentifier("pdf-close-pane-button")
+    }
+
+    @ViewBuilder
+    private func autoSaveStatusView(
+        status: AutoSaveStatus,
+        hasUnsavedChanges: Bool,
+        savedHelp: String,
+        pendingHelp: String
+    ) -> some View {
+        switch status {
+        case .idle:
+            if hasUnsavedChanges {
+                Label("Edited", systemImage: "circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help("This document has unsaved changes")
+                    .accessibilityLabel("Unsaved changes")
+            }
+        case .pending, .saving:
+            Label("Saving…", systemImage: "arrow.triangle.2.circlepath")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .help(pendingHelp)
+        case .saved:
+            Label("Saved", systemImage: "checkmark.circle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel(savedHelp)
+        case .failed:
+            Label("Auto-save failed", systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(.red)
+                .help("The edits are still in memory. See the save details and retry or save a copy.")
+        }
     }
 
     private var searchBar: some View {
@@ -1389,11 +1731,17 @@ struct PDFReaderView: View {
     }
 
     private var findNextSearchResultAction: (@MainActor () -> Void)? {
+        if activePaneKind == .markdown, let mdSession = activeMarkdownSession {
+            return { mdSession.paneModel.editorController.performFindPanelAction(.nextMatch) }
+        }
         guard !searchSession.results.isEmpty || searchSession.isSearching else { return nil }
         return { showNextSearchResult() }
     }
 
     private var findPreviousSearchResultAction: (@MainActor () -> Void)? {
+        if activePaneKind == .markdown, let mdSession = activeMarkdownSession {
+            return { mdSession.paneModel.editorController.performFindPanelAction(.previousMatch) }
+        }
         guard !searchSession.results.isEmpty || searchSession.isSearching else { return nil }
         return { showPreviousSearchResult() }
     }
@@ -1504,9 +1852,9 @@ struct PDFReaderView: View {
 
     @ViewBuilder
     private var content: some View {
-        if model.isLoaded {
+        if tab.hasLoadedContent {
             HStack(spacing: 0) {
-                if isSidebarVisible {
+                if isSidebarVisible && model.isLoaded {
                     ReaderSidebar(
                         model: model,
                         navigationState: navigationState,
@@ -1596,24 +1944,74 @@ struct PDFReaderView: View {
 
     @ViewBuilder
     private func paneView(for paneID: PaneID) -> some View {
-        if let paneSession = tab.paneSessions[paneID] {
-            let paneModel = paneSession.paneModel
-            let resourceSession = paneSession.resourceSession
-            let isPaneActive = (tab.activePaneID == paneID)
-            let searchBelongsToDisplayedDocument = paneModel.searchSession.document === resourceSession.document
-            let paneDocModel = tab.model(for: paneSession)
-            let resolver = anchorResolver(for: paneID)
+        switch tab.paneEntry(for: paneID) {
+        case let .pdf(paneSession):
+            pdfPaneView(for: paneID, paneSession: paneSession)
+        case let .markdown(mdSession):
+            MarkdownPaneView(
+                paneID: paneID,
+                tabID: tab.id,
+                paneCount: tab.layoutTree.paneCount,
+                isPaneActive: tab.activePaneID == paneID,
+                isDraggingThisPane: activeDraggedPayload?.sourcePaneID == paneID,
+                paneModel: mdSession.paneModel,
+                resourceSession: mdSession.resourceSession,
+                hoverState: paneHoverStates[paneID],
+                onActivate: { activatePane(paneID) },
+                onClose: { requestClosePane(paneID) },
+                onDragStarted: {
+                    activeDraggedPayload = PaneDragPayload(kind: .pane, sourceTabID: tab.id, sourcePaneID: paneID)
+                },
+                onDragEnded: {
+                    endActiveDrag()
+                },
+                onOpenLink: { rawDestination in
+                    handleMarkdownCitationLink(rawDestination, from: mdSession)
+                },
+                paneDropSink: makePaneDropSink(for: paneID)
+            )
+        case .none:
+            EmptyView()
+        }
+    }
 
-            let isDraggingThisPane = (activeDraggedPayload?.sourcePaneID == paneID)
+    private func makePaneDropSink(for paneID: PaneID) -> PaneDropSink {
+        PaneDropSink(
+            validate: { payload, zone in
+                validateDrop(on: paneID, payload: payload, zone: zone)
+            },
+            onHoverChanged: { hover in
+                paneHoverStates[paneID] = hover
+            },
+            onPerformDrop: { payload, zone in
+                handlePaneDrop(
+                    payload: payload,
+                    on: paneID,
+                    zone: zone
+                )
+            }
+        )
+    }
 
-            VStack(spacing: 0) {
-                // The per-pane header carries the drag handle, title, page
-                // info, and close button needed to manage a split. With a
-                // single pane the tab strip and the toolbar already show the
-                // same title and page info, so rendering the header would
-                // only duplicate them and steal vertical space.
-                if tab.layoutTree.paneCount > 1 {
-                    PaneHeaderView(
+    @ViewBuilder
+    private func pdfPaneView(for paneID: PaneID, paneSession: PDFPaneSession) -> some View {
+        let paneModel = paneSession.paneModel
+        let resourceSession = paneSession.resourceSession
+        let isPaneActive = (tab.activePaneID == paneID)
+        let searchBelongsToDisplayedDocument = paneModel.searchSession.document === resourceSession.document
+        let paneDocModel = tab.model(for: paneSession)
+        let resolver = anchorResolver(for: paneID)
+
+        let isDraggingThisPane = (activeDraggedPayload?.sourcePaneID == paneID)
+
+        VStack(spacing: 0) {
+            // The per-pane header carries the drag handle, title, page
+            // info, and close button needed to manage a split. With a
+            // single pane the tab strip and the toolbar already show the
+            // same title and page info, so rendering the header would
+            // only duplicate them and steal vertical space.
+            if tab.layoutTree.paneCount > 1 {
+                PaneHeaderView(
                     paneID: paneID,
                     title: resourceSession.fileURL?.lastPathComponent ?? "Document",
                     pageIndicator: resourceSession.pageCount > 0 ? "\(paneModel.currentPageIndex + 1) / \(resourceSession.pageCount)" : "",
@@ -1628,144 +2026,126 @@ struct PDFReaderView: View {
                     onDragEnded: {
                         endActiveDrag()
                     }
-                    )
+                )
+            }
+
+            ZStack(alignment: .topTrailing) {
+                PDFViewerRepresentable(
+                    document: resourceSession.document,
+                    currentPageIndex: Binding(
+                        get: { paneModel.currentPageIndex },
+                        set: { paneModel.updateCurrentPageIndex($0) }
+                    ),
+                    selection: Binding(
+                        get: { paneModel.currentSelection },
+                        set: { paneModel.updateSelection($0) }
+                    ),
+                    autoScales: paneModel.isAutoScaling,
+                    zoomScale: paneModel.zoomScale,
+                    zoomCommandRevision: paneModel.zoomCommandRevision,
+                    pageNavigationRevision: paneModel.pageNavigationRevision,
+                    navigationDestination: isPaneActive ? pendingNavigationDestination : nil,
+                    navigationRevision: navigationRevision,
+                    onScaleChange: { paneModel.updateEffectiveScale($0) },
+                    onSettledViewState: { document, pageIndex, scale, pageRevision, zoomRevision in
+                        paneModel.updateViewState(
+                            document: document,
+                            pageIndex: pageIndex,
+                            scale: scale,
+                            pageNavigationRevision: pageRevision,
+                            zoomCommandRevision: zoomRevision
+                        )
+                    },
+                    onManualMagnification: { paneModel.setAutoScaling(false) },
+                    selectedMarkup: paneModel.selectedMarkup,
+                    noteMarkers: resourceSession.noteMarkers,
+                    isPlacingNote: isPaneActive && isPlacingNote,
+                    annotationRevision: resourceSession.annotationRevision,
+                    changedAnnotationPageIndices: resourceSession.changedAnnotationPageIndices,
+                    onMarkupClick: { point, page in
+                        paneModel.selectMarkup(at: point, on: page)
+                    },
+                    onNoteHit: { point, page in
+                        paneModel.noteSelection(at: point, on: page)
+                    },
+                    onNoteActivated: { note, anchor in
+                        requestNoteComposer(note, anchor: anchor, in: paneID)
+                    },
+                    onNoteMoved: { note, center in
+                        _ = resourceSession.moveNoteMarker(note, to: center)
+                    },
+                    onPlaceNote: { point, page, anchor in
+                        placePageNote(at: point, on: page, anchor: anchor, in: paneID)
+                    },
+                    onCancelPlacement: {
+                        if isPaneActive { isPlacingNote = false }
+                    },
+                    searchSelections: searchBelongsToDisplayedDocument ? paneModel.searchSession.results : [],
+                    activeSearchSelection: searchBelongsToDisplayedDocument
+                        ? paneModel.searchSession.currentSelection
+                        : nil,
+                    searchResultsRevision: paneModel.searchSession.resultsRevision,
+                    makeMenuItems: { context in
+                        pageMenuItems(for: context, in: paneID)
+                    },
+                    anchorResolver: resolver,
+                    onActivatePane: {
+                        activatePane(paneID)
+                    },
+                    paneDropSink: makePaneDropSink(for: paneID)
+                )
+                .transaction { $0.animation = nil }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .id(resourceSession.loadGeneration)
+                .popover(
+                    isPresented: Binding(
+                        get: { paneModel.noteComposerStore.isPresented },
+                        set: { paneModel.noteComposerStore.isPresented = $0 }
+                    ),
+                    attachmentAnchor: .rect(.rect(paneModel.noteComposerStore.session?.anchorRect ?? Self.fallbackAnchor)),
+                    arrowEdge: .top
+                ) {
+                    if let session = paneModel.noteComposerStore.session {
+                        NoteComposerView(session: session, model: paneDocModel) {
+                            paneModel.noteComposerStore.end()
+                        } onEditGroupEntry: { group, entry in
+                            guard let note = paneDocModel.noteSelection(forThreadEntry: entry, in: group) else {
+                                return
+                            }
+                            let anchor = resolver.containerRect(
+                                forPageBounds: group.bounds,
+                                pageIndex: group.pageIndex
+                            ) ?? Self.fallbackAnchor
+                            requestCompose(.note(note, anchor), in: paneID)
+                        }
+                        .id(session.id)
+                    }
                 }
 
-                GeometryReader { paneGeometry in
-                    ZStack(alignment: .topTrailing) {
-                        PDFViewerRepresentable(
-                            document: resourceSession.document,
-                            currentPageIndex: Binding(
-                                get: { paneModel.currentPageIndex },
-                                set: { paneModel.updateCurrentPageIndex($0) }
-                            ),
-                            selection: Binding(
-                                get: { paneModel.currentSelection },
-                                set: { paneModel.updateSelection($0) }
-                            ),
-                            autoScales: paneModel.isAutoScaling,
-                            zoomScale: paneModel.zoomScale,
-                            zoomCommandRevision: paneModel.zoomCommandRevision,
-                            pageNavigationRevision: paneModel.pageNavigationRevision,
-                            navigationDestination: isPaneActive ? pendingNavigationDestination : nil,
-                            navigationRevision: navigationRevision,
-                            onScaleChange: { paneModel.updateEffectiveScale($0) },
-                            onSettledViewState: { document, pageIndex, scale, pageRevision, zoomRevision in
-                                paneModel.updateViewState(
-                                    document: document,
-                                    pageIndex: pageIndex,
-                                    scale: scale,
-                                    pageNavigationRevision: pageRevision,
-                                    zoomCommandRevision: zoomRevision
-                                )
-                            },
-                            onManualMagnification: { paneModel.setAutoScaling(false) },
-                            selectedMarkup: paneModel.selectedMarkup,
-                            noteMarkers: resourceSession.noteMarkers,
-                            isPlacingNote: isPaneActive && isPlacingNote,
-                            annotationRevision: resourceSession.annotationRevision,
-                            changedAnnotationPageIndices: resourceSession.changedAnnotationPageIndices,
-                            onMarkupClick: { point, page in
-                                paneModel.selectMarkup(at: point, on: page)
-                            },
-                            onNoteHit: { point, page in
-                                paneModel.noteSelection(at: point, on: page)
-                            },
-                            onNoteActivated: { note, anchor in
-                                requestNoteComposer(note, anchor: anchor, in: paneID)
-                            },
-                            onNoteMoved: { note, center in
-                                _ = resourceSession.moveNoteMarker(note, to: center)
-                            },
-                            onPlaceNote: { point, page, anchor in
-                                placePageNote(at: point, on: page, anchor: anchor, in: paneID)
-                            },
-                            onCancelPlacement: {
-                                if isPaneActive { isPlacingNote = false }
-                            },
-                            searchSelections: searchBelongsToDisplayedDocument ? paneModel.searchSession.results : [],
-                            activeSearchSelection: searchBelongsToDisplayedDocument
-                                ? paneModel.searchSession.currentSelection
-                                : nil,
-                            searchResultsRevision: paneModel.searchSession.resultsRevision,
-                            makeMenuItems: { context in
-                                pageMenuItems(for: context, in: paneID)
-                            },
-                            anchorResolver: resolver,
-                            onActivatePane: {
-                                activatePane(paneID)
-                            },
-                            paneDropSink: PaneDropSink(
-                                validate: { payload, zone in
-                                    validateDrop(on: paneID, payload: payload, zone: zone)
-                                },
-                                onHoverChanged: { hover in
-                                    paneHoverStates[paneID] = hover
-                                },
-                                onPerformDrop: { payload, zone in
-                                    handlePaneDrop(
-                                        payload: payload,
-                                        on: paneID,
-                                        zone: zone,
-                                        in: paneGeometry.size
-                                    )
-                                }
-                            )
-                        )
-                        .transaction { $0.animation = nil }
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .id(resourceSession.loadGeneration)
-                        .popover(
-                            isPresented: Binding(
-                                get: { paneModel.noteComposerStore.isPresented },
-                                set: { paneModel.noteComposerStore.isPresented = $0 }
-                            ),
-                            attachmentAnchor: .rect(.rect(paneModel.noteComposerStore.session?.anchorRect ?? Self.fallbackAnchor)),
-                            arrowEdge: .top
-                        ) {
-                            if let session = paneModel.noteComposerStore.session {
-                                NoteComposerView(session: session, model: paneDocModel) {
-                                    paneModel.noteComposerStore.end()
-                                } onEditGroupEntry: { group, entry in
-                                    guard let note = paneDocModel.noteSelection(forThreadEntry: entry, in: group) else {
-                                        return
-                                    }
-                                    let anchor = resolver.containerRect(
-                                        forPageBounds: group.bounds,
-                                        pageIndex: group.pageIndex
-                                    ) ?? Self.fallbackAnchor
-                                    requestCompose(.note(note, anchor), in: paneID)
-                                }
-                                .id(session.id)
-                            }
-                        }
+                if tab.layoutTree.paneCount > 1 {
+                    Rectangle()
+                        .strokeBorder(isPaneActive ? Color.accentColor.opacity(0.65) : Color.clear, lineWidth: 2)
+                        .allowsHitTesting(false)
+                }
 
-                        if tab.layoutTree.paneCount > 1 {
-                            Rectangle()
-                                .strokeBorder(isPaneActive ? Color.accentColor.opacity(0.65) : Color.clear, lineWidth: 2)
-                                .allowsHitTesting(false)
-                        }
-
-                        if let hoverState = paneHoverStates[paneID] {
-                            PaneDropPreviewOverlay(
-                                zone: hoverState.zone,
-                                isValid: hoverState.isValid,
-                                feedbackMessage: hoverState.feedbackMessage
-                            )
-                            .allowsHitTesting(false)
-                        }
-                    }
-                    .opacity(isDraggingThisPane ? 0.45 : 1.0)
-                    .animation(.easeInOut(duration: 0.15), value: isDraggingThisPane)
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        activatePane(paneID)
-                    }
+                if let hoverState = paneHoverStates[paneID] {
+                    PaneDropPreviewOverlay(
+                        zone: hoverState.zone,
+                        isValid: hoverState.isValid,
+                        feedbackMessage: hoverState.feedbackMessage
+                    )
+                    .allowsHitTesting(false)
                 }
             }
-            .accessibilityElement(children: .contain)
-            .accessibilityLabel("Pane \(paneID.description)\(isPaneActive ? ", active" : "")")
+            .opacity(isDraggingThisPane ? 0.45 : 1.0)
+            .animation(.easeInOut(duration: 0.15), value: isDraggingThisPane)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                activatePane(paneID)
+            }
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Pane \(paneID.description)\(isPaneActive ? ", active" : "")")
     }
 
     // MARK: - Drag & Drop Handling
@@ -1802,7 +2182,7 @@ struct PDFReaderView: View {
         )
     }
 
-    private func handlePaneDrop(payload: DropPayload, on targetPaneID: PaneID, zone: PaneDropZone, in size: CGSize) -> Bool {
+    private func handlePaneDrop(payload: DropPayload, on targetPaneID: PaneID, zone: PaneDropZone) -> Bool {
         activeDraggedPayload = nil
         paneHoverStates.removeAll()
 
@@ -1850,6 +2230,36 @@ struct PDFReaderView: View {
             }
 
         case let .fileURL(url):
+            if MarkdownResourceSession.isSupportedMarkdownFile(url) {
+                let result: Result<PaneID, Error> = withAnimation(.easeOut(duration: 0.16)) {
+                    if let direction = zone.insertionDirection {
+                        return workspace.openMarkdownInSplit(
+                            url: url,
+                            associatedPDFURL: model.fileURL,
+                            in: tab.id,
+                            adjacentTo: targetPaneID,
+                            direction: direction,
+                            policy: .default,
+                            availableSize: currentContentSize
+                        )
+                    } else {
+                        return workspace.openMarkdownReplacingPane(
+                            url: url,
+                            associatedPDFURL: model.fileURL,
+                            in: tab.id,
+                            replacing: targetPaneID
+                        )
+                    }
+                }
+                switch result {
+                case .success:
+                    return true
+                case let .failure(error):
+                    presentMarkdownOpenFailure(error)
+                    return false
+                }
+            }
+
             let result: Result<PaneID, Error> = withAnimation(.easeOut(duration: 0.16)) {
                 if let direction = zone.insertionDirection {
                     return workspace.openPDFInSplit(
@@ -1897,19 +2307,30 @@ struct PDFReaderView: View {
                         .foregroundStyle(.tertiary)
                     Text("Open a PDF to get started")
                         .font(.title3.weight(.medium))
-                    Text("Drag a PDF here, or choose one from disk.")
+                    Text("Drag a PDF or Markdown file here, or choose one from disk.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
-                    Button("Open PDF…") {
-                        isImporterPresented = true
-                    }
-                    .buttonStyle(
-                        ReaderInteractiveButtonStyle(
-                            isProminent: true,
-                            insets: EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16)
+                    HStack(spacing: 12) {
+                        Button("Open PDF…") {
+                            isImporterPresented = true
+                        }
+                        .buttonStyle(
+                            ReaderInteractiveButtonStyle(
+                                isProminent: true,
+                                insets: EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16)
+                            )
                         )
-                    )
-                    .keyboardShortcut("o", modifiers: .command)
+                        .keyboardShortcut("o", modifiers: .command)
+
+                        Button("New Markdown Note…") {
+                            presentNewStandaloneMarkdownPanel()
+                        }
+                        .buttonStyle(
+                            ReaderInteractiveButtonStyle(
+                                insets: EdgeInsets(top: 6, leading: 14, bottom: 6, trailing: 14)
+                            )
+                        )
+                    }
 
                     if !recentDocuments.items.isEmpty {
                         RecentDocumentsGrid(
@@ -1936,14 +2357,20 @@ struct PDFReaderView: View {
 
     // MARK: - Opening
 
-    /// Opens a PDF in the current workspace, reusing an empty tab or creating a
-    /// new one. A failed candidate leaves every already-open tab untouched.
+    /// Opens a PDF or Markdown file in the current workspace, reusing an empty tab
+    /// or creating a new one. A failed candidate leaves every already-open tab untouched.
     @discardableResult
     private func requestOpen(
         _ url: URL,
         relinking item: RecentDocument? = nil
     ) -> PDFDocumentModel.LoadError? {
         pendingOpenFailure = nil
+        if item == nil, MarkdownResourceSession.isSupportedMarkdownFile(url) {
+            if case let .failed(error) = workspace.openMarkdown(url) {
+                presentMarkdownOpenFailure(error)
+            }
+            return nil
+        }
         let result = workspace.open(url, relinking: item)
         if case let .failed(error) = result {
             if model.lastError == nil { pendingOpenFailure = error }
@@ -1998,9 +2425,17 @@ struct PDFReaderView: View {
 
     // MARK: - Saving
 
-    /// ⌘S. The note is resolved first: a document save writes the PDF as it is,
-    /// so saving the file with a pending note would put the note's text nowhere.
+    /// ⌘S. When a Markdown pane is active, saves that Markdown file; otherwise
+    /// resolves any pending PDF note draft before saving the PDF.
     private func requestSave() {
+        if activePaneKind == .markdown, let mdSession = activeMarkdownSession {
+            _ = presentMarkdownOutcome(
+                mdSession.resourceSession.save(),
+                tabID: workspace.activeTabID,
+                paneID: mdSession.id
+            )
+            return
+        }
         switch promptKind(for: .save) {
         case .draft:
             prompt = .draftChanges(.save)
@@ -2010,6 +2445,14 @@ struct PDFReaderView: View {
     }
 
     private func requestSaveAs() {
+        if activePaneKind == .markdown, let mdSession = activeMarkdownSession {
+            presentMarkdownSaveAsPanel(
+                for: mdSession.resourceSession,
+                tabID: workspace.activeTabID,
+                paneID: mdSession.id
+            )
+            return
+        }
         guard model.isLoaded else { return }
         switch promptKind(for: .saveAs) {
         case .draft:
@@ -2099,49 +2542,89 @@ struct PDFReaderView: View {
         return "\(safeTitle.isEmpty ? "Annotations" : safeTitle).md"
     }
 
+    private func presentMarkdownSaveAsPanel(
+        for mdResource: MarkdownResourceSession,
+        tabID: UUID,
+        paneID: PaneID
+    ) {
+        guard mdResource.isLoaded else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = mdResource.fileURL?.lastPathComponent ?? suggestedMarkdownFilename(for: mdResource.title)
+        let response = mdResource.withAutoSavePaused { panel.runModal() }
+        guard response == .OK, let url = panel.url else { return }
+        _ = presentMarkdownOutcome(workspace.saveMarkdownAs(mdResource, to: url, overwrite: true), tabID: tabID, paneID: paneID)
+    }
+
     @discardableResult
     private func present(_ outcome: SaveOutcome, for tabID: UUID? = nil) -> Bool {
+        let described = describeSaveOutcome(outcome)
+        if let problem = described.problem {
+            prompt = .saveProblem(
+                title: problem.title,
+                message: problem.message,
+                offersSaveAs: problem.offersSaveAs,
+                tabID: tabID
+            )
+        }
+        return described.editsOnDisk
+    }
+
+    @discardableResult
+    private func presentMarkdownOutcome(
+        _ outcome: SaveOutcome,
+        tabID: UUID,
+        paneID: PaneID
+    ) -> Bool {
+        let described = describeSaveOutcome(outcome)
+        if let problem = described.problem {
+            prompt = .markdownSaveProblem(
+                title: problem.title,
+                message: problem.message,
+                offersSaveAs: problem.offersSaveAs,
+                tabID: tabID,
+                paneID: paneID
+            )
+        }
+        return described.editsOnDisk
+    }
+
+    private func describeSaveOutcome(
+        _ outcome: SaveOutcome
+    ) -> (editsOnDisk: Bool, problem: (title: String, message: String, offersSaveAs: Bool)?) {
         switch outcome {
         case .saved:
-            return true
+            return (true, nil)
         case let .savedUnverified(reason, editsOnDisk):
-            prompt = .saveProblem(
-                title: editsOnDisk ? "Saved, but not verified" : "The save could not be confirmed",
-                message: reason,
-                offersSaveAs: !editsOnDisk,
-                tabID: tabID
+            return (
+                editsOnDisk,
+                ("Saved, but not verified" + (editsOnDisk ? "" : " — couldn’t confirm"),
+                 reason,
+                 !editsOnDisk)
             )
-            return editsOnDisk
         case let .conflict(error):
-            prompt = .saveProblem(
-                title: "The file changed on disk",
-                message: (error.errorDescription ?? "The file was not written.")
+            return (
+                false,
+                ("The file changed on disk",
+                 (error.errorDescription ?? "The file was not written.")
                     + " Your changes are still here — save a copy to keep them.",
-                offersSaveAs: true,
-                tabID: tabID
+                 true)
             )
-            return false
         case let .uncertain(reason, recovery):
             var message = reason
             if !recovery.isEmpty {
                 message += "\n\nNothing was deleted. These copies were kept:\n"
                     + recovery.map(\.path).joined(separator: "\n")
             }
-            prompt = .saveProblem(
-                title: "The save stopped in an unclear state",
-                message: message,
-                offersSaveAs: false,
-                tabID: tabID
-            )
-            return false
+            return (false, ("The save stopped in an unclear state", message, false))
         case let .failed(error):
-            prompt = .saveProblem(
-                title: "Couldn’t save",
-                message: error.errorDescription ?? "The file was not written.",
-                offersSaveAs: offersSaveAs(for: error),
-                tabID: tabID
+            return (
+                false,
+                ("Couldn’t save",
+                 error.errorDescription ?? "The file was not written.",
+                 offersSaveAs(for: error))
             )
-            return false
         }
     }
 
@@ -2216,7 +2699,7 @@ struct PDFReaderView: View {
     // MARK: - Multi-Pane Split Actions
 
     private func canSplitActivePane(direction: LayoutInsertionDirection) -> Bool {
-        guard model.isLoaded else { return false }
+        guard tab.hasLoadedContent else { return false }
         return workspace.canSplit(
             direction: direction,
             policy: .default,
@@ -2225,8 +2708,8 @@ struct PDFReaderView: View {
     }
 
     private func splitButtonHelp(direction: LayoutInsertionDirection) -> String {
-        if !model.isLoaded {
-            return "Open a PDF to split view"
+        if !tab.hasLoadedContent {
+            return "Open a PDF or Markdown file to split view"
         }
         let policy = LayoutPolicy.default
         if tab.layoutTree.paneCount >= policy.maxPanes {
@@ -2297,14 +2780,15 @@ struct PDFReaderView: View {
 
     private func requestClosePane(_ paneID: PaneID) {
         guard tab.layoutTree.paneCount > 1 else { return }
-        guard let paneSession = tab.paneSessions[paneID] else { return }
-
-        if paneSession.paneModel.noteComposerStore.hasUncommittedChanges {
+        guard let closePrompt = workspace.closePanePrompt(tabID: tab.id, paneID: paneID) else { return }
+        switch closePrompt {
+        case .draft:
             prompt = .draftChanges(.closePane(paneID))
-            return
+        case .document:
+            prompt = .unsavedChanges(.closePane(paneID))
+        case .none:
+            try? workspace.closePane(paneID: paneID)
         }
-
-        try? workspace.closePane(paneID: paneID)
     }
 
     private func showCannotSplitFeedback(direction: LayoutInsertionDirection) {
@@ -2402,6 +2886,28 @@ struct PDFReaderView: View {
             items.append(.separator())
         }
         items.append(contentsOf: markup)
+
+        if let pdfPane = tab.paneSessions[targetPaneID],
+           pdfPane.resourceSession.isLoaded,
+           pdfPane.resourceSession.fileURL != nil {
+            if !items.isEmpty {
+                items.append(.separator())
+            }
+            let hasSelection = activePaneModel.currentSelection?
+                .string?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .isEmpty == false
+            let citeItem = MarkupActionMenuItem(
+                title: hasSelection ? "Cite Selection in Paper Note" : "Cite Page in Paper Note"
+            ) {
+                citeActivePDFInPaperNote(from: targetPaneID, pageOverride: context.page)
+            }
+            citeItem.isEnabled = canCiteFromPDFPane(pdfPane)
+            items.append(citeItem)
+            items.append(MarkupActionMenuItem(title: "Open Paper Note") {
+                openOrCreatePaperNote(from: targetPaneID)
+            })
+        }
 
         var splitItems: [NSMenuItem] = []
         let canRight = tab.canSplit(paneID: targetPaneID, direction: .right, policy: .default, availableSize: currentContentSize)
@@ -2562,15 +3068,26 @@ struct PDFReaderView: View {
         }
     }
 
-    /// Saves every PDF in place. A failed, conflicting, or uncertain result
-    /// stops the close and leaves the remaining sessions available.
+    /// Saves every dirty PDF and Markdown document in place. A failed,
+    /// conflicting, or uncertain result stops the close and leaves the
+    /// remaining sessions available.
     private func saveWorkspaceDocuments() -> Bool {
         for tab in workspace.tabs where tab.hasUnsavedDocumentChanges {
             workspace.activate(tabID: tab.id)
-            for resourceSession in tab.uniqueResourceSessions where resourceSession.hasUnsavedChanges {
-                let outcome = resourceSession.save()
-                guard present(outcome, for: tab.id) else { return false }
-            }
+            guard saveTabDocuments(tab) else { return false }
+        }
+        return true
+    }
+
+    private func saveTabDocuments(_ target: WorkspaceTabSession) -> Bool {
+        for resourceSession in target.uniqueResourceSessions where resourceSession.hasUnsavedChanges {
+            let outcome = resourceSession.save()
+            guard present(outcome, for: target.id) else { return false }
+        }
+        for mdResource in target.uniqueMarkdownResourceSessions where mdResource.hasUnsavedChanges {
+            let paneID = target.markdownPaneSessions.values.first { $0.resourceSession === mdResource }?.id ?? target.activePaneID
+            let outcome = mdResource.save()
+            guard presentMarkdownOutcome(outcome, tabID: target.id, paneID: paneID) else { return false }
         }
         return true
     }
@@ -2736,8 +3253,15 @@ struct PDFReaderView: View {
         let didSave: Bool
         if action == .quit {
             didSave = saveWorkspaceDocuments()
+        } else if case let .closePane(paneID) = action,
+                  case let .markdown(mdSession) = tab.paneEntry(for: paneID) {
+            didSave = presentMarkdownOutcome(
+                mdSession.resourceSession.save(),
+                tabID: tab.id,
+                paneID: paneID
+            )
         } else if let target = session(for: action) {
-            didSave = present(target.model.save(), for: target.id)
+            didSave = saveTabDocuments(target)
         } else {
             didSave = false
         }
@@ -2767,6 +3291,7 @@ struct PDFReaderView: View {
             _ = workspace.discardDocumentChanges(tabID: tabID)
             _ = workspace.closeTab(tabID: tabID)
         case let .closePane(paneID):
+            workspace.discardPaneChanges(tabID: tab.id, paneID: paneID)
             try? workspace.closePane(paneID: paneID)
         case .closeWindow:
             // The window is closing now, so the edits really are being discarded.
@@ -2802,6 +3327,7 @@ struct PDFReaderView: View {
         case let .closeTab(tabID):
             _ = workspace.closeTab(tabID: tabID)
         case let .closePane(paneID):
+            workspace.discardPaneChanges(tabID: tab.id, paneID: paneID)
             try? workspace.closePane(paneID: paneID)
         case .closeWindow:
             closeGuard.closeNow()
@@ -2810,5 +3336,494 @@ struct PDFReaderView: View {
         case let .compose(target):
             startComposer(target)
         }
+    }
+
+    // MARK: - Paper Notes & Citations
+
+    private func openOrCreatePaperNote(from sourcePaneID: PaneID? = nil, completion: ((MarkdownPaneSession) -> Void)? = nil) {
+        let pdfPane = sourcePaneID.flatMap { tab.paneSessions[$0] } ?? tab.primaryPDFPaneSession
+        guard let pdfPane, let pdfURL = pdfPane.resourceSession.fileURL else { return }
+
+        // If a Markdown pane for this paper's note is already open in this tab, focus it.
+        if let associated = workspace.noteAssociationStore.association(forPDF: pdfURL) {
+            let resolved = workspace.noteAssociationStore.resolveAssociation(associated)
+            if case let .resolved(markdownURL, _) = resolved.markdownResolution {
+                openMarkdownInTabOrFallback(
+                    url: markdownURL,
+                    associatedPDFURL: pdfURL,
+                    preferredSplitFrom: pdfPane.id,
+                    completion: completion
+                )
+                return
+            }
+            prompt = .brokenPaperNoteAssociation(
+                association: resolved.association,
+                pdfURL: pdfURL,
+                sourcePaneID: pdfPane.id
+            )
+            return
+        }
+
+        // If any Markdown pane is already open in the current tab with no association yet,
+        // only fall back to creating/planning when not already open.
+        let plan = workspace.noteAssociationStore.planDefaultNoteCreation(forPDF: pdfURL)
+        switch plan {
+        case let .alreadyAssociated(_, resolvedMarkdownURL):
+            openMarkdownInTabOrFallback(
+                url: resolvedMarkdownURL,
+                associatedPDFURL: pdfURL,
+                preferredSplitFrom: pdfPane.id,
+                completion: completion
+            )
+
+        case let .brokenAssociation(association):
+            prompt = .brokenPaperNoteAssociation(
+                association: association,
+                pdfURL: pdfURL,
+                sourcePaneID: pdfPane.id
+            )
+
+        case let .readyToCreate(targetURL):
+            createPaperNote(
+                pdfURL: pdfURL,
+                at: targetURL,
+                isUserSelectedDestination: false,
+                sourcePaneID: pdfPane.id,
+                completion: completion
+            )
+
+        case let .existingNoteCollision(existingURL, suggestedAlternativeURL):
+            prompt = .paperNoteCollision(
+                pdfURL: pdfURL,
+                existingURL: existingURL,
+                suggestedAlternativeURL: suggestedAlternativeURL,
+                sourcePaneID: pdfPane.id
+            )
+
+        case let .locationAuthorizationRequired(suggestedURL):
+            presentNewPaperNoteSavePanel(
+                for: pdfURL,
+                suggestedURL: suggestedURL,
+                sourcePaneID: pdfPane.id,
+                completion: completion
+            )
+
+        case .directoryNotWritable, .notebookDirectoryUnavailable:
+            presentNewPaperNoteSavePanel(
+                for: pdfURL,
+                suggestedURL: nil,
+                sourcePaneID: pdfPane.id,
+                completion: completion
+            )
+        }
+    }
+
+    private func createPaperNote(
+        pdfURL: URL,
+        at noteURL: URL,
+        isUserSelectedDestination: Bool,
+        sourcePaneID: PaneID,
+        completion: ((MarkdownPaneSession) -> Void)? = nil
+    ) {
+        let pdfTitle = tab.paneSessions[sourcePaneID]?.resourceSession.title
+            ?? pdfURL.deletingPathExtension().lastPathComponent
+        let initialSeed = "# \(pdfTitle)\n\n"
+        do {
+            let created = try workspace.noteAssociationStore.createNote(
+                forPDF: pdfURL,
+                at: noteURL,
+                initialContent: initialSeed,
+                isUserSelectedDestination: isUserSelectedDestination
+            )
+            presentCreatedMarkdownSession(
+                created.session,
+                associatedPDFURL: pdfURL,
+                preferredSplitFrom: sourcePaneID,
+                completion: completion
+            )
+        } catch let error as PaperNoteAssociationError {
+            if case let .noteCreatedButPersistenceFailed(pending, _) = error {
+                _ = try? workspace.noteAssociationStore.commitPendingAssociation(pending)
+            }
+            presentMarkdownOpenFailure(error)
+        } catch {
+            presentMarkdownOpenFailure(error)
+        }
+    }
+
+    private func linkExistingPaperNote(
+        pdfURL: URL,
+        markdownURL: URL,
+        sourcePaneID: PaneID,
+        completion: ((MarkdownPaneSession) -> Void)? = nil
+    ) {
+        do {
+            _ = try workspace.noteAssociationStore.linkExistingNote(forPDF: pdfURL, markdownURL: markdownURL)
+            openMarkdownInTabOrFallback(
+                url: markdownURL,
+                associatedPDFURL: pdfURL,
+                preferredSplitFrom: sourcePaneID,
+                completion: completion
+            )
+        } catch {
+            presentMarkdownOpenFailure(error)
+        }
+    }
+
+    private func relinkBrokenPaperNote(
+        association: PaperNoteAssociation,
+        pdfURL: URL,
+        sourcePaneID: PaneID
+    ) {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = Self.supportedOpenTypes.filter { $0 != .pdf }
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = association.markdownURL.deletingLastPathComponent()
+        panel.prompt = "Relink"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        do {
+            _ = try workspace.noteAssociationStore.relinkMarkdown(for: association.id, to: url)
+            openMarkdownInTabOrFallback(
+                url: url,
+                associatedPDFURL: pdfURL,
+                preferredSplitFrom: sourcePaneID
+            )
+        } catch {
+            presentMarkdownOpenFailure(error)
+        }
+    }
+
+    private func presentNewPaperNoteSavePanel(
+        for pdfURL: URL,
+        suggestedURL: URL?,
+        sourcePaneID: PaneID,
+        completion: ((MarkdownPaneSession) -> Void)? = nil
+    ) {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        panel.canCreateDirectories = true
+        panel.directoryURL = suggestedURL?.deletingLastPathComponent() ?? pdfURL.deletingLastPathComponent()
+        panel.nameFieldStringValue = suggestedURL?.lastPathComponent
+            ?? PaperNoteAssociationStore.defaultNoteFilename(forPDF: pdfURL)
+        panel.prompt = "Create Note"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        if FileManager.default.fileExists(atPath: url.path) {
+            linkExistingPaperNote(
+                pdfURL: pdfURL,
+                markdownURL: url,
+                sourcePaneID: sourcePaneID,
+                completion: completion
+            )
+        } else {
+            createPaperNote(
+                pdfURL: pdfURL,
+                at: url,
+                isUserSelectedDestination: true,
+                sourcePaneID: sourcePaneID,
+                completion: completion
+            )
+        }
+    }
+
+    private func presentNewStandaloneMarkdownPanel() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        panel.canCreateDirectories = true
+        panel.directoryURL = model.fileURL?.deletingLastPathComponent()
+        panel.nameFieldStringValue = model.isLoaded
+            ? PaperNoteAssociationStore.defaultNoteFilename(forPDF: model.fileURL ?? URL(fileURLWithPath: "Notes.pdf"))
+            : "Notes.md"
+        panel.prompt = "Create Note"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        if FileManager.default.fileExists(atPath: url.path) {
+            requestOpenMarkdown(url)
+            return
+        }
+
+        let initialTitle = url.deletingPathExtension().lastPathComponent
+        let result = workspace.createMarkdownNote(
+            at: url,
+            initialContent: "# \(initialTitle)\n\n",
+            associatedPDFURL: model.fileURL,
+            in: tab.id,
+            adjacentTo: tab.activePaneID,
+            direction: .right,
+            availableSize: currentContentSize
+        )
+        if case let .failure(error) = result {
+            presentMarkdownOpenFailure(error)
+        }
+    }
+
+    private func requestOpenMarkdown(_ url: URL) {
+        if tab.hasLoadedContent,
+           tab.activePaneKind == .pdf,
+           tab.markdownPaneSessions.isEmpty,
+           case .success = workspace.openMarkdownInSplit(
+               url: url,
+               associatedPDFURL: model.fileURL,
+               in: tab.id,
+               adjacentTo: tab.activePaneID,
+               direction: .right,
+               availableSize: currentContentSize
+           ) {
+            return
+        }
+        if case let .failed(error) = workspace.openMarkdown(url, associatedPDFURL: model.fileURL) {
+            presentMarkdownOpenFailure(error)
+        }
+    }
+
+    private func openMarkdownInTabOrFallback(
+        url: URL,
+        associatedPDFURL: URL?,
+        preferredSplitFrom sourcePaneID: PaneID,
+        completion: ((MarkdownPaneSession) -> Void)? = nil
+    ) {
+        let result = withAnimation(.easeOut(duration: 0.16)) {
+            workspace.openOrActivateMarkdown(
+                url: url,
+                associatedPDFURL: associatedPDFURL,
+                in: tab.id,
+                preferredSplitFrom: sourcePaneID,
+                direction: .right,
+                availableSize: currentContentSize
+            )
+        }
+        switch result {
+        case let .success(paneID):
+            if let mdSession = tab.markdownPaneSessions[paneID] {
+                focusMarkdownSession(mdSession, completion: completion)
+            }
+        case let .failure(error):
+            if let layoutError = error as? LayoutMutationError {
+                switch workspace.openMarkdown(url, associatedPDFURL: associatedPDFURL) {
+                case let .opened(openedTabID, openedPaneID), let .activatedExisting(openedTabID, openedPaneID):
+                    if let mdSession = workspace.session(tabID: openedTabID)?.markdownPaneSessions[openedPaneID] {
+                        focusMarkdownSession(mdSession, completion: completion)
+                    }
+                case let .failed(loadError):
+                    presentMarkdownOpenFailure(loadError)
+                }
+                _ = layoutError
+            } else {
+                presentMarkdownOpenFailure(error)
+            }
+        }
+    }
+
+    private func presentCreatedMarkdownSession(
+        _ mdResourceSession: MarkdownResourceSession,
+        associatedPDFURL: URL?,
+        preferredSplitFrom sourcePaneID: PaneID,
+        completion: ((MarkdownPaneSession) -> Void)? = nil
+    ) {
+        let result = withAnimation(.easeOut(duration: 0.16)) {
+            workspace.openOrActivateMarkdownSession(
+                mdResourceSession,
+                associatedPDFURL: associatedPDFURL,
+                in: tab.id,
+                preferredSplitFrom: sourcePaneID,
+                direction: .right,
+                availableSize: currentContentSize
+            )
+        }
+        switch result {
+        case let .success(paneID):
+            if let mdSession = tab.markdownPaneSessions[paneID] {
+                focusMarkdownSession(mdSession, completion: completion)
+            }
+        case .failure:
+            let opened = workspace.openMarkdownInNewTab(
+                session: mdResourceSession,
+                associatedPDFURL: associatedPDFURL
+            )
+            if let mdSession = workspace.session(tabID: opened.tabID)?.markdownPaneSessions[opened.paneID] {
+                focusMarkdownSession(mdSession, completion: completion)
+            }
+        }
+    }
+
+    private func focusMarkdownSession(
+        _ mdSession: MarkdownPaneSession,
+        completion: ((MarkdownPaneSession) -> Void)? = nil
+    ) {
+        Task { @MainActor in
+            await Task.yield()
+            _ = mdSession.paneModel.editorController.focus()
+            completion?(mdSession)
+        }
+    }
+
+    private func canCiteCompanionPDF(in mdSession: MarkdownPaneSession) -> Bool {
+        workspace.canInsertCitation(into: mdSession)
+            && workspace.companionPDFPane(for: mdSession, in: tab.id)?.resourceSession.isLoaded == true
+    }
+
+    private func canCiteFromPDFPane(_ pdfPane: PDFPaneSession?) -> Bool {
+        guard let pdfPane,
+              pdfPane.resourceSession.isLoaded,
+              let pdfURL = pdfPane.resourceSession.fileURL else {
+            return false
+        }
+        if let targetMarkdown = workspace.citationTargetMarkdownPane(forPDF: pdfURL, in: tab.id) {
+            return workspace.canInsertCitation(into: targetMarkdown)
+        }
+        return true
+    }
+
+    private func citeActivePDFInPaperNote(
+        from sourcePaneID: PaneID? = nil,
+        pageOverride: PDFPage? = nil
+    ) {
+        let pdfPane = sourcePaneID.flatMap { tab.paneSessions[$0] } ?? tab.primaryPDFPaneSession
+        guard let pdfPane, pdfPane.resourceSession.isLoaded else { return }
+
+        let pageIndex: Int
+        if let pageOverride, let doc = pdfPane.resourceSession.document {
+            let idx = doc.index(for: pageOverride)
+            pageIndex = idx == NSNotFound ? pdfPane.paneModel.currentPageIndex : idx
+        } else {
+            pageIndex = pdfPane.paneModel.currentPageIndex
+        }
+        let selectedText = pdfPane.paneModel.currentSelection?.string
+        let pdfURL = pdfPane.resourceSession.fileURL
+        let title = pdfPane.resourceSession.title
+
+        if let targetMarkdown = workspace.citationTargetMarkdownPane(forPDF: pdfURL, in: tab.id) {
+            insertCitation(
+                pdfURL: pdfURL,
+                title: title,
+                pageIndex: pageIndex,
+                selectedText: selectedText,
+                into: targetMarkdown
+            )
+            return
+        }
+
+        openOrCreatePaperNote(from: pdfPane.id) { mdSession in
+            insertCitation(
+                pdfURL: pdfURL,
+                title: title,
+                pageIndex: pageIndex,
+                selectedText: selectedText,
+                into: mdSession
+            )
+        }
+    }
+
+    private func citeCompanionPDFInMarkdown(_ mdSession: MarkdownPaneSession) {
+        guard let pdfPane = workspace.companionPDFPane(for: mdSession, in: tab.id),
+              pdfPane.resourceSession.isLoaded else { return }
+        insertCitation(
+            pdfURL: pdfPane.resourceSession.fileURL,
+            title: pdfPane.resourceSession.title,
+            pageIndex: pdfPane.paneModel.currentPageIndex,
+            selectedText: pdfPane.paneModel.currentSelection?.string,
+            into: mdSession
+        )
+    }
+
+    private func insertCitation(
+        pdfURL: URL?,
+        title: String,
+        pageIndex: Int,
+        selectedText: String?,
+        into mdSession: MarkdownPaneSession
+    ) {
+        guard workspace.canInsertCitation(into: mdSession) else { return }
+        let citation = MarkdownCitation.formatCitation(
+            pdfURL: pdfURL,
+            title: title,
+            pageIndex: pageIndex,
+            selectedText: selectedText,
+            relativeTo: mdSession.resourceSession.fileURL
+        )
+        activatePane(mdSession.id)
+        _ = workspace.insertCitationText(citation, into: mdSession)
+    }
+
+    private func handleMarkdownCitationLink(_ rawDestination: String, from mdSession: MarkdownPaneSession) {
+        guard let target = MarkdownCitation.parseDestination(rawDestination) else { return }
+        let targetPageIndex = target.pageNumber.map { max(0, $0 - 1) }
+
+        let resolvedURL: URL?
+        if target.path.isEmpty {
+            resolvedURL = mdSession.paneModel.associatedPDFURL ?? tab.primaryPDFPaneSession?.resourceSession.fileURL
+        } else {
+            resolvedURL = MarkdownCitation.resolveTargetURL(
+                for: target.path,
+                relativeTo: mdSession.resourceSession.fileURL
+            )
+        }
+
+        guard let resolvedURL else {
+            // Non-file external URLs (e.g. https://) open in the system browser.
+            if let external = URL(string: rawDestination),
+               let scheme = external.scheme?.lowercased(),
+               scheme == "http" || scheme == "https" {
+                NSWorkspace.shared.open(external)
+            }
+            return
+        }
+
+        if MarkdownResourceSession.isSupportedMarkdownFile(resolvedURL) {
+            openMarkdownInTabOrFallback(
+                url: resolvedURL,
+                associatedPDFURL: mdSession.paneModel.associatedPDFURL,
+                preferredSplitFrom: mdSession.id
+            )
+            return
+        }
+
+        let canonicalTarget = resolvedURL.resolvingSymlinksInPath().standardizedFileURL
+        // 1. Check if a PDF pane in the current tab already displays this PDF.
+        if let matchingPane = tab.paneSessions.values.first(where: {
+            $0.resourceSession.fileURL?.resolvingSymlinksInPath().standardizedFileURL == canonicalTarget
+        }) {
+            activatePane(matchingPane.id)
+            if let targetPageIndex {
+                matchingPane.paneModel.goToPage(targetPageIndex)
+            }
+            return
+        }
+
+        // 2. Otherwise try opening the PDF in a left split pane next to the Markdown note.
+        if case let .success(newPaneID) = workspace.openPDFInSplit(
+            url: resolvedURL,
+            in: tab.id,
+            adjacentTo: mdSession.id,
+            direction: .left,
+            policy: .default,
+            availableSize: currentContentSize
+        ), let newPDFPane = tab.paneSessions[newPaneID] {
+            if let targetPageIndex {
+                newPDFPane.paneModel.goToPage(targetPageIndex)
+            }
+            return
+        }
+
+        // 3. Fallback: open or activate the PDF tab in the workspace.
+        switch workspace.open(resolvedURL) {
+        case .opened, .activatedExisting:
+            if let targetPageIndex {
+                workspace.activeTab.primaryPDFPaneSession?.paneModel.goToPage(targetPageIndex)
+            }
+        case let .failed(error):
+            pendingOpenFailure = error
+        }
+    }
+
+    private func presentMarkdownOpenFailure(_ error: Error) {
+        prompt = .saveProblem(
+            title: "Couldn’t open Markdown note",
+            message: error.localizedDescription,
+            offersSaveAs: false,
+            tabID: workspace.activeTabID
+        )
     }
 }

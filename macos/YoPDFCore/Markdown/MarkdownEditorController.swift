@@ -6,6 +6,7 @@
 //  Apache-2.0 Open Source License.
 //
 
+import AppKit
 import Combine
 import Foundation
 
@@ -33,6 +34,8 @@ public protocol MarkdownEditorHost: AnyObject {
 
     @discardableResult
     func performRedo() -> Bool
+
+    func performFindPanelAction(_ action: NSTextFinder.Action)
 }
 
 /// Imperative control & state-restoration handle for `MarkdownEditorView`.
@@ -192,5 +195,9 @@ public final class MarkdownEditorController: ObservableObject {
         let redone = host.performRedo()
         syncStateFromHost()
         return redone
+    }
+
+    public func performFindPanelAction(_ action: NSTextFinder.Action) {
+        host?.performFindPanelAction(action)
     }
 }
