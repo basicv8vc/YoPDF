@@ -132,6 +132,10 @@ struct InsertCitationActionKey: FocusedValueKey {
     typealias Value = @MainActor () -> Void
 }
 
+struct ToggleCompanionBrowserActionKey: FocusedValueKey {
+    typealias Value = @MainActor () -> Void
+}
+
 extension FocusedValues {
     var documentModel: PDFDocumentModel? {
         get { self[DocumentModelFocusKey.self] }
@@ -266,5 +270,10 @@ extension FocusedValues {
     var insertCitation: (@MainActor () -> Void)? {
         get { self[InsertCitationActionKey.self] }
         set { self[InsertCitationActionKey.self] = newValue }
+    }
+
+    var toggleCompanionBrowser: (@MainActor () -> Void)? {
+        get { self[ToggleCompanionBrowserActionKey.self] }
+        set { self[ToggleCompanionBrowserActionKey.self] = newValue }
     }
 }
