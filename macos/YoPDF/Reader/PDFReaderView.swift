@@ -506,6 +506,8 @@ struct PDFReaderView: View {
     @State private var paneHoverStates: [PaneID: PaneDropHoverState] = [:]
     /// Tracks the in-flight pane or tab drag payload to enable visual source dimming and accurate intra-tab validation.
     @State private var activeDraggedPayload: PaneDragPayload? = nil
+    /// Window-scoped lightweight WebKit companion browser ("Ask Gemini").
+    @StateObject private var companionBrowser = CompanionBrowserSession()
 
     private var anchorResolver: PageAnchorResolver {
         anchorResolver(for: tab.activePaneID)
@@ -789,6 +791,15 @@ struct PDFReaderView: View {
     private var titlebarReader: some View {
         closeGuardReader
             .background(
+                AskGeminiTitlebarInstaller(
+                    isPresented: companionBrowser.isPresented,
+                    onToggle: { toggleCompanionBrowser() }
+                )
+                .frame(width: 0, height: 0)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+            )
+            .background(
                 TitlebarUpdateIndicatorInstaller(updateController: updateController)
                     .frame(width: 0, height: 0)
                     .allowsHitTesting(false)
@@ -903,6 +914,7 @@ struct PDFReaderView: View {
                     select: { showSidebarSection($0) }
                 )
             )
+            .focusedSceneValue(\.toggleCompanionBrowser, { toggleCompanionBrowser() })
     }
 
     private var highlightSelectionAction: (@MainActor () -> Void)? {
@@ -1230,20 +1242,41 @@ struct PDFReaderView: View {
                 }
             )
             Divider()
-            toolbar
-            Divider()
-            if isSearchPresented {
-                searchBar
-                Divider()
+            GeometryReader { geometry in
+                HStack(spacing: 0) {
+                    VStack(spacing: 0) {
+                        toolbar
+                        Divider()
+                        if isSearchPresented {
+                            searchBar
+                            Divider()
+                        }
+                        content
+                            .modifier(ReaderPDFDropDestination(
+                                isTargeted: $isDropTargeted,
+                                showsPersistentHint: !tab.hasLoadedContent
+                            ) { url in
+                                requestOpen(url)
+                                return true
+                            })
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                    if companionBrowser.isPresented {
+                        CompanionBrowserPanelView(
+                            session: companionBrowser,
+                            containerWidth: geometry.size.width
+                        )
+                        .transition(.move(edge: .trailing))
+                    }
+                }
             }
-            content
-                .modifier(ReaderPDFDropDestination(
-                    isTargeted: $isDropTargeted,
-                    showsPersistentHint: !tab.hasLoadedContent
-                ) { url in
-                    requestOpen(url)
-                    return true
-                })
+        }
+    }
+
+    private func toggleCompanionBrowser() {
+        withAnimation(.easeInOut(duration: 0.18)) {
+            companionBrowser.toggle()
         }
     }
 
@@ -2888,6 +2921,13 @@ struct PDFReaderView: View {
             items.append(MarkupActionMenuItem(title: "Open Paper Note") {
                 openOrCreatePaperNote(from: targetPaneID)
             })
+            if hasSelection, let selectedText = activePaneModel.currentSelection?.string {
+                items.append(MarkupActionMenuItem(title: "Ask Gemini") {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        companionBrowser.sendSelectedText(selectedText)
+                    }
+                })
+            }
         }
 
         var splitItems: [NSMenuItem] = []

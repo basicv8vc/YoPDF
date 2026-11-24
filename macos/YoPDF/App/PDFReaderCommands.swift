@@ -40,6 +40,7 @@ struct PDFReaderCommands: Commands {
     @FocusedValue(\.openPaperNote) private var openPaperNote
     @FocusedValue(\.newMarkdownNote) private var newMarkdownNote
     @FocusedValue(\.insertCitation) private var insertCitation
+    @FocusedValue(\.toggleCompanionBrowser) private var toggleCompanionBrowser
 
     init(updateController: SparkleUpdateController, recentDocuments: RecentDocumentsStore) {
         self.updateController = updateController
@@ -262,6 +263,12 @@ struct PDFReaderCommands: Commands {
             }
             .keyboardShortcut("b", modifiers: .command)
             .disabled(sidebarActions == nil || model?.isLoaded != true)
+
+            Button("Ask Gemini") {
+                toggleCompanionBrowser?()
+            }
+            .keyboardShortcut("g", modifiers: [.command, .option])
+            .disabled(toggleCompanionBrowser == nil)
 
             Button("Outline") {
                 sidebarActions?.select(.outline)
