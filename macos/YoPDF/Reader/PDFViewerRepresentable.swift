@@ -431,6 +431,11 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
         magnificationController.attach(to: self)
     }
 
+    override func annotationsChanged(on page: PDFPage) {
+        super.annotationsChanged(on: page)
+        overlayViews[ObjectIdentifier(page)]?.suppressRefreshedNoteToolTips()
+    }
+
     // MARK: - Pane drag & drop destination
     //
     // AppKit routes mouse events to the deepest view under the pointer (the
@@ -732,6 +737,10 @@ final class MarkupPDFView: PDFView, @MainActor PDFPageOverlayViewProvider {
             let pdfViewPoint = self.convert(point, from: overlay)
             return self.convert(pdfViewPoint, to: page)
         }
+        overlay.pageViewRectForPageRect = { [weak self, weak overlay, weak page] rect in
+            guard let self, let page, let pageView = overlay?.superview else { return nil }
+            return pageView.convert(self.convert(rect, from: page), from: self)
+        }
         overlay.selectedMarkup = selectedMarkup
         overlay.markers = noteMarkers.filter { $0.pageIndex == pageIndex }
         overlay.searchSelections = searchSelectionsByPage[pageIndex] ?? []
@@ -840,6 +849,7 @@ private final class MarkupSelectionOverlayView: NSView {
     var page: PDFPage?
     var pageBounds: CGRect = .zero
     var pagePointForOverlayPoint: ((CGPoint) -> CGPoint)?
+    var pageViewRectForPageRect: ((CGRect) -> CGRect?)?
     var selectedMarkup: MarkupSelection? {
         didSet { needsDisplay = true }
     }
@@ -1076,11 +1086,45 @@ private final class MarkupSelectionOverlayView: NSView {
         ))
     }
 
+    func suppressRefreshedNoteToolTips() {
+        guard hoverLifecycle.visibleMarkerID != nil || hoverLifecycle.pendingMarkerID != nil else { return }
+        // PDFKit queues help-tag registration after annotation changes.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let markerID = self.currentPointerMarkerID() else { return }
+            self.suppressNativeNoteToolTips(for: markerID)
+        }
+    }
+
+    private func suppressNativeNoteToolTips(for markerID: ObjectIdentifier) {
+        guard let pageView = superview,
+              let marker = markers.first(where: { $0.id == markerID }),
+              let pageViewRectForPageRect
+        else { return }
+
+        // PDFKit puts its help tags on the page view as always-active
+        // entry/exit tracking areas at the original annotation rectangles.
+        // Use those rectangles so link and other annotations keep their tags.
+        let noteRects = marker.sourceHitBounds.compactMap(pageViewRectForPageRect)
+        for area in pageView.trackingAreas
+            where area.options.isSuperset(of: [.mouseEnteredAndExited, .activeAlways])
+        {
+            let rect = area.rect
+            if noteRects.contains(where: {
+                // PDFKit may round the origin when positioning the page view.
+                abs($0.minX - rect.minX) < 1 && abs($0.minY - rect.minY) < 1
+                    && abs($0.maxX - rect.maxX) < 1 && abs($0.maxY - rect.maxY) < 1
+            }) {
+                pageView.removeTrackingArea(area)
+            }
+        }
+    }
+
     /// The sticker under the pointer right now, read from the window rather
     /// than from a stale event. Used to re-check a queued or visible preview.
     private func currentPointerMarkerID() -> ObjectIdentifier? {
         guard let window else { return nil }
         let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        guard visibleRect.contains(point) else { return nil }
         return marker(at: point)?.id
     }
 
@@ -1095,6 +1139,7 @@ private final class MarkupSelectionOverlayView: NSView {
         case .none, .cancel:
             break
         case .schedule(let markerID, let token):
+            suppressNativeNoteToolTips(for: markerID)
             // A different sticker replaces the previous card at once, rather
             // than leaving the old body on screen for the length of the delay.
             hideHoverPreview()
@@ -1112,6 +1157,8 @@ private final class MarkupSelectionOverlayView: NSView {
                 self.applyHover(finished)
             }
         case .show(let markerID):
+            // A page can finish registering help tags during the dwell.
+            suppressNativeNoteToolTips(for: markerID)
             if !presentHoverPreview(for: markerID) {
                 applyHover(hoverLifecycle.hide())
             }
