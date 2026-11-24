@@ -5,53 +5,46 @@ import YoPDFCore
 struct NoteStickerSheetEditor: View {
     @Environment(\.dismiss) private var dismiss
 
-    let title: String
-    let canEditContents: Bool
-    let canChangeStyle: Bool
-    let onCancel: () -> Void
+    @ObservedObject var session: NoteComposerSession
+    @ObservedObject var model: PDFDocumentModel
     let onSave: () -> String?
 
-    @Binding private var text: String
-    @Binding private var style: NoteStickerStyle
-    @Binding private var templateSelection: NoteTemplateSelection
+    @State private var initialDraft: NoteComposerSession.Snapshot
     @State private var errorMessage: String?
 
     init(
-        title: String,
-        text: Binding<String>,
-        style: Binding<NoteStickerStyle>,
-        templateSelection: Binding<NoteTemplateSelection>,
-        canEditContents: Bool,
-        canChangeStyle: Bool,
-        onCancel: @escaping () -> Void,
+        session: NoteComposerSession,
+        model: PDFDocumentModel,
         onSave: @escaping () -> String?
     ) {
-        self.title = title
-        self.canEditContents = canEditContents
-        self.canChangeStyle = canChangeStyle
-        self.onCancel = onCancel
+        self.session = session
+        self.model = model
         self.onSave = onSave
-        _text = text
-        _style = style
-        _templateSelection = templateSelection
+        _initialDraft = State(initialValue: session.snapshot())
     }
 
-    private var trimmedText: String {
-        text.trimmingCharacters(in: .whitespacesAndNewlines)
+    private var title: String {
+        if session.isEditing { return "Edit Note" }
+        return session.isGroupComposer ? "New Thought" : "New Note"
+    }
+
+    private var isEmpty: Bool {
+        session.contents.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var body: some View {
+        let permissions = session.editorPermissions(in: model)
         VStack(alignment: .leading, spacing: 20) {
             Text(title)
                 .font(.headline)
 
             NoteStickerComposer(
-                text: $text,
-                style: $style,
+                text: $session.contents,
+                style: $session.style,
                 expanded: true,
-                templateSelection: $templateSelection,
-                canEditContents: canEditContents,
-                canChangeStyle: canChangeStyle
+                templateSelection: $session.templateSelection,
+                canEditContents: permissions.canEditContents,
+                canChangeStyle: permissions.canChangeStyle
             )
 
             if let errorMessage {
@@ -63,12 +56,15 @@ struct NoteStickerSheetEditor: View {
 
             HStack {
                 Spacer()
-                Button("Cancel", action: onCancel)
-                    .keyboardShortcut(.cancelAction)
+                Button("Cancel") {
+                    session.restore(from: initialDraft)
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
                 Button("Save") { save() }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(trimmedText.isEmpty)
+                    .disabled(isEmpty)
             }
         }
         .padding(24)

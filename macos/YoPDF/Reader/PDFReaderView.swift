@@ -2086,30 +2086,22 @@ struct PDFReaderView: View {
                 .transaction { $0.animation = nil }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .id(resourceSession.loadGeneration)
-                .popover(
-                    isPresented: Binding(
-                        get: { paneModel.noteComposerStore.isPresented },
-                        set: { paneModel.noteComposerStore.isPresented = $0 }
-                    ),
-                    attachmentAnchor: .rect(.rect(paneModel.noteComposerStore.session?.anchorRect ?? Self.fallbackAnchor)),
-                    arrowEdge: .top
-                ) {
-                    if let session = paneModel.noteComposerStore.session {
-                        NoteComposerView(session: session, model: paneDocModel) {
-                            paneModel.noteComposerStore.end()
-                        } onEditGroupEntry: { group, entry in
-                            guard let note = paneDocModel.noteSelection(forThreadEntry: entry, in: group) else {
-                                return
-                            }
-                            let anchor = resolver.containerRect(
-                                forPageBounds: group.bounds,
-                                pageIndex: group.pageIndex
-                            ) ?? Self.fallbackAnchor
-                            requestCompose(.note(note, anchor), in: paneID)
+                .modifier(
+                    NoteComposerPresentation(
+                        store: paneModel.noteComposerStore,
+                        model: paneDocModel,
+                        fallbackAnchor: Self.fallbackAnchor
+                    ) { group, entry in
+                        guard let note = paneDocModel.noteSelection(forThreadEntry: entry, in: group) else {
+                            return
                         }
-                        .id(session.id)
+                        let anchor = resolver.containerRect(
+                            forPageBounds: group.bounds,
+                            pageIndex: group.pageIndex
+                        ) ?? Self.fallbackAnchor
+                        requestCompose(.note(note, anchor), in: paneID)
                     }
-                }
+                )
 
                 if tab.layoutTree.paneCount > 1 {
                     Rectangle()

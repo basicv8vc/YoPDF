@@ -2,32 +2,90 @@ import AppKit
 import SwiftUI
 import YoPDFCore
 
-/// The note popover.
-///
-/// Nothing here writes to the PDF until Save. The body and the complete sticker
-/// style live in `NoteComposerSession`, not in this view's state, so closing and
-/// rebuilding the popover cannot throw the draft away.
-struct NoteComposerView: View {
-
-    @ObservedObject var session: NoteComposerSession
-    @ObservedObject var model: PDFDocumentModel
-    let onDismiss: () -> Void
+/// Presents both editors from the reader. An expanded sheet belongs to the
+/// reader window, so the compact popover's anchor cannot shift the sheet.
+struct NoteComposerPresentation: ViewModifier {
+    @ObservedObject var store: NoteComposerStore
+    let model: PDFDocumentModel
+    let fallbackAnchor: CGRect
     let onEditGroupEntry: (NoteSelection, NoteThreadEntry) -> Void
 
-    /// A failure reported by the last Save. Local on purpose: it describes one
-    /// attempt, and the text it failed to save is not local state.
-    @State private var errorMessage: String?
+    @State private var expandedSession: NoteComposerSession?
     @State private var showsExpandedEditor = false
-    @State private var expandedEditorSnapshot: NoteComposerSession.Snapshot?
-    @State private var focusRequest = 0
     #if DEBUG
-    @State private var didAutoPresentScreenshotSurface = false
+    @State private var autoExpandedSessionID: UUID?
     #endif
 
-    /// Read from the model on every render: another application can change `/F`
-    /// while the composer is open, and the Save button must follow.
-    private var permissions: NotePermissions {
-        switch session.mode {
+    func body(content: Content) -> some View {
+        content
+            .popover(
+                isPresented: $store.isPresented,
+                attachmentAnchor: .rect(.rect(store.session?.anchorRect ?? fallbackAnchor)),
+                arrowEdge: .top
+            ) {
+                if let session = store.session {
+                    NoteComposerView(
+                        session: session,
+                        model: model,
+                        onDismiss: store.end,
+                        onExpand: { expand(session) },
+                        onEditGroupEntry: onEditGroupEntry
+                    )
+                    .id(session.id)
+                    .onAppear {
+                        #if DEBUG
+                        if UserDefaults.standard.bool(forKey: "YOPDF_SCREENSHOT_EXPANDED"),
+                           autoExpandedSessionID != session.id {
+                            autoExpandedSessionID = session.id
+                            expand(session)
+                        }
+                        #endif
+                    }
+                }
+            }
+            .sheet(isPresented: $showsExpandedEditor, onDismiss: returnToCompactEditor) {
+                if let expandedSession {
+                    NoteStickerSheetEditor(session: expandedSession, model: model) {
+                        saveExpanded(expandedSession)
+                    }
+                }
+            }
+    }
+
+    private func expand(_ session: NoteComposerSession) {
+        guard expandedSession == nil, store.session === session else { return }
+        expandedSession = session
+        store.closePopover()
+        showsExpandedEditor = true
+    }
+
+    private func returnToCompactEditor() {
+        if let expandedSession, store.session === expandedSession {
+            store.isPresented = true
+        }
+        expandedSession = nil
+    }
+
+    private func saveExpanded(_ session: NoteComposerSession) -> String? {
+        guard store.session === session else { return "This note is no longer being edited." }
+        switch session.commit(to: model) {
+        case .success:
+            if session.isGroupComposer {
+                session.prepareNextGroupEntry()
+            } else {
+                store.end()
+            }
+            return nil
+        case let .failure(error):
+            return error.errorDescription ?? "The note was not saved."
+        }
+    }
+}
+
+extension NoteComposerSession {
+    /// Read on every render so both editors reflect current annotation permissions.
+    func editorPermissions(in model: PDFDocumentModel) -> NotePermissions {
+        switch mode {
         case .create:
             return model.canCreateNote
                 ? NotePermissions(canEditContents: true, canChangeStyle: true, canDelete: true)
@@ -39,6 +97,29 @@ struct NoteComposerView: View {
                 ? NotePermissions(canEditContents: true, canChangeStyle: true, canDelete: false)
                 : .none
         }
+    }
+}
+
+/// The note popover.
+///
+/// Nothing here writes to the PDF until Save. The body and the complete sticker
+/// style live in `NoteComposerSession`, not in this view's state, so closing and
+/// rebuilding the popover cannot throw the draft away.
+struct NoteComposerView: View {
+
+    @ObservedObject var session: NoteComposerSession
+    @ObservedObject var model: PDFDocumentModel
+    let onDismiss: () -> Void
+    let onExpand: () -> Void
+    let onEditGroupEntry: (NoteSelection, NoteThreadEntry) -> Void
+
+    /// A failure reported by the last Save. Local on purpose: it describes one
+    /// attempt, and the text it failed to save is not local state.
+    @State private var errorMessage: String?
+    @State private var focusRequest = 0
+
+    private var permissions: NotePermissions {
+        session.editorPermissions(in: model)
     }
 
     /// Whether the note this composer is working on is still there.
@@ -111,7 +192,7 @@ struct NoteComposerView: View {
                     submitTitle: session.isEditing ? "Save" : "Add",
                     focusRequest: focusRequest,
                     onCancel: session.isEditing ? onDismiss : nil,
-                    onExpand: { beginExpandedEditor() },
+                    onExpand: onExpand,
                     onDelete: deleteAction,
                     onSubmit: { save() }
                 )
@@ -121,30 +202,6 @@ struct NoteComposerView: View {
         .frame(width: 380)
         .fixedSize(horizontal: false, vertical: true)
         .accessibilityIdentifier("pdf-thought-capture-popover")
-        .onAppear {
-            #if DEBUG
-            guard !didAutoPresentScreenshotSurface else { return }
-            didAutoPresentScreenshotSurface = true
-            if UserDefaults.standard.bool(forKey: "YOPDF_SCREENSHOT_EXPANDED") {
-                showsExpandedEditor = true
-            }
-            #endif
-        }
-        .sheet(isPresented: $showsExpandedEditor, onDismiss: {
-            expandedEditorSnapshot = nil
-            focusRequest += 1
-        }) {
-            NoteStickerSheetEditor(
-                title: session.isEditing ? "Edit Note" : (session.isGroupComposer ? "New Thought" : "New Note"),
-                text: $session.contents,
-                style: $session.style,
-                templateSelection: templateSelectionBinding,
-                canEditContents: permissions.canEditContents,
-                canChangeStyle: permissions.canChangeStyle,
-                onCancel: cancelExpandedEditor,
-                onSave: saveExpanded
-            )
-        }
     }
 
     // MARK: - Sections
@@ -298,7 +355,7 @@ struct NoteComposerView: View {
             submitSymbol: "arrow.up",
             submitTitle: "Add",
             focusRequest: focusRequest,
-            onExpand: { beginExpandedEditor() },
+            onExpand: onExpand,
             onSubmit: { save() }
         )
     }
@@ -382,45 +439,6 @@ struct NoteComposerView: View {
             }
         case let .failure(error):
             errorMessage = error.errorDescription
-        }
-    }
-
-    private func beginExpandedEditor() {
-        expandedEditorSnapshot = session.snapshot()
-        showsExpandedEditor = true
-    }
-
-    /// Cancel returns to the compact draft as it stood when the sheet opened.
-    /// The session has already tracked every expanded edit for close and quit
-    /// protection, so restoring through it also invalidates stale approvals.
-    private func cancelExpandedEditor() {
-        if let expandedEditorSnapshot {
-            session.restore(from: expandedEditorSnapshot)
-        }
-        expandedEditorSnapshot = nil
-        showsExpandedEditor = false
-    }
-
-    /// The sheet edits the session live; Save commits that same protected draft.
-    /// Returning a message keeps the sheet open with every edit intact on failure.
-    private func saveExpanded() -> String? {
-        errorMessage = nil
-
-        switch session.commit(to: model) {
-        case .success:
-            expandedEditorSnapshot = nil
-            if session.isGroupComposer {
-                session.prepareNextGroupEntry()
-                showsExpandedEditor = false
-                focusRequest += 1
-            } else {
-                onDismiss()
-            }
-            return nil
-        case let .failure(error):
-            let message = error.errorDescription ?? "The note was not saved."
-            errorMessage = message
-            return message
         }
     }
 

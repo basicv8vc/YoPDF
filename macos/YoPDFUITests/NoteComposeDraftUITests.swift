@@ -1,3 +1,4 @@
+import PDFKit
 import XCTest
 
 /// End-to-end coverage for the compose draft prompt.
@@ -8,6 +9,80 @@ import XCTest
 /// These tests need an interactive Aqua session (`scripts/test-ui.sh`).
 @MainActor
 final class NoteComposeDraftUITests: XCTestCase {
+
+    func testExpandedEditorFitsFromBothReaderEdges() throws {
+        continueAfterFailure = false
+        let fixtureURL = try PDFFixtureFactory.writeTemporaryPDF(pageCount: 1, named: "note-editor-edges")
+        defer {
+            try? FileManager.default.removeItem(at: fixtureURL.deletingLastPathComponent())
+        }
+
+        let app = XCUIApplication()
+        app.launchArguments = ["-ApplePersistenceIgnoreState", "YES"]
+        app.launchEnvironment["YOPDF_SCREENSHOT_PDF"] = fixtureURL.path
+        app.launch()
+        defer { app.terminate() }
+        app.activate()
+
+        let window = app.windows.firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 20))
+        XCTAssertTrue(app.staticTexts[fixtureURL.lastPathComponent].waitForExistence(timeout: 20))
+        let hideSidebar = window.buttons["Hide Sidebar"]
+        if hideSidebar.exists { hideSidebar.click() }
+        // At high zoom the page covers the visible reader width.
+        app.typeKey("0", modifierFlags: .command)
+        for _ in 0..<6 {
+            app.typeKey("+", modifierFlags: .command)
+        }
+        let windowFrame = window.frame
+
+        for (index, x) in [0.06, 0.94].enumerated() {
+            startNewNote(in: app)
+            clickPage(window, at: CGVector(dx: x, dy: 0.45))
+            let compactInput = try noteInput(in: app)
+            compactInput.click()
+            compactInput.typeText("Compact draft")
+
+            let actions = app.descendants(matching: .any)
+                .matching(identifier: "pdf-note-draft-actions").firstMatch
+            XCTAssertTrue(actions.waitForExistence(timeout: 5))
+            actions.click()
+            app.menuItems["Expand to Edit"].click()
+
+            let sheet = window.sheets.firstMatch
+            let editor = sheet.descendants(matching: .any)
+                .matching(identifier: "pdf-sticker-text").firstMatch
+            XCTAssertTrue(editor.waitForExistence(timeout: 5), "The editor should be a sheet of the reader window.")
+            XCTAssertEqual(sheet.frame.midX, windowFrame.midX, accuracy: 2)
+            XCTAssertTrue(windowFrame.contains(sheet.frame), "The whole editor should fit inside the reader window.")
+            XCTAssertTrue(sheet.buttons["Cancel"].isHittable)
+            XCTAssertTrue(sheet.buttons["Save"].isHittable)
+            XCTAssertEqual(editor.value as? String, "Compact draft")
+
+            editor.click()
+            editor.typeKey("a", modifierFlags: .command)
+            editor.typeText("Expanded text")
+            if index == 0 {
+                sheet.buttons["Cancel"].click()
+                let restoredInput = try noteInput(in: app)
+                XCTAssertEqual(restoredInput.value as? String, "Compact draft")
+                submitNote(in: app)
+            } else {
+                sheet.buttons["Save"].click()
+            }
+            XCTAssertTrue(waitForPromptToDisappear(in: app))
+            XCTAssertTrue(waitForComposerToDisappear(in: app))
+        }
+
+        let savedNotes = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in
+                let contents = PDFDocument(url: fixtureURL)?.page(at: 0)?.annotations.compactMap(\.contents)
+                return Set(contents ?? []) == ["Compact draft", "Expanded text"]
+            },
+            object: nil
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [savedNotes], timeout: 5), .completed)
+    }
 
     func testSavingTheDraftFromTheComposePromptOpensTheClickedNote() throws {
         let fixtureURL = try PDFFixtureFactory.writeTemporaryPDF(
@@ -115,7 +190,8 @@ final class NoteComposeDraftUITests: XCTestCase {
         let composer = app.descendants(matching: .any)
             .matching(identifier: "pdf-thought-capture-popover").firstMatch
         XCTAssertTrue(composer.waitForExistence(timeout: 5), "The note composer did not open.")
-        let input = app.textFields.matching(identifier: "pdf-compact-note-input").firstMatch
+        let input = app.descendants(matching: .any)
+            .matching(identifier: "pdf-compact-note-input").firstMatch
         XCTAssertTrue(input.waitForExistence(timeout: 5), "The note body field did not appear.")
         return input
     }
