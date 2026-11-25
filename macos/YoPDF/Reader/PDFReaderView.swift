@@ -1243,9 +1243,15 @@ struct PDFReaderView: View {
             )
             Divider()
             GeometryReader { geometry in
+                let readerWidth = CompanionBrowserLayoutPolicy.readerWidth(
+                    in: geometry.size.width,
+                    panelWidth: companionBrowser.panelWidth,
+                    isPresented: companionBrowser.isPresented
+                )
+
                 HStack(spacing: 0) {
                     VStack(spacing: 0) {
-                        toolbar
+                        toolbar(availableWidth: readerWidth)
                         Divider()
                         if isSearchPresented {
                             searchBar
@@ -1260,7 +1266,8 @@ struct PDFReaderView: View {
                                 return true
                             })
                     }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(width: readerWidth, height: geometry.size.height, alignment: .topLeading)
+                    .clipped()
 
                     if companionBrowser.isPresented {
                         CompanionBrowserPanelView(
@@ -1270,6 +1277,7 @@ struct PDFReaderView: View {
                         .transition(.move(edge: .trailing))
                     }
                 }
+                .frame(width: geometry.size.width, height: geometry.size.height, alignment: .leading)
             }
         }
     }
@@ -1307,13 +1315,18 @@ struct PDFReaderView: View {
         navigationRevision &+= 1
     }
 
-    @ViewBuilder
-    private var toolbar: some View {
-        if activePaneKind == .markdown, let mdSession = activeMarkdownSession {
-            markdownToolbar(for: mdSession)
-        } else {
-            pdfToolbar
+    private func toolbar(availableWidth: CGFloat) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            Group {
+                if activePaneKind == .markdown, let mdSession = activeMarkdownSession {
+                    markdownToolbar(for: mdSession)
+                } else {
+                    pdfToolbar
+                }
+            }
+            .frame(minWidth: availableWidth, alignment: .leading)
         }
+        .background(.bar)
     }
 
     private var pdfToolbar: some View {
@@ -1705,7 +1718,7 @@ struct PDFReaderView: View {
                 .accessibilityIdentifier("pdf-search-field")
                 .onSubmit(showNextSearchResult)
                 .onExitCommand(perform: closeSearch)
-                .frame(minWidth: 220, maxWidth: 360)
+                .frame(minWidth: 120, maxWidth: 360)
 
             if !searchSession.inputQuery.isEmpty {
                 Button {
