@@ -73,6 +73,20 @@ enum CompanionBrowserLayoutPolicy: Sendable {
         return min(max(candidate, minAllowed), maxAllowed)
     }
 
+    /// Returns the horizontal width remaining for the main reader pane alongside
+    /// the companion browser drawer so wide toolbars in the reader column cannot
+    /// push the companion panel past the trailing edge of the window.
+    static func readerWidth(
+        in containerWidth: CGFloat,
+        panelWidth: CGFloat,
+        isPresented: Bool
+    ) -> CGFloat {
+        guard containerWidth.isFinite, containerWidth > 0 else { return 0 }
+        guard isPresented else { return containerWidth }
+        let companionWidth = clampedWidth(panelWidth, in: containerWidth)
+        return max(0, containerWidth - companionWidth)
+    }
+
     /// Normalizes user-entered URL or search text into a safe HTTP(S) URL.
     /// Rejects non-HTTP(S) schemes such as `file:`, `javascript:`, or `data:`.
     static func normalizedURL(from rawInput: String) -> URL? {

@@ -294,6 +294,7 @@ struct CompanionBrowserPanelView: View {
             .background(Color(nsColor: .windowBackgroundColor))
         }
         .frame(width: CompanionBrowserLayoutPolicy.clampedWidth(session.panelWidth, in: containerWidth))
+        .clipped()
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("companion-browser-panel")
     }

@@ -67,6 +67,37 @@ final class CompanionBrowserSessionTests: XCTestCase {
         XCTAssertEqual(CompanionBrowserLayoutPolicy.clampedWidth(.nan, in: 1000), 420)
     }
 
+    func testReaderWidthComplementsCompanionPanelWithoutOverflow() {
+        // Hidden panel leaves the full container width for the reader.
+        XCTAssertEqual(
+            CompanionBrowserLayoutPolicy.readerWidth(in: 1100, panelWidth: 420, isPresented: false),
+            1100
+        )
+
+        // Default 1100pt window + 420pt companion panel -> 680pt reader column.
+        let defaultReader = CompanionBrowserLayoutPolicy.readerWidth(in: 1100, panelWidth: 420, isPresented: true)
+        let defaultPanel = CompanionBrowserLayoutPolicy.clampedWidth(420, in: 1100)
+        XCTAssertEqual(defaultReader, 680)
+        XCTAssertEqual(defaultReader + defaultPanel, 1100)
+
+        // Narrow 900pt window with wide proposed panel clamps panel to 60% (540pt) and leaves 360pt.
+        let narrowReader = CompanionBrowserLayoutPolicy.readerWidth(in: 900, panelWidth: 700, isPresented: true)
+        let narrowPanel = CompanionBrowserLayoutPolicy.clampedWidth(700, in: 900)
+        XCTAssertEqual(narrowPanel, 540)
+        XCTAssertEqual(narrowReader, 360)
+        XCTAssertEqual(narrowReader + narrowPanel, 900)
+
+        // Invalid container widths return 0 safely.
+        XCTAssertEqual(
+            CompanionBrowserLayoutPolicy.readerWidth(in: 0, panelWidth: 420, isPresented: true),
+            0
+        )
+        XCTAssertEqual(
+            CompanionBrowserLayoutPolicy.readerWidth(in: .nan, panelWidth: 420, isPresented: true),
+            0
+        )
+    }
+
     // MARK: - Preset Matching
 
     func testPresetMatchingRecognizesBuiltInHosts() {
