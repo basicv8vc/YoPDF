@@ -6,6 +6,21 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>YoPDF</title>
         <item>
+            <title>2026.11.25</title>
+            <pubDate>Wed, 25 Nov 2026 10:57:40 +0900</pubDate>
+            <link>https://github.com/basicv8vc/YoPDF/releases</link>
+            <sparkle:version>16</sparkle:version>
+            <sparkle:shortVersionString>2026.11.25</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[## What's changed
+
+- Fixed a layout issue that could push the Ask Gemini panel and its header controls outside the reader window. Both panes now stay within the window, and the PDF toolbar can scroll horizontally when space is tight.
+
+**Full changelog**: https://github.com/basicv8vc/YoPDF/compare/v2026.11.24.2...v2026.11.25
+]]></description>
+            <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.25/YoPDF-2026.11.25-build16-universal.dmg" length="7681375" type="application/octet-stream" sparkle:edSignature="2h6Ybat2fDsEod1dP9glMpc3cwt4NtyRhT6Ry9+3fhW71yuzZSqbNZN6mssD3Hrc0jEgoruAsRjd4XGB93MkAg=="/>
+        </item>
+        <item>
             <title>2026.11.24.2</title>
             <pubDate>Tue, 24 Nov 2026 23:35:22 +0900</pubDate>
             <link>https://github.com/basicv8vc/YoPDF/releases</link>
@@ -38,25 +53,9 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
 ]]></description>
             <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.24/YoPDF-2026.11.24-build14-universal.dmg" length="7543861" type="application/octet-stream" sparkle:edSignature="OvsLTDirwYu7SSKQiNNBeQb1gacv6ptQ1qEF7rfJElNd28vVndl1x75P8KbN3BZSbsjTSgVWRKx4n1CGzxjcCA=="/>
         </item>
-        <item>
-            <title>2026.11.18.2</title>
-            <pubDate>Wed, 18 Nov 2026 17:06:37 +0900</pubDate>
-            <link>https://github.com/basicv8vc/YoPDF/releases</link>
-            <sparkle:version>13</sparkle:version>
-            <sparkle:shortVersionString>2026.11.18.2</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <description sparkle:format="markdown"><![CDATA[## What's Changed
-* fix(macos): embed Sparkle release notes and avoid endless update spinner by @basicv8vc in https://github.com/basicv8vc/YoPDF/pull/62
-* feat(macos): integrate heterogeneous PDF and Markdown split panes (P0-C-C) by @basicv8vc in https://github.com/basicv8vc/YoPDF/pull/63
-
-
-**Full Changelog**: https://github.com/basicv8vc/YoPDF/compare/v2026.11.18...v2026.11.18.2
-]]></description>
-            <enclosure url="https://github.com/basicv8vc/YoPDF/releases/download/v2026.11.18.2/YoPDF-2026.11.18.2-build13-universal.dmg" length="7547746" type="application/octet-stream" sparkle:edSignature="zGjMQtY9mCQ3Pcn/xQBTn2tTFP+dpxPyGcXKdmnTSA2FI/Vynj+PRsIy4IiIwqTDOjV0sOuqoZcNL2w3CwSECA=="/>
-        </item>
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: r1EL0pvgmRKL1GqbLMQVL9v29vLpGARrR+2BSkUVwU9zCw0CLFsfXTLqpd6mFIVGISvKYjKXc/qyTrwa6eTAAg==
-length: 3941
+edSignature: +zCwAF7/WmWjFYtEmf0W9Evp+o2RHX14q71vRi7ccEL4okWW5821266PGgYzOhnkNtgtB4QT1As7qoIZkKyjDw==
+length: 3876
 -->
