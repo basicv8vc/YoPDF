@@ -1,0 +1,34 @@
+# YoPDF Windows — Rust workspace.
+#
+# The PdfCraft crates are consumed as *path* dependencies from the pinned
+# upstream checkout produced by scripts/fetch-deps.sh. Cargo ignores a
+# dependency workspace's [patch.crates-io], so the patches PdfCraft needs for
+# its vendored renderer MUST be repeated here. Without them the build silently
+# falls back to the unpatched crates.io hayro/lopdf, which lack PdfCraft's
+# cancellation, resource-limit and appearance-state work.
+[workspace]
+resolver = "3"
+members = ["pdfcore", "gpui-app"]
+# PdfCraft is its own Cargo workspace. Without this exclusion Cargo would
+# adopt its crates as members of *our* workspace and `edition.workspace = true`
+# would resolve against the wrong root manifest.
+exclude = ["third_party/pdfcraft"]
+
+[patch.crates-io]
+hayro-interpret = { path = "third_party/pdfcraft/vendor/hayro-interpret" }
+hayro = { path = "third_party/pdfcraft/vendor/hayro" }
+hayro-syntax = { path = "third_party/pdfcraft/vendor/hayro-syntax" }
+hayro-cmap = { path = "third_party/pdfcraft/vendor/hayro-cmap" }
+hayro-postscript = { path = "third_party/pdfcraft/vendor/hayro-postscript" }
+hayro-jbig2 = { path = "third_party/pdfcraft/vendor/hayro-jbig2" }
+lopdf = { path = "third_party/pdfcraft/vendor/lopdf" }
+vello_common = { path = "third_party/pdfcraft/vendor/vello_common" }
+vello_cpu = { path = "third_party/pdfcraft/vendor/vello_cpu" }
+
+[profile.release]
+opt-level = 2
+
+[profile.dev]
+debug = false
+[profile.dev.package."*"]
+debug = false

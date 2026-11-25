@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target/
+**/target/
+*.exe
+*.dll
+*.dylib
+*.so
+
+# Pinned upstream checkout, produced by scripts/fetch-deps.sh
+/third_party/pdfcraft/
+
+# Generated PDF outputs from tests
+/fixtures/generated/
